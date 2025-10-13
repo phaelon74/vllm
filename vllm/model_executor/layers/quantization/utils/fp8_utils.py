@@ -1160,8 +1160,9 @@ def maybe_post_process_fp8_weight_block(
     # On Blackwell or Hopper, if E8M0 for DeepGemm is used, we need to
     # requantize the weight and input to the specific scale
     # at the same time.
+    orig_dtype = getattr(layer, "orig_dtype", torch.get_default_dtype())
     should_use_deepgemm = should_use_deepgemm_for_fp8_linear(
-        layer.orig_dtype, layer.weight
+        orig_dtype, layer.weight
     )
     if is_deep_gemm_e8m0_used() and should_use_deepgemm:
         block_sz = tuple(layer.weight_block_size)
