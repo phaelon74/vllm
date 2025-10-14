@@ -612,7 +612,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       CUDA_ARCHS "${FP4_ARCHS}")
     list(APPEND VLLM_EXT_SRC "${SRCS}")
     list(APPEND VLLM_GPU_FLAGS "-DENABLE_NVFP4_SM100=1")
-    list(APPEND VLLM_GPU_FLAGS "-DENABLE_CUTLASS_MOE_SM100=1")
+    # Note: ENABLE_CUTLASS_MOE_SM100 is set separately based on MOE kernel availability
     message(STATUS "Building NVFP4 for archs: ${FP4_ARCHS}")
   else()
     message(STATUS "Not building NVFP4 as no compatible archs were found.")
