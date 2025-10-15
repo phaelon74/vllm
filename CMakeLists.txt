@@ -488,10 +488,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
 
   # The cutlass_scaled_mm kernels for Blackwell SM100 (c3x, i.e. CUTLASS 3.x)
   # require CUDA 12.8 or later
+  # NOTE: Only building for SM12.0 (GB20x). SM10.0/11.0 (GB10x) have incomplete implementations.
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
-    cuda_archs_loose_intersection(SCALED_MM_ARCHS "10.0f;11.0f;12.0f" "${CUDA_ARCHS}")
+    cuda_archs_loose_intersection(SCALED_MM_ARCHS "12.0f" "${CUDA_ARCHS}")
   else()
-    cuda_archs_loose_intersection(SCALED_MM_ARCHS "10.0a;10.1a;10.3a;12.0a;12.1a" "${CUDA_ARCHS}")
+    cuda_archs_loose_intersection(SCALED_MM_ARCHS "12.0a;12.1a" "${CUDA_ARCHS}")
   endif()
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND SCALED_MM_ARCHS)
     set(SRCS
@@ -595,10 +596,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   endif()
 
   # FP4 Archs and flags
+  # NOTE: Only building for SM12.0 (GB20x). SM10.0/11.0 (GB10x) have incomplete implementations.
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
-    cuda_archs_loose_intersection(FP4_ARCHS "10.0f;11.0f;12.0f" "${CUDA_ARCHS}")
+    cuda_archs_loose_intersection(FP4_ARCHS "12.0f" "${CUDA_ARCHS}")
   else()
-    cuda_archs_loose_intersection(FP4_ARCHS "10.0a;10.1a;12.0a;12.1a" "${CUDA_ARCHS}")
+    cuda_archs_loose_intersection(FP4_ARCHS "12.0a;12.1a" "${CUDA_ARCHS}")
   endif()
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND FP4_ARCHS)
     set(SRCS
@@ -621,10 +623,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   endif()
 
   # CUTLASS MLA Archs and flags
+  # NOTE: Only building for SM12.0 (GB20x). SM10.0/11.0 (GB10x) have incomplete implementations.
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
-    cuda_archs_loose_intersection(MLA_ARCHS "10.0f;11.0f;12.0f" "${CUDA_ARCHS}")
+    cuda_archs_loose_intersection(MLA_ARCHS "12.0f" "${CUDA_ARCHS}")
   else()
-    cuda_archs_loose_intersection(MLA_ARCHS "10.0a;10.1a;10.3a;12.0a;12.1a" "${CUDA_ARCHS}")
+    cuda_archs_loose_intersection(MLA_ARCHS "12.0a;12.1a" "${CUDA_ARCHS}")
   endif()
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND MLA_ARCHS)
     set(SRCS
@@ -669,10 +672,12 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     endif()
   endif()
 
+  # NOTE: SM10.0/11.0 (GB10x) grouped_mm_c3x has incomplete implementations - DISABLED
+  # Only SM12.0 (GB20x) would work, but we're disabling this entirely to avoid linker issues
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
-    cuda_archs_loose_intersection(SCALED_MM_ARCHS "10.0f;11.0f" "${CUDA_ARCHS}")
+    cuda_archs_loose_intersection(SCALED_MM_ARCHS "" "${CUDA_ARCHS}")
   else()
-    cuda_archs_loose_intersection(SCALED_MM_ARCHS "10.0a" "${CUDA_ARCHS}")
+    cuda_archs_loose_intersection(SCALED_MM_ARCHS "" "${CUDA_ARCHS}")
   endif()
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND SCALED_MM_ARCHS)
     set(SRCS "csrc/quantization/w8a8/cutlass/moe/grouped_mm_c3x_sm100.cu")
@@ -694,10 +699,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   endif()
 
   # moe_data.cu is used by all CUTLASS MoE kernels.
+  # NOTE: Excluding SM10.0/11.0 (GB10x) due to incomplete MOE implementations. Keeping 9.0 (Hopper) and 12.0 (GB20x).
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
-    cuda_archs_loose_intersection(CUTLASS_MOE_DATA_ARCHS "9.0a;10.0f;11.0f;12.0f" "${CUDA_ARCHS}")
+    cuda_archs_loose_intersection(CUTLASS_MOE_DATA_ARCHS "9.0a;12.0f" "${CUDA_ARCHS}")
   else()
-    cuda_archs_loose_intersection(CUTLASS_MOE_DATA_ARCHS "9.0a;10.0a;10.1a;10.3a;12.0a;12.1a" "${CUDA_ARCHS}")
+    cuda_archs_loose_intersection(CUTLASS_MOE_DATA_ARCHS "9.0a;12.0a;12.1a" "${CUDA_ARCHS}")
   endif()
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.3 AND CUTLASS_MOE_DATA_ARCHS)
     set(SRCS "csrc/quantization/w8a8/cutlass/moe/moe_data.cu")
@@ -717,10 +723,12 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     endif()
   endif()
 
+  # NOTE: SM10.0/11.0 (GB10x) blockwise MoE has incomplete implementations - DISABLED
+  # Only SM12.0 (GB20x) would work, but we're disabling this entirely to avoid linker issues
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
-    cuda_archs_loose_intersection(SCALED_MM_ARCHS "10.0f;11.0f;12.0f" "${CUDA_ARCHS}")
+    cuda_archs_loose_intersection(SCALED_MM_ARCHS "" "${CUDA_ARCHS}")
   else()
-    cuda_archs_loose_intersection(SCALED_MM_ARCHS "10.0a;10.1a;10.3a;12.0a;12.1a" "${CUDA_ARCHS}")
+    cuda_archs_loose_intersection(SCALED_MM_ARCHS "" "${CUDA_ARCHS}")
   endif()
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND SCALED_MM_ARCHS)
     set(SRCS "csrc/quantization/w8a8/cutlass/moe/blockwise_scaled_group_mm_sm100.cu")
