@@ -51,12 +51,22 @@ def calculate_perplexity(
     total_nll = 0.0
     total_tokens = 0
     
-    # Slide window across the sequence
-    num_windows = (len(token_ids) - context_length) // stride + 1
+    # Handle case where sequence is shorter than context_length
+    if len(token_ids) <= context_length:
+        # Just use the whole sequence
+        num_windows = 1
+        windows = [(0, len(token_ids))]
+    else:
+        # Slide window across the sequence
+        num_windows = (len(token_ids) - context_length) // stride + 1
+        windows = []
+        for i in range(num_windows):
+            start_idx = i * stride
+            end_idx = min(start_idx + context_length, len(token_ids))
+            windows.append((start_idx, end_idx))
     
     for i in tqdm(range(num_windows), desc="Computing perplexity"):
-        start_idx = i * stride
-        end_idx = min(start_idx + context_length, len(token_ids))
+        start_idx, end_idx = windows[i]
         window_tokens = token_ids[start_idx:end_idx]
         
         if len(window_tokens) < 2:
@@ -72,9 +82,16 @@ def calculate_perplexity(
         output = outputs[0]
         
         # Calculate NLL for tokens in this window
-        # Skip first token (no context) and last token if we're not at the end
-        start_eval = 1 if i == 0 else stride
-        end_eval = len(window_tokens) if end_idx == len(token_ids) else len(window_tokens)
+        # Skip first token (no context) in the first window
+        # For subsequent windows, skip tokens that were already evaluated
+        if len(token_ids) <= context_length:
+            # Single window case - evaluate all but first token
+            start_eval = 1
+            end_eval = len(window_tokens)
+        else:
+            # Multi-window case
+            start_eval = 1 if i == 0 else stride
+            end_eval = len(window_tokens) if end_idx == len(token_ids) else len(window_tokens)
         
         if output.prompt_logprobs:
             for j in range(start_eval, end_eval):
@@ -120,7 +137,19 @@ def main():
         "--dataset",
         type=str,
         default=None,
-        help="Dataset to load (e.g., 'wikitext-2-raw-v1')",
+        help="Dataset to load (e.g., 'wikitext', 'wikitext-103-raw-v1')",
+    )
+    parser.add_argument(
+        "--dataset-config",
+        type=str,
+        default=None,
+        help="Dataset configuration (e.g., 'wikitext-2-raw-v1', 'wikitext-103-raw-v1')",
+    )
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=None,
+        help="Number of samples to use from dataset (default: all)",
     )
     parser.add_argument(
         "--context-length",
@@ -140,6 +169,28 @@ def main():
         default=None,
         help="Maximum model length",
     )
+    parser.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=1,
+        help="Tensor parallel size for multi-GPU",
+    )
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.9,
+        help="GPU memory utilization (0.0 to 1.0)",
+    )
+    parser.add_argument(
+        "--disable-custom-all-reduce",
+        action="store_true",
+        help="Disable custom all-reduce",
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Trust remote code",
+    )
     
     args = parser.parse_args()
     
@@ -148,6 +199,8 @@ def main():
     llm_kwargs = {
         "model": args.model,
         "enforce_eager": True,  # For simplicity in example
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
     }
     
     if args.quantization:
@@ -156,32 +209,66 @@ def main():
     if args.max_model_len:
         llm_kwargs["max_model_len"] = args.max_model_len
     
+    if args.disable_custom_all_reduce:
+        llm_kwargs["disable_custom_all_reduce"] = True
+    
+    if args.trust_remote_code:
+        llm_kwargs["trust_remote_code"] = True
+    
+    print(f"Model config:")
+    print(f"  Quantization: {args.quantization}")
+    print(f"  Tensor parallel size: {args.tensor_parallel_size}")
+    print(f"  GPU memory utilization: {args.gpu_memory_utilization}")
+    print(f"  Max model length: {args.max_model_len}")
+    
     llm = LLM(**llm_kwargs)
     tokenizer = llm.get_tokenizer()
     
     # Get text to evaluate
     if args.text:
         text = args.text
+        print(f"Using provided text ({len(args.text)} characters)")
     elif args.dataset:
         # Load dataset
         try:
             from datasets import load_dataset
-            dataset = load_dataset(args.dataset, split="test")
-            # Concatenate all text
-            text = "\n\n".join(dataset["text"][:100])  # Use first 100 examples
-            print(f"Loaded {len(dataset)} examples from {args.dataset}")
+            
+            # Load dataset with optional config
+            if args.dataset_config:
+                print(f"Loading dataset: {args.dataset} (config: {args.dataset_config})")
+                dataset = load_dataset(args.dataset, args.dataset_config, split="test")
+            else:
+                print(f"Loading dataset: {args.dataset}")
+                dataset = load_dataset(args.dataset, split="test")
+            
+            print(f"Loaded {len(dataset)} examples from dataset")
+            
+            # Determine how many samples to use
+            num_samples = args.num_samples if args.num_samples else len(dataset)
+            num_samples = min(num_samples, len(dataset))
+            
+            # Concatenate text samples
+            # For wikitext, join with double newline to separate articles
+            text = "\n\n".join(dataset["text"][:num_samples])
+            print(f"Using {num_samples} samples ({len(text)} characters)")
+            
         except ImportError:
-            print("Please install datasets: pip install datasets")
+            print("ERROR: Please install datasets library:")
+            print("  pip install datasets")
+            return
+        except Exception as e:
+            print(f"ERROR loading dataset: {e}")
+            print("\nFor WikiText-2, use:")
+            print("  --dataset wikitext --dataset-config wikitext-2-raw-v1")
+            print("\nFor WikiText-103, use:")
+            print("  --dataset wikitext --dataset-config wikitext-103-raw-v1")
             return
     else:
-        # Use sample text
-        text = """
-        The quick brown fox jumps over the lazy dog. This is a sample text
-        for demonstrating perplexity calculation using vLLM's score_mode.
-        With score_mode enabled, we can compute exact log probabilities for
-        all tokens in the vocabulary, which is essential for accurate
-        perplexity measurement on quantized models.
-        """
+        print("ERROR: Must provide either --text or --dataset")
+        print("\nExamples:")
+        print("  --text 'Your text here'")
+        print("  --dataset wikitext --dataset-config wikitext-2-raw-v1")
+        return
     
     # Tokenize
     print("\nTokenizing...")
@@ -189,9 +276,13 @@ def main():
     print(f"Total tokens: {len(token_ids)}")
     
     # Calculate perplexity
-    print(f"\nCalculating perplexity with:")
-    print(f"  Context length: {args.context_length}")
-    print(f"  Stride: {args.stride}")
+    print(f"\n{'='*70}")
+    print(f"PERPLEXITY EVALUATION")
+    print(f"{'='*70}")
+    print(f"Context length: {args.context_length}")
+    print(f"Stride: {args.stride}")
+    print(f"Total tokens to evaluate: {len(token_ids)}")
+    print(f"{'='*70}\n")
     
     perplexity = calculate_perplexity(
         llm,
@@ -200,9 +291,15 @@ def main():
         stride=args.stride,
     )
     
-    print(f"\n{'='*50}")
-    print(f"Perplexity: {perplexity:.4f}")
-    print(f"{'='*50}")
+    print(f"\n{'='*70}")
+    print(f"RESULTS")
+    print(f"{'='*70}")
+    print(f"Model: {args.model}")
+    print(f"Quantization: {args.quantization}")
+    print(f"Dataset: {args.dataset} ({args.dataset_config if args.dataset_config else 'default'})")
+    print(f"Total tokens evaluated: {len(token_ids)}")
+    print(f"\n>>> Perplexity: {perplexity:.4f} <<<")
+    print(f"{'='*70}")
 
 
 if __name__ == "__main__":

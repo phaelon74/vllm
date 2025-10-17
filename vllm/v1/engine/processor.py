@@ -80,7 +80,8 @@ class Processor:
             num_logprobs = params.logprobs
             if num_logprobs == -1:
                 num_logprobs = self.model_config.get_vocab_size()
-            if num_logprobs > max_logprobs:
+            # Skip validation in score_mode (needed for perplexity calculation)
+            if not params.score_mode and num_logprobs > max_logprobs:
                 raise ValueError(
                     f"Requested sample logprobs of {num_logprobs}, "
                     f"which is greater than max allowed: {max_logprobs}"
@@ -91,7 +92,8 @@ class Processor:
             num_prompt_logprobs = params.prompt_logprobs
             if num_prompt_logprobs == -1:
                 num_prompt_logprobs = self.model_config.get_vocab_size()
-            if num_prompt_logprobs > max_logprobs:
+            # Skip validation in score_mode (needed for perplexity calculation)
+            if not params.score_mode and num_prompt_logprobs > max_logprobs:
                 raise ValueError(
                     f"Requested prompt logprobs of {num_prompt_logprobs}, "
                     f"which is greater than max allowed: {max_logprobs}"
