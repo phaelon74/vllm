@@ -212,6 +212,11 @@ class SamplingParams(
     """Arbitrary additional args, that can be used by custom sampling
     implementations, plugins, etc. Not used by any in-tree sampling
     implementations."""
+    
+    score_mode: bool = False
+    """If True, enables scoring mode: computes exact log probabilities for all
+    prompt tokens without generating new tokens. This is useful for perplexity 
+    evaluation. When enabled, max_tokens is automatically set to 0."""
 
     # Fields used for bad words
     bad_words: list[str] | None = None
@@ -252,6 +257,7 @@ class SamplingParams(
         logit_bias: dict[int, float] | dict[str, float] | None = None,
         allowed_token_ids: list[int] | None = None,
         extra_args: dict[str, Any] | None = None,
+        score_mode: bool = False,
     ) -> "SamplingParams":
         if logit_bias is not None:
             # Convert token_id to integer
@@ -303,9 +309,16 @@ class SamplingParams(
             logit_bias=logit_bias,
             allowed_token_ids=allowed_token_ids,
             extra_args=extra_args,
+            score_mode=score_mode,
         )
 
     def __post_init__(self) -> None:
+        # Handle score_mode: set max_tokens to 0 and enable full prompt logprobs
+        if self.score_mode:
+            self.max_tokens = 0
+            if self.prompt_logprobs is None:
+                self.prompt_logprobs = -1  # Return all vocab logprobs
+        
         # how we deal with `best_of``:
         # if `best_of`` is not set, we default to `n`;
         # if `best_of`` is set, we set `n`` to `best_of`,
@@ -427,8 +440,10 @@ class SamplingParams(
             )
         if not 0.0 <= self.min_p <= 1.0:
             raise ValueError(f"min_p must be in [0, 1], got {self.min_p}.")
-        if self.max_tokens is not None and self.max_tokens < 1:
-            raise ValueError(f"max_tokens must be at least 1, got {self.max_tokens}.")
+        if self.max_tokens is not None and self.max_tokens < 0:
+            raise ValueError(f"max_tokens must be at least 0, got {self.max_tokens}.")
+        if self.max_tokens == 0 and not self.score_mode:
+            raise ValueError("max_tokens=0 is only allowed in score_mode.")
         if self.min_tokens < 0:
             raise ValueError(
                 f"min_tokens must be greater than or equal to 0, got {self.min_tokens}."
