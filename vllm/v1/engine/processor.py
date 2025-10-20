@@ -426,6 +426,11 @@ class Processor:
             if decoder_inputs["type"] == "embeds"
             else None
         )
+        
+        # Extract target_token_ids from prompt if provided (for score_mode optimization)
+        target_token_ids = None
+        if isinstance(prompt, dict) and "target_token_ids" in prompt:
+            target_token_ids = prompt.get("target_token_ids")
 
         sampling_params = None
         pooling_params = None
@@ -484,6 +489,7 @@ class Processor:
             priority=priority,
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
+            target_token_ids=target_token_ids,
         )
 
     def _validate_model_inputs(

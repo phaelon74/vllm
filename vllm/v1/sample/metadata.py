@@ -42,3 +42,7 @@ class SamplingMetadata:
 
     # Speculative token ids
     spec_token_ids: list[list[int]] | None = None
+
+    # Target token IDs for efficient logprob extraction (score_mode optimization)
+    # When provided, only these specific token logprobs are returned
+    target_token_ids: torch.Tensor | None = None

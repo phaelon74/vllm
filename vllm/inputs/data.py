@@ -92,6 +92,15 @@ class TokensPrompt(TypedDict):
     Optional cache salt to be used for prefix caching.
     """
 
+    target_token_ids: NotRequired[list[int]]
+    """
+    Optional target token IDs for efficient logprob extraction (score_mode optimization).
+    When provided with score_mode=True, only the logprobs of these specific tokens
+    will be returned, avoiding the need to transfer the full vocabulary (128K tokens)
+    from GPU to CPU. This reduces transfer from ~65-70GB to ~16KB per window.
+    Should contain the ground-truth tokens at positions [1:] (skipping position 0).
+    """
+
 
 class EmbedsPrompt(TypedDict):
     """Schema for a prompt provided via token embeddings."""

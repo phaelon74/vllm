@@ -70,6 +70,9 @@ class EngineCoreRequest(
     priority: int = 0
 
     trace_headers: Mapping[str, str] | None = None
+    
+    # Target token IDs for efficient logprob extraction (score_mode optimization)
+    target_token_ids: list[int] | None = None
 
 
 class EngineCoreEventType(enum.IntEnum):

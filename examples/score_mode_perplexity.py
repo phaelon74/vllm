@@ -97,9 +97,15 @@ def calculate_perplexity(
             # Need at least 2 tokens (context + target)
             continue
         
-        # Get logprobs for this window
+        # Prepare target_token_ids for optimization (skip position 0, no context for prediction)
+        target_token_ids = window_tokens[1:]  # Ground-truth tokens to evaluate
+        
+        # Get logprobs for this window (with optimization: only extract targets)
         outputs = llm.generate(
-            prompts=[TokensPrompt(prompt_token_ids=window_tokens)],
+            prompts=[TokensPrompt(
+                prompt_token_ids=window_tokens,
+                target_token_ids=target_token_ids,  # NEW: Enable fast path
+            )],
             sampling_params=sampling_params,
         )
         

@@ -99,11 +99,20 @@ class Sampler(nn.Module):
 
         # Gather the logprobs of the topk and sampled token (if requested).
         # Get logprobs and rank tensors (if requested)
-        logprobs_tensors = (
-            None
-            if num_logprobs is None
-            else self.gather_logprobs(raw_logprobs, num_logprobs, token_ids=sampled)
-        )
+        # Optimization: If target_token_ids are provided, extract only those
+        # (for efficient perplexity evaluation in score_mode)
+        if num_logprobs is None:
+            logprobs_tensors = None
+        elif sampling_metadata.target_token_ids is not None:
+            # score_mode optimization: extract only target token logprobs
+            logprobs_tensors = self.gather_target_logprobs(
+                raw_logprobs, sampling_metadata.target_token_ids
+            )
+        else:
+            # Standard path: extract top-K + sampled token
+            logprobs_tensors = self.gather_logprobs(
+                raw_logprobs, num_logprobs, token_ids=sampled
+            )
 
         # Use int32 to reduce the tensor size.
         sampled = sampled.to(torch.int32)
@@ -237,6 +246,42 @@ class Sampler(nn.Module):
         indices = indices.to(torch.int32)
 
         return LogprobsTensors(indices, logprobs, token_ranks)
+
+    @staticmethod
+    def gather_target_logprobs(
+        logprobs: torch.Tensor,
+        target_token_ids: torch.Tensor,
+    ) -> LogprobsTensors:
+        """
+        Gather logprobs ONLY for specified target tokens (score_mode optimization).
+        
+        This is used for efficient perplexity evaluation where we only need logprobs
+        of ground-truth tokens, not the full vocabulary or top-K.
+        
+        Args:
+          logprobs: (num tokens) x (vocab) tensor
+          target_token_ids: ground-truth token IDs to extract;
+                           1D tensor with (num tokens) elements
+                           Must be int64.
+        
+        Returns:
+          Target token indices tensor, (num tokens) x 1
+          Target token logprobs tensor, (num tokens) x 1
+          Target token ranks tensor, (num tokens)
+        """
+        assert target_token_ids.dtype == torch.int64
+        
+        # Extract logprobs for target tokens only
+        target_token_ids_2d = target_token_ids.unsqueeze(-1)
+        target_logprobs = logprobs.gather(-1, target_token_ids_2d)
+        
+        # Compute ranks (how many tokens have higher logprob)
+        target_ranks = batched_count_greater_than(logprobs, target_logprobs)
+        
+        # Return in same format as gather_logprobs, but with only 1 token per position
+        indices = target_token_ids_2d.to(torch.int32)
+        
+        return LogprobsTensors(indices, target_logprobs, target_ranks)
 
     @staticmethod
     def _combine_outputs_with_spec_tokens(

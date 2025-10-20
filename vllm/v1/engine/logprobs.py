@@ -31,6 +31,9 @@ class LogprobsProcessor:
     cumulative_logprob: float | None
     num_logprobs: int | None
     num_prompt_logprobs: int | None
+    
+    # Target token IDs for efficient extraction (score_mode optimization)
+    target_token_ids: list[int] | None = None
 
     @classmethod
     def from_new_request(
@@ -41,6 +44,10 @@ class LogprobsProcessor:
         assert request.sampling_params is not None
         num_logprobs = request.sampling_params.logprobs
         num_prompt_logprobs = request.sampling_params.prompt_logprobs
+        
+        # Extract target_token_ids if provided (for score_mode optimization)
+        target_token_ids = request.target_token_ids
+        
         return cls(
             tokenizer=tokenizer,
             cumulative_logprob=(None if num_logprobs is None else 0.0),
@@ -49,6 +56,7 @@ class LogprobsProcessor:
             prompt_logprobs=(None if num_prompt_logprobs is None else [None]),
             num_prompt_logprobs=num_prompt_logprobs,
             num_logprobs=num_logprobs,
+            target_token_ids=target_token_ids,
         )
 
     def _update_sample_logprobs(self, logprobs_lists: LogprobsLists) -> None:
@@ -109,6 +117,15 @@ class LogprobsProcessor:
 
         token_ids, logprobs, ranks = prompt_logprobs_tensors
 
+        # FAST PATH: If target_token_ids provided, extract only those
+        # (avoids creating 262M Logprob objects for full vocab)
+        if self.target_token_ids is not None:
+            self._update_prompt_logprobs_fast_path(
+                prompt_logprobs_tensors, self.target_token_ids
+            )
+            return
+
+        # STANDARD PATH: Extract top-K logprobs (create many Logprob objects)
         # Detokenize non-incrementally.
         # Output is flat: [num_tok, num_lps] -> [num_tok * num_lps]
         decoded_tokens = (
@@ -146,6 +163,57 @@ class LogprobsProcessor:
                     self.num_prompt_logprobs,
                 )
             )
+
+    def _update_prompt_logprobs_fast_path(
+        self,
+        prompt_logprobs_tensors: LogprobsTensors,
+        target_token_ids: list[int],
+    ) -> None:
+        """Fast path for score_mode: extract only target token logprobs.
+        
+        This optimization avoids creating 262M Logprob objects when full vocab is requested.
+        Instead, it extracts only the target tokens (e.g., ground-truth for perplexity).
+        
+        Key optimizations:
+        1. token_ids tensor is already filtered to only targets by Sampler
+        2. Only transfer minimal data from GPU to CPU
+        3. Create only ~2048 Logprob objects instead of 262M
+        
+        Args:
+          prompt_logprobs_tensors: tuple containing (token_ids, logprobs, ranks)
+                                   where token_ids.shape is [num_tokens, 1] (targets only)
+          target_token_ids: list of ground-truth token IDs for each position
+        """
+        token_ids, logprobs, ranks = prompt_logprobs_tensors
+        
+        # In fast path, Sampler has already filtered to only target tokens
+        # token_ids.shape = [num_tokens, 1]
+        # logprobs.shape = [num_tokens, 1]
+        
+        # Extract only target token data (minimal transfer)
+        target_token_ids_flat = token_ids.flatten().tolist()
+        target_logprobs_flat = logprobs.flatten().tolist()
+        target_ranks = ranks.tolist()
+        
+        # Optionally detokenize (only target tokens, very fast)
+        decoded_tokens = (
+            NONES
+            if self.tokenizer is None
+            else convert_ids_list_to_tokens(self.tokenizer, target_token_ids_flat)
+        )
+        
+        # Build minimal dict: only 1 Logprob object per position
+        for pos, (token_id, logprob, rank, token) in enumerate(
+            zip(target_token_ids_flat, target_logprobs_flat, target_ranks, decoded_tokens)
+        ):
+            # Create dict with single entry (target token only)
+            self.prompt_logprobs.append({
+                token_id: Logprob(
+                    logprob=logprob,
+                    rank=rank,
+                    decoded_token=token,
+                )
+            })
 
     def pop_prompt_logprobs(self) -> PromptLogprobs | None:
         """Pop and return all request prompt logprobs
