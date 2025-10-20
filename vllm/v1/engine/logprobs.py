@@ -192,27 +192,27 @@ class LogprobsProcessor:
         
         num_positions = logprobs_tensor.shape[0]
         
-        # target_token_ids should have length num_positions - 1 (no target for position 0)
-        # Position 0 has no context, so no logprob should be computed
-        if len(target_token_ids) != num_positions - 1:
+        # target_token_ids should match num_positions exactly
+        # vLLM already excludes position 0 (no context) from logprobs_tensor
+        # So logprobs_tensor contains positions 1 through N of the original window
+        if len(target_token_ids) != num_positions:
             raise ValueError(
-                f"target_token_ids length ({len(target_token_ids)}) should be "
-                f"num_positions - 1 ({num_positions - 1}), since position 0 has no context"
+                f"target_token_ids length ({len(target_token_ids)}) doesn't match "
+                f"num_positions ({num_positions}). Note: vLLM already excluded position 0."
             )
         
-        # Extract target token data ON GPU (fast) - start from position 1
-        position_indices = torch.arange(1, num_positions, device=logprobs_tensor.device)
+        # Extract target token data ON GPU (fast)
+        # Both target_token_ids and logprobs_tensor correspond to positions 1+ of original window
+        position_indices = torch.arange(num_positions, device=logprobs_tensor.device)
         target_token_ids_tensor = torch.tensor(target_token_ids, device=logprobs_tensor.device)
         
-        # Gather only the target token logprobs and ids (positions 1 through N)
+        # Gather only the target token logprobs and ids
         target_logprobs = logprobs_tensor[position_indices, target_token_ids_tensor]
         target_token_ids_out = token_ids_tensor[position_indices, target_token_ids_tensor]
         
         # Compute ranks: count how many tokens have higher logprob than target
-        # Extract only the relevant positions for rank computation
-        logprobs_subset = logprobs_tensor[1:, :]  # [num_positions-1, vocab_size]
-        target_logprobs_expanded = target_logprobs.unsqueeze(1)  # [num_positions-1, 1]
-        target_ranks = (logprobs_subset > target_logprobs_expanded).sum(dim=1) + 1
+        target_logprobs_expanded = target_logprobs.unsqueeze(1)  # [num_positions, 1]
+        target_ranks = (logprobs_tensor > target_logprobs_expanded).sum(dim=1) + 1
         
         # Transfer only the extracted data to CPU (minimal transfer!)
         target_token_ids_cpu = target_token_ids_out.cpu().tolist()
