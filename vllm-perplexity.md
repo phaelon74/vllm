@@ -321,16 +321,16 @@ We created `examples/score_mode_perplexity.py` to leverage score mode for perple
 ```python
 def calculate_perplexity(llm, token_ids, context_length=2048, stride=512):
     """
-    Calculate perplexity using sliding window approach.
+    Calculate perplexity using EXL3-compatible sliding window approach.
     
     Example with 5000 tokens:
     Window 1: tokens [   0:2048]  → evaluate tokens [   1:2048] (2047 tokens)
-    Window 2: tokens [ 512:2560]  → evaluate tokens [1024:2560] (512 tokens)
-    Window 3: tokens [1024:3072]  → evaluate tokens [1536:3072] (512 tokens)
+    Window 2: tokens [ 512:2560]  → evaluate tokens [ 513:2560] (2047 tokens, including overlap)
+    Window 3: tokens [1024:3072]  → evaluate tokens [1025:3072] (2047 tokens, including overlap)
     ...
     
-    This ensures each token (except the first) is evaluated exactly once
-    with maximum available context.
+    Tokens in overlapping regions are evaluated MULTIPLE times with different context lengths.
+    The final perplexity is averaged over all evaluations (including duplicates).
     """
     sampling_params = SamplingParams(score_mode=True, temperature=0.0)
     
@@ -352,8 +352,9 @@ def calculate_perplexity(llm, token_ids, context_length=2048, stride=512):
         )
         
         # Extract logprobs for ground-truth tokens
-        # Skip tokens already evaluated in previous windows
-        start_eval = 1 if i == 0 else stride
+        # EXL3-compatible: Evaluate ALL tokens in each window (except first with no context)
+        # Tokens in overlap regions get evaluated multiple times with different context
+        start_eval = 1  # Always skip position 0 (no context for prediction)
         end_eval = len(window_tokens)
         
         for j in range(start_eval, end_eval):
@@ -374,12 +375,22 @@ The EXL3 reference script (`compare_q.py`) uses the exact same methodology:
 |--------|------|-----------------|
 | Context length | 2048 | 2048 ✅ |
 | Stride | 512 | 512 ✅ |
-| Window overlap | Yes | Yes ✅ |
+| Window overlap | Yes (tokens re-evaluated) | Yes (tokens re-evaluated) ✅ |
+| Overlap handling | Evaluate ALL tokens in each window | Evaluate ALL tokens in each window ✅ |
 | Logprob computation | `log_softmax(logits)` | `log_softmax(logits)` ✅ |
 | First token handling | Skip (no context) | Skip ✅ |
-| Aggregation | `exp(mean(NLL))` | `exp(mean(NLL))` ✅ |
+| Aggregation | `exp(mean(all NLLs))` | `exp(mean(all NLLs))` ✅ |
+
+**Key insight**: Tokens in overlapping regions (e.g., positions 512-2048) are evaluated multiple times with different context lengths. All evaluations contribute to the final perplexity average, giving most tokens a "warm context" benefit.
+
+**Impact on scores**: This approach typically yields LOWER (better-looking) perplexity scores compared to evaluating each token only once, because:
+- Most tokens are evaluated with substantial prior context
+- Only the first 512 tokens of each window have "cold" context
+- The warm context evaluations dominate the average
 
 **Result**: Perplexity scores are directly comparable to EXL3 benchmarks.
+
+**Important**: When comparing quantization methods, the absolute perplexity value matters less than the RELATIVE difference between FP16 baseline and quantized models. As the EXL3 developer noted: "quantization noise is measured by the relative perplexity anyway, as long as you use the same method for each model/quant."
 
 ---
 

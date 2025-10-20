@@ -31,7 +31,29 @@ def calculate_perplexity(
     stride: int = 512,
 ) -> float:
     """
-    Calculate perplexity using sliding window approach.
+    Calculate perplexity using EXL3-compatible sliding window approach.
+    
+    EXL3 methodology (direct from developer):
+    1. Tokenize the entire test set
+    2. Create overlapping windows:
+       - input_ids[0] = tokenized_set[0:2048]
+       - input_ids[1] = tokenized_set[512:2560]
+       - input_ids[2] = tokenized_set[1024:3072]
+       - etc.
+    3. For EACH window (treated as a NEW sequence):
+       - Get logits = model.forward(input_ids[i])
+       - logprobs = log_softmax(logits)
+       - Gather target token logprobs (skip position 0 with no context)
+       - Sum up gathered logprobs
+    4. Final: ppl = exp(-mean of ALL logprobs from ALL windows)
+    
+    Example with 5000 tokens (context=2048, stride=512):
+        Window 0: tokens [   0:2048]  → evaluate positions [1:2048] (2047 evaluations)
+        Window 1: tokens [ 512:2560]  → evaluate positions [1:2048] (2047 evaluations)
+        Window 2: tokens [1024:3072]  → evaluate positions [1:2048] (2047 evaluations)
+        ...
+        Tokens in overlapping regions are evaluated multiple times.
+        Final perplexity = exp(-mean(all logprobs))
     
     Args:
         llm: vLLM LLM instance
@@ -48,8 +70,10 @@ def calculate_perplexity(
         temperature=0.0,
     )
     
-    total_nll = 0.0
-    total_tokens = 0
+    # Accumulate negative log-likelihoods across ALL windows
+    # Each window is treated as an independent sequence
+    total_nll = 0.0  # Sum of -logprob for all evaluated tokens
+    total_tokens = 0  # Count of all evaluated tokens (across all windows)
     
     # Handle case where sequence is shorter than context_length
     if len(token_ids) <= context_length:
@@ -81,17 +105,12 @@ def calculate_perplexity(
         
         output = outputs[0]
         
-        # Calculate NLL for tokens in this window
-        # Skip first token (no context) in the first window
-        # For subsequent windows, skip tokens that were already evaluated
-        if len(token_ids) <= context_length:
-            # Single window case - evaluate all but first token
-            start_eval = 1
-            end_eval = len(window_tokens)
-        else:
-            # Multi-window case
-            start_eval = 1 if i == 0 else stride
-            end_eval = len(window_tokens) if end_idx == len(token_ids) else len(window_tokens)
+        # EXL3-compatible: Treat each window as a NEW independent sequence
+        # Evaluate ALL positions in this window (except position 0 which has no context)
+        # Tokens in overlapping regions will be evaluated multiple times across different windows
+        # All evaluations are summed and averaged: ppl = exp(-mean(all logprobs))
+        start_eval = 1  # Skip position 0 (no context for prediction)
+        end_eval = len(window_tokens)  # Evaluate up to the end of THIS window
         
         if output.prompt_logprobs:
             for j in range(start_eval, end_eval):
@@ -105,8 +124,10 @@ def calculate_perplexity(
     if total_tokens == 0:
         raise ValueError("No valid tokens found for perplexity calculation")
     
-    avg_nll = total_nll / total_tokens
-    perplexity = math.exp(avg_nll)
+    # Final perplexity calculation (EXL3 formula)
+    # ppl = exp(-mean(all logprobs))
+    avg_nll = total_nll / total_tokens  # mean of negative log probs
+    perplexity = math.exp(avg_nll)       # exp(-mean(logprobs))
     
     return perplexity
 
