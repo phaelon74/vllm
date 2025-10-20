@@ -174,37 +174,59 @@ class LogprobsProcessor:
         This optimization avoids creating 262M Logprob objects when full vocab is requested.
         Instead, it extracts only the target tokens (e.g., ground-truth for perplexity).
         
-        Key optimizations:
-        1. token_ids tensor is already filtered to only targets by Sampler
-        2. Only transfer minimal data from GPU to CPU
-        3. Create only ~2048 Logprob objects instead of 262M
+        Key optimization: Create only ~2048 Logprob objects instead of 262M
         
         Args:
           prompt_logprobs_tensors: tuple containing (token_ids, logprobs, ranks)
-                                   where token_ids.shape is [num_tokens, 1] (targets only)
-          target_token_ids: list of ground-truth token IDs for each position
+                                   where tensors contain FULL vocabulary data
+          target_token_ids: list of ground-truth token IDs to extract (one per position)
         """
-        token_ids, logprobs, ranks = prompt_logprobs_tensors
+        import torch
         
-        # In fast path, Sampler has already filtered to only target tokens
-        # token_ids.shape = [num_tokens, 1]
-        # logprobs.shape = [num_tokens, 1]
+        token_ids_tensor, logprobs_tensor, ranks_tensor = prompt_logprobs_tensors
         
-        # Extract only target token data (minimal transfer)
-        target_token_ids_flat = token_ids.flatten().tolist()
-        target_logprobs_flat = logprobs.flatten().tolist()
-        target_ranks = ranks.tolist()
+        # token_ids_tensor.shape = [num_positions, vocab_size] (full vocabulary!)
+        # logprobs_tensor.shape = [num_positions, vocab_size]
+        # We need to extract only the target tokens
+        
+        num_positions = logprobs_tensor.shape[0]
+        
+        # Ensure we have target_token_ids for all positions (skip first with None)
+        # The first position should be None (no context for prediction)
+        if len(target_token_ids) != num_positions:
+            raise ValueError(
+                f"target_token_ids length ({len(target_token_ids)}) doesn't match "
+                f"number of positions ({num_positions})"
+            )
+        
+        # Extract target token data ON GPU (fast)
+        position_indices = torch.arange(num_positions, device=logprobs_tensor.device)
+        target_token_ids_tensor = torch.tensor(target_token_ids, device=logprobs_tensor.device)
+        
+        # Gather only the target token logprobs and ids
+        target_logprobs = logprobs_tensor[position_indices, target_token_ids_tensor]
+        target_token_ids_out = token_ids_tensor[position_indices, target_token_ids_tensor]
+        
+        # Compute ranks: count how many tokens have higher logprob than target
+        # This is expensive but necessary for compatibility
+        target_logprobs_expanded = target_logprobs.unsqueeze(1)  # [num_pos, 1]
+        target_ranks = (logprobs_tensor > target_logprobs_expanded).sum(dim=1) + 1
+        
+        # Transfer only the extracted data to CPU (minimal transfer!)
+        target_token_ids_cpu = target_token_ids_out.cpu().tolist()
+        target_logprobs_cpu = target_logprobs.cpu().tolist()
+        target_ranks_cpu = target_ranks.cpu().tolist()
         
         # Optionally detokenize (only target tokens, very fast)
         decoded_tokens = (
             NONES
             if self.tokenizer is None
-            else convert_ids_list_to_tokens(self.tokenizer, target_token_ids_flat)
+            else convert_ids_list_to_tokens(self.tokenizer, target_token_ids_cpu)
         )
         
         # Build minimal dict: only 1 Logprob object per position
         for pos, (token_id, logprob, rank, token) in enumerate(
-            zip(target_token_ids_flat, target_logprobs_flat, target_ranks, decoded_tokens)
+            zip(target_token_ids_cpu, target_logprobs_cpu, target_ranks_cpu, decoded_tokens)
         ):
             # Create dict with single entry (target token only)
             self.prompt_logprobs.append({
