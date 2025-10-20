@@ -179,7 +179,8 @@ class LogprobsProcessor:
         Args:
           prompt_logprobs_tensors: tuple containing (token_ids, logprobs, ranks)
                                    where tensors contain FULL vocabulary data
-          target_token_ids: list of ground-truth token IDs to extract (one per position)
+          target_token_ids: list of ground-truth token IDs to extract
+                           Should have length = num_positions - 1 (skipping position 0)
         """
         import torch
         
@@ -191,26 +192,27 @@ class LogprobsProcessor:
         
         num_positions = logprobs_tensor.shape[0]
         
-        # Ensure we have target_token_ids for all positions (skip first with None)
-        # The first position should be None (no context for prediction)
-        if len(target_token_ids) != num_positions:
+        # target_token_ids should have length num_positions - 1 (no target for position 0)
+        # Position 0 has no context, so no logprob should be computed
+        if len(target_token_ids) != num_positions - 1:
             raise ValueError(
-                f"target_token_ids length ({len(target_token_ids)}) doesn't match "
-                f"number of positions ({num_positions})"
+                f"target_token_ids length ({len(target_token_ids)}) should be "
+                f"num_positions - 1 ({num_positions - 1}), since position 0 has no context"
             )
         
-        # Extract target token data ON GPU (fast)
-        position_indices = torch.arange(num_positions, device=logprobs_tensor.device)
+        # Extract target token data ON GPU (fast) - start from position 1
+        position_indices = torch.arange(1, num_positions, device=logprobs_tensor.device)
         target_token_ids_tensor = torch.tensor(target_token_ids, device=logprobs_tensor.device)
         
-        # Gather only the target token logprobs and ids
+        # Gather only the target token logprobs and ids (positions 1 through N)
         target_logprobs = logprobs_tensor[position_indices, target_token_ids_tensor]
         target_token_ids_out = token_ids_tensor[position_indices, target_token_ids_tensor]
         
         # Compute ranks: count how many tokens have higher logprob than target
-        # This is expensive but necessary for compatibility
-        target_logprobs_expanded = target_logprobs.unsqueeze(1)  # [num_pos, 1]
-        target_ranks = (logprobs_tensor > target_logprobs_expanded).sum(dim=1) + 1
+        # Extract only the relevant positions for rank computation
+        logprobs_subset = logprobs_tensor[1:, :]  # [num_positions-1, vocab_size]
+        target_logprobs_expanded = target_logprobs.unsqueeze(1)  # [num_positions-1, 1]
+        target_ranks = (logprobs_subset > target_logprobs_expanded).sum(dim=1) + 1
         
         # Transfer only the extracted data to CPU (minimal transfer!)
         target_token_ids_cpu = target_token_ids_out.cpu().tolist()
@@ -224,7 +226,8 @@ class LogprobsProcessor:
             else convert_ids_list_to_tokens(self.tokenizer, target_token_ids_cpu)
         )
         
-        # Build minimal dict: only 1 Logprob object per position
+        # Build minimal dict: only 1 Logprob object per position (starting from position 1)
+        # Note: self.prompt_logprobs already has [None] at position 0 from __init__
         for pos, (token_id, logprob, rank, token) in enumerate(
             zip(target_token_ids_cpu, target_logprobs_cpu, target_ranks_cpu, decoded_tokens)
         ):
