@@ -204,20 +204,21 @@ class LogprobsProcessor:
         # Extract target token data ON GPU (fast)
         # Both target_token_ids and logprobs_tensor correspond to positions 1+ of original window
         position_indices = torch.arange(num_positions, device=logprobs_tensor.device)
-        target_token_ids_tensor = torch.tensor(target_token_ids, device=logprobs_tensor.device)
+        target_token_ids_tensor = torch.tensor(target_token_ids, device=logprobs_tensor.device, dtype=torch.long)
         
-        # Gather only the target token logprobs and ids
+        # Gather only the target token logprobs (extract specific token logprobs from full vocab)
         target_logprobs = logprobs_tensor[position_indices, target_token_ids_tensor]
-        target_token_ids_out = token_ids_tensor[position_indices, target_token_ids_tensor]
         
         # Compute ranks: count how many tokens have higher logprob than target
         target_logprobs_expanded = target_logprobs.unsqueeze(1)  # [num_positions, 1]
         target_ranks = (logprobs_tensor > target_logprobs_expanded).sum(dim=1) + 1
         
         # Transfer only the extracted data to CPU (minimal transfer!)
-        target_token_ids_cpu = target_token_ids_out.cpu().tolist()
+        # Use the original target_token_ids directly (they're the ground-truth tokens)
         target_logprobs_cpu = target_logprobs.cpu().tolist()
         target_ranks_cpu = target_ranks.cpu().tolist()
+        # target_token_ids is already a Python list, use it directly
+        target_token_ids_cpu = target_token_ids
         
         # Optionally detokenize (only target tokens, very fast)
         decoded_tokens = (
