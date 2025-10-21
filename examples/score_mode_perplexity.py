@@ -229,11 +229,15 @@ def main():
         "tensor_parallel_size": args.tensor_parallel_size,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "enable_prefix_caching": False,  # CRITICAL: Disable prefix caching to avoid OOM
+        # CRITICAL: Limit max_model_len to actual context_length to avoid allocating
+        # massive KV cache (model's max is 131K, but we only need 2048!)
+        "max_model_len": args.context_length,
     }
     
     if args.quantization:
         llm_kwargs["quantization"] = args.quantization
     
+    # User can still override max_model_len if they want
     if args.max_model_len:
         llm_kwargs["max_model_len"] = args.max_model_len
     
