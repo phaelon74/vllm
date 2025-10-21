@@ -186,9 +186,10 @@ class LogprobsProcessor:
         
         token_ids_tensor, logprobs_tensor, ranks_tensor = prompt_logprobs_tensors
         
-        # token_ids_tensor.shape = [num_positions, vocab_size] (full vocabulary!)
-        # logprobs_tensor.shape = [num_positions, vocab_size]
-        # We need to extract only the target tokens
+        # When using target_token_ids optimization, Sampler already extracted the targets:
+        # token_ids_tensor.shape = [num_positions, 1] (target tokens already extracted!)
+        # logprobs_tensor.shape = [num_positions, 1] (target logprobs already extracted!)
+        # ranks_tensor.shape = [num_positions] (target ranks already computed!)
         
         num_positions = logprobs_tensor.shape[0]
         
@@ -201,38 +202,18 @@ class LogprobsProcessor:
                 f"num_positions ({num_positions}). Note: vLLM already excluded position 0."
             )
         
-        # Extract target token data ON GPU (fast)
-        # IMPORTANT: token_ids_tensor contains tokens sorted by logprob (not by token ID!)
-        # We need to find where each target_token_id appears in the sorted list
+        # Data is already extracted by Sampler - just squeeze and transfer to CPU!
+        target_logprobs_cpu = logprobs_tensor.squeeze(-1).cpu().tolist()  # [num_positions, 1] -> [num_positions]
+        target_ranks_cpu = ranks_tensor.cpu().tolist()  # [num_positions]
+        target_token_ids_cpu = token_ids_tensor.squeeze(-1).cpu().tolist()  # [num_positions, 1] -> [num_positions]
         
-        target_token_ids_tensor = torch.tensor(target_token_ids, device=logprobs_tensor.device, dtype=torch.long)
-        
-        # For each position, find where the target token appears in token_ids_tensor
-        # token_ids_tensor.shape = [num_positions, vocab_size]
-        # target_token_ids_tensor.shape = [num_positions]
-        
-        # Expand target_token_ids to compare with all vocab positions
-        target_expanded = target_token_ids_tensor.unsqueeze(1)  # [num_positions, 1]
-        
-        # Find where target token matches in the sorted token list for each position
-        matches = (token_ids_tensor == target_expanded)  # [num_positions, vocab_size]
-        
-        # Get the index where each target token appears (should be exactly one per position)
-        indices = matches.long().argmax(dim=1)  # [num_positions]
-        
-        # Extract the logprobs at those indices
-        position_indices = torch.arange(num_positions, device=logprobs_tensor.device)
-        target_logprobs = logprobs_tensor[position_indices, indices]
-        
-        # Ranks: since token_ids_tensor is sorted by logprob (highest first),
-        # the index where we found the token IS its rank (rank 0 = highest, so add 1)
-        target_ranks = indices + 1  # Convert 0-based index to 1-based rank
-        
-        # Transfer only the extracted data to CPU (minimal transfer!)
-        target_logprobs_cpu = target_logprobs.cpu().tolist()
-        target_ranks_cpu = target_ranks.cpu().tolist()
-        # target_token_ids is already a Python list, use it directly
-        target_token_ids_cpu = target_token_ids
+        # Validate that extracted tokens match what we requested
+        if target_token_ids_cpu != target_token_ids:
+            raise ValueError(
+                f"Extracted tokens don't match requested targets!\n"
+                f"Requested: {target_token_ids[:10]}...\n"
+                f"Got: {target_token_ids_cpu[:10]}..."
+            )
         
         # Optionally detokenize (only target tokens, very fast)
         decoded_tokens = (
