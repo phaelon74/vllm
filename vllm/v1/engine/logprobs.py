@@ -202,17 +202,19 @@ class LogprobsProcessor:
                 f"num_positions ({num_positions}). Note: vLLM already excluded position 0."
             )
         
-        # Data is already extracted by Sampler - just squeeze and transfer to CPU!
-        target_logprobs_cpu = logprobs_tensor.squeeze(-1).cpu().tolist()  # [num_positions, 1] -> [num_positions]
+        # Data is already extracted by Sampler - just flatten and transfer to CPU!
+        # token_ids_tensor.shape = [num_positions, 1], need to flatten to [num_positions]
+        target_logprobs_cpu = logprobs_tensor.flatten().cpu().tolist()  # [num_positions, 1] -> [num_positions]
         target_ranks_cpu = ranks_tensor.cpu().tolist()  # [num_positions]
-        target_token_ids_cpu = token_ids_tensor.squeeze(-1).cpu().tolist()  # [num_positions, 1] -> [num_positions]
+        target_token_ids_cpu = token_ids_tensor.flatten().cpu().tolist()  # [num_positions, 1] -> [num_positions]
         
         # Validate that extracted tokens match what we requested
         if target_token_ids_cpu != target_token_ids:
             raise ValueError(
                 f"Extracted tokens don't match requested targets!\n"
                 f"Requested: {target_token_ids[:10]}...\n"
-                f"Got: {target_token_ids_cpu[:10]}..."
+                f"Got: {target_token_ids_cpu[:10]}...\n"
+                f"Tensor shape: {token_ids_tensor.shape}, Logprobs shape: {logprobs_tensor.shape}"
             )
         
         # Optionally detokenize (only target tokens, very fast)
