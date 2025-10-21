@@ -229,9 +229,10 @@ def main():
         "tensor_parallel_size": args.tensor_parallel_size,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "enable_prefix_caching": False,  # CRITICAL: Disable prefix caching to avoid OOM
-        # CRITICAL: Limit max_model_len to actual context_length to avoid allocating
-        # massive KV cache (model's max is 131K, but we only need 2048!)
-        "max_model_len": args.context_length,
+        # CRITICAL: Limit max_model_len to avoid allocating massive KV cache
+        # Use context_length * 2 to give plenty of headroom for internal buffers
+        # (model's max is 131K, but we only need ~2048-4096!)
+        "max_model_len": args.context_length * 2,
     }
     
     if args.quantization:
