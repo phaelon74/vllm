@@ -202,19 +202,33 @@ class LogprobsProcessor:
             )
         
         # Extract target token data ON GPU (fast)
-        # Both target_token_ids and logprobs_tensor correspond to positions 1+ of original window
-        position_indices = torch.arange(num_positions, device=logprobs_tensor.device)
+        # IMPORTANT: token_ids_tensor contains tokens sorted by logprob (not by token ID!)
+        # We need to find where each target_token_id appears in the sorted list
+        
         target_token_ids_tensor = torch.tensor(target_token_ids, device=logprobs_tensor.device, dtype=torch.long)
         
-        # Gather only the target token logprobs (extract specific token logprobs from full vocab)
-        target_logprobs = logprobs_tensor[position_indices, target_token_ids_tensor]
+        # For each position, find where the target token appears in token_ids_tensor
+        # token_ids_tensor.shape = [num_positions, vocab_size]
+        # target_token_ids_tensor.shape = [num_positions]
         
-        # Compute ranks: count how many tokens have higher logprob than target
-        target_logprobs_expanded = target_logprobs.unsqueeze(1)  # [num_positions, 1]
-        target_ranks = (logprobs_tensor > target_logprobs_expanded).sum(dim=1) + 1
+        # Expand target_token_ids to compare with all vocab positions
+        target_expanded = target_token_ids_tensor.unsqueeze(1)  # [num_positions, 1]
+        
+        # Find where target token matches in the sorted token list for each position
+        matches = (token_ids_tensor == target_expanded)  # [num_positions, vocab_size]
+        
+        # Get the index where each target token appears (should be exactly one per position)
+        indices = matches.long().argmax(dim=1)  # [num_positions]
+        
+        # Extract the logprobs at those indices
+        position_indices = torch.arange(num_positions, device=logprobs_tensor.device)
+        target_logprobs = logprobs_tensor[position_indices, indices]
+        
+        # Ranks: since token_ids_tensor is sorted by logprob (highest first),
+        # the index where we found the token IS its rank (rank 0 = highest, so add 1)
+        target_ranks = indices + 1  # Convert 0-based index to 1-based rank
         
         # Transfer only the extracted data to CPU (minimal transfer!)
-        # Use the original target_token_ids directly (they're the ground-truth tokens)
         target_logprobs_cpu = target_logprobs.cpu().tolist()
         target_ranks_cpu = target_ranks.cpu().tolist()
         # target_token_ids is already a Python list, use it directly
