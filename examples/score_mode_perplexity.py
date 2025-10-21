@@ -115,17 +115,24 @@ def calculate_perplexity(
         # Evaluate ALL positions in this window (except position 0 which has no context)
         # Tokens in overlapping regions will be evaluated multiple times across different windows
         # All evaluations are summed and averaged: ppl = exp(-mean(all logprobs))
-        start_eval = 1  # Skip position 0 (no context for prediction)
-        end_eval = len(window_tokens)  # Evaluate up to the end of THIS window
         
         if output.prompt_logprobs:
-            for j in range(start_eval, end_eval):
-                if j < len(output.prompt_logprobs) and output.prompt_logprobs[j]:
-                    actual_token = window_tokens[j]
-                    if actual_token in output.prompt_logprobs[j]:
-                        logprob = output.prompt_logprobs[j][actual_token].logprob
+            # prompt_logprobs is a list indexed from 0, containing logprobs for positions [1, 2, ..., N-1]
+            # prompt_logprobs[i] contains logprobs for window_tokens[i+1]
+            for i in range(len(output.prompt_logprobs)):
+                logprobs_dict = output.prompt_logprobs[i]
+                if logprobs_dict:
+                    actual_token = window_tokens[i + 1]  # +1 because position 0 is excluded
+                    if actual_token in logprobs_dict:
+                        logprob = logprobs_dict[actual_token].logprob
                         total_nll += -logprob
                         total_tokens += 1
+                    else:
+                        # This should never happen with our optimization - raise error to debug
+                        raise ValueError(
+                            f"Token {actual_token} not found in logprobs at position {i+1}. "
+                            f"Available tokens: {list(logprobs_dict.keys())[:10]}"
+                        )
     
     if total_tokens == 0:
         raise ValueError("No valid tokens found for perplexity calculation")
