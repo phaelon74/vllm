@@ -45,12 +45,14 @@ class Request:
         priority: int = 0,
         trace_headers: Mapping[str, str] | None = None,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
+        target_token_ids: list[int] | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
         self.priority = priority
         self.sampling_params = sampling_params
         self.pooling_params = pooling_params
+        self.target_token_ids = target_token_ids
         # Because of LoRA, the eos token id can be different for each request.
         self.eos_token_id = eos_token_id
         self.lora_request = lora_request
@@ -154,6 +156,7 @@ class Request:
             priority=request.priority,
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
+            target_token_ids=request.target_token_ids,
         )
 
     def append_output_token_ids(
