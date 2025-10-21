@@ -228,6 +228,7 @@ def main():
         "enforce_eager": True,  # For simplicity in example
         "tensor_parallel_size": args.tensor_parallel_size,
         "gpu_memory_utilization": args.gpu_memory_utilization,
+        "enable_prefix_caching": False,  # CRITICAL: Disable prefix caching to avoid OOM
     }
     
     if args.quantization:
