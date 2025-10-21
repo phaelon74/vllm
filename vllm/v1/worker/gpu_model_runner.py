@@ -3077,9 +3077,23 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             # Compute prompt logprobs.
             logprobs = self.sampler.compute_logprobs(logits)
-            token_ids, logprobs, ranks = self.sampler.gather_logprobs(
-                logprobs, num_prompt_logprobs, tgt_token_ids
-            )
+            
+            # Optimization: If target_token_ids is set (score_mode), use fast path
+            if hasattr(request, 'target_token_ids') and request.target_token_ids is not None:
+                # Extract only the tokens for this chunk
+                chunk_start = start_idx  # Where this chunk starts in the full prompt
+                chunk_end = start_idx + num_logits
+                target_tokens_chunk = request.target_token_ids[chunk_start:chunk_end]
+                target_tokens_tensor = torch.tensor(target_tokens_chunk, dtype=torch.int64, device=self.device)
+                
+                token_ids, logprobs, ranks = self.sampler.gather_target_logprobs(
+                    logprobs, target_tokens_tensor
+                )
+            else:
+                # Standard path: gather top-k logprobs
+                token_ids, logprobs, ranks = self.sampler.gather_logprobs(
+                    logprobs, num_prompt_logprobs, tgt_token_ids
+                )
 
             # Transfer GPU->CPU async.
             chunk_slice = slice(start_idx, start_idx + num_logits)

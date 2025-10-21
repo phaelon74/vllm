@@ -208,14 +208,8 @@ class LogprobsProcessor:
         target_ranks_cpu = ranks_tensor.cpu().tolist()  # [num_positions]
         target_token_ids_cpu = token_ids_tensor.flatten().cpu().tolist()  # [num_positions, 1] -> [num_positions]
         
-        # Validate that extracted tokens match what we requested
-        if target_token_ids_cpu != target_token_ids:
-            raise ValueError(
-                f"Extracted tokens don't match requested targets!\n"
-                f"Requested: {target_token_ids[:10]}...\n"
-                f"Got: {target_token_ids_cpu[:10]}...\n"
-                f"Tensor shape: {token_ids_tensor.shape}, Logprobs shape: {logprobs_tensor.shape}"
-            )
+        # Note: We don't validate here because gpu_model_runner might pass a chunk
+        # of target_token_ids (for chunked prefill), not the full list
         
         # Optionally detokenize (only target tokens, very fast)
         decoded_tokens = (
