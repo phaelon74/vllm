@@ -3079,15 +3079,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             logprobs = self.sampler.compute_logprobs(logits)
             
             # Optimization: If target_token_ids is set (score_mode), use fast path
+            # This extracts only the target tokens instead of full vocab or top-k
             if hasattr(request, 'target_token_ids') and request.target_token_ids is not None:
-                # Extract only the tokens for this chunk
-                chunk_start = start_idx  # Where this chunk starts in the full prompt
-                chunk_end = start_idx + num_logits
-                target_tokens_chunk = request.target_token_ids[chunk_start:chunk_end]
-                target_tokens_tensor = torch.tensor(target_tokens_chunk, dtype=torch.int64, device=self.device)
-                
+                # tgt_token_ids already has the correct tokens - just use fast path!
                 token_ids, logprobs, ranks = self.sampler.gather_target_logprobs(
-                    logprobs, target_tokens_tensor
+                    logprobs, tgt_token_ids
                 )
             else:
                 # Standard path: gather top-k logprobs
