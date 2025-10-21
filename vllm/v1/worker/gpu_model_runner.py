@@ -3080,11 +3080,21 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             
             # Optimization: If target_token_ids is set (score_mode), use fast path
             # This extracts only the target tokens instead of full vocab or top-k
-            if hasattr(request, 'target_token_ids') and request.target_token_ids is not None:
+            use_fast_path = (hasattr(request, 'target_token_ids') and 
+                           request.target_token_ids is not None and
+                           len(request.target_token_ids) > 0)
+            
+            if use_fast_path:
                 # tgt_token_ids already has the correct tokens - just use fast path!
                 token_ids, logprobs, ranks = self.sampler.gather_target_logprobs(
                     logprobs, tgt_token_ids
                 )
+                # DEBUG: Verify we got the right shape
+                if token_ids.shape[1] != 1:
+                    raise RuntimeError(
+                        f"Fast path failed! Expected shape [N, 1], got {token_ids.shape}. "
+                        f"request.target_token_ids length: {len(request.target_token_ids)}"
+                    )
             else:
                 # Standard path: gather top-k logprobs
                 token_ids, logprobs, ranks = self.sampler.gather_logprobs(
