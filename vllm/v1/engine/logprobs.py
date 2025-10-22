@@ -48,6 +48,13 @@ class LogprobsProcessor:
         # Extract target_token_ids if provided (for score_mode optimization)
         target_token_ids = request.target_token_ids
         
+        # CRITICAL DEBUG
+        import sys
+        print(f"[DEBUG LogprobsProcessor.from_new_request] "
+              f"target_token_ids={'NOT NONE' if target_token_ids else 'NONE'}, "
+              f"length={len(target_token_ids) if target_token_ids else 0}",
+              file=sys.stderr, flush=True)
+        
         return cls(
             tokenizer=tokenizer,
             cumulative_logprob=(None if num_logprobs is None else 0.0),
@@ -119,6 +126,12 @@ class LogprobsProcessor:
 
         # FAST PATH: If target_token_ids provided, extract only those
         # (avoids creating 262M Logprob objects for full vocab)
+        import sys
+        print(f"[DEBUG _update_prompt_logprobs] "
+              f"target_token_ids={'NOT NONE' if self.target_token_ids else 'NONE'}, "
+              f"using_fast_path={self.target_token_ids is not None}",
+              file=sys.stderr, flush=True)
+        
         if self.target_token_ids is not None:
             self._update_prompt_logprobs_fast_path(
                 prompt_logprobs_tensors, self.target_token_ids
