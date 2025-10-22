@@ -3095,14 +3095,25 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             
             if use_fast_path:
                 # tgt_token_ids already has the correct tokens - just use fast path!
+                import sys
+                print(f"[DEBUG] CALLING gather_target_logprobs with tgt_token_ids type={type(tgt_token_ids)}, "
+                      f"shape={tgt_token_ids.shape if hasattr(tgt_token_ids, 'shape') else 'N/A'}, "
+                      f"dtype={tgt_token_ids.dtype if hasattr(tgt_token_ids, 'dtype') else 'N/A'}",
+                      file=sys.stderr, flush=True)
+                
                 token_ids, logprobs, ranks = self.sampler.gather_target_logprobs(
                     logprobs, tgt_token_ids
                 )
+                
+                print(f"[DEBUG] AFTER gather_target_logprobs: token_ids.shape={token_ids.shape}, "
+                      f"logprobs.shape={logprobs.shape}",
+                      file=sys.stderr, flush=True)
+                
                 # DEBUG: Verify we got the right shape
                 if token_ids.shape[1] != 1:
                     raise RuntimeError(
                         f"Fast path failed! Expected shape [N, 1], got {token_ids.shape}. "
-                        f"request.target_token_ids length: {len(request.target_token_ids)}"
+                        f"tgt_token_ids: {tgt_token_ids[:10]}"
                     )
             else:
                 # Standard path: gather top-k logprobs
