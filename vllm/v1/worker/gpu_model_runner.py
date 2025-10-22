@@ -3078,18 +3078,19 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # Compute prompt logprobs.
             logprobs = self.sampler.compute_logprobs(logits)
             
-            # Optimization: If target_token_ids is set (score_mode), use fast path
-            # This extracts only the target tokens instead of full vocab or top-k
-            has_attr = hasattr(request, 'target_token_ids')
-            is_not_none = has_attr and request.target_token_ids is not None
-            has_length = is_not_none and len(request.target_token_ids) > 0
-            use_fast_path = has_attr and is_not_none and has_length
+            # Optimization: If score_mode is enabled, use fast path
+            # Check sampling_params directly (avoids serialization issues)
+            use_fast_path = (request.sampling_params is not None and 
+                           hasattr(request.sampling_params, 'score_mode') and
+                           request.sampling_params.score_mode)
             
             # CRITICAL DEBUG
             import sys
             print(f"[DEBUG gpu_model_runner] req_id={req_id}, "
-                  f"has_attr={has_attr}, is_not_none={is_not_none}, "
-                  f"has_length={has_length}, use_fast_path={use_fast_path}", 
+                  f"has_sampling_params={request.sampling_params is not None}, "
+                  f"has_score_mode={hasattr(request.sampling_params, 'score_mode') if request.sampling_params else False}, "
+                  f"score_mode_value={request.sampling_params.score_mode if request.sampling_params and hasattr(request.sampling_params, 'score_mode') else None}, "
+                  f"use_fast_path={use_fast_path}", 
                   file=sys.stderr, flush=True)
             
             if use_fast_path:
