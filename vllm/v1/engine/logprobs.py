@@ -217,9 +217,18 @@ class LogprobsProcessor:
         
         # Data is already extracted by Sampler - just flatten and transfer to CPU!
         # token_ids_tensor.shape = [num_positions, 1], need to flatten to [num_positions]
+        import sys
+        print(f"[DEBUG fast_path] tensor shapes: token_ids={token_ids_tensor.shape}, "
+              f"logprobs={logprobs_tensor.shape}, ranks={ranks_tensor.shape}",
+              file=sys.stderr, flush=True)
+        
         target_logprobs_cpu = logprobs_tensor.flatten().cpu().tolist()  # [num_positions, 1] -> [num_positions]
         target_ranks_cpu = ranks_tensor.cpu().tolist()  # [num_positions]
         target_token_ids_cpu = token_ids_tensor.flatten().cpu().tolist()  # [num_positions, 1] -> [num_positions]
+        
+        print(f"[DEBUG fast_path] expected tokens: {target_token_ids[:5]}, "
+              f"got tokens: {target_token_ids_cpu[:5]}, match={target_token_ids_cpu[:5] == target_token_ids[:5]}",
+              file=sys.stderr, flush=True)
         
         # Note: We don't validate here because gpu_model_runner might pass a chunk
         # of target_token_ids (for chunked prefill), not the full list
