@@ -88,11 +88,13 @@ find_package(Torch REQUIRED)
 if(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
   # Exclude SM10.0 and SM11.0 due to incomplete kernel implementations (keep SM12.0 for GB20x)
-  set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;12.0")
+  # Use 12.0f suffix for proper FP4 kernel compilation with CUDA 13+
+  set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;12.0;12.0f")
 elseif(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
   # Exclude SM10.0 and SM11.0 due to incomplete kernel implementations (keep SM12.0 for GB20x)
-  set(CUDA_SUPPORTED_ARCHS "7.0;7.2;7.5;8.0;8.6;8.7;8.9;9.0;12.0")
+  # Use 12.0a suffix for proper FP4 kernel compilation
+  set(CUDA_SUPPORTED_ARCHS "7.0;7.2;7.5;8.0;8.6;8.7;8.9;9.0;12.0;12.0a")
 else()
   set(CUDA_SUPPORTED_ARCHS "7.0;7.2;7.5;8.0;8.6;8.7;8.9;9.0")
 endif()
