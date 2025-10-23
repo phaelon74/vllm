@@ -242,10 +242,16 @@ class LogprobsProcessor:
         
         # Build minimal dict: only 1 Logprob object per position (starting from position 1)
         # Note: self.prompt_logprobs already has [None] at position 0 from __init__
+        import sys
         for pos, (token_id, logprob, rank, token) in enumerate(
             zip(target_token_ids_cpu, target_logprobs_cpu, target_ranks_cpu, decoded_tokens)
         ):
             # Create dict with single entry (target token only)
+            if pos < 5:  # Debug first 5
+                print(f"[DEBUG dict_build] pos={pos}, token_id={token_id}, "
+                      f"len(prompt_logprobs)={len(self.prompt_logprobs)}",
+                      file=sys.stderr, flush=True)
+            
             self.prompt_logprobs.append({
                 token_id: Logprob(
                     logprob=logprob,

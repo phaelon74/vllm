@@ -119,10 +119,16 @@ def calculate_perplexity(
         if output.prompt_logprobs:
             # prompt_logprobs is a list indexed from 0, containing logprobs for positions [1, 2, ..., N-1]
             # prompt_logprobs[i] contains logprobs for window_tokens[i+1]
+            if len(output.prompt_logprobs) > 0:
+                print(f"[DEBUG SCRIPT] len(prompt_logprobs)={len(output.prompt_logprobs)}, "
+                      f"window_tokens[0:5]={window_tokens[:5]}")
             for i in range(len(output.prompt_logprobs)):
                 logprobs_dict = output.prompt_logprobs[i]
                 if logprobs_dict:
                     actual_token = window_tokens[i + 1]  # +1 because position 0 is excluded
+                    if i < 5:
+                        print(f"[DEBUG SCRIPT] i={i}, actual_token={actual_token}, "
+                              f"dict_keys={list(logprobs_dict.keys())}")
                     if actual_token in logprobs_dict:
                         logprob = logprobs_dict[actual_token].logprob
                         total_nll += -logprob
