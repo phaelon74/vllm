@@ -89,8 +89,8 @@ def calculate_perplexity(
             end_idx = min(start_idx + context_length, len(token_ids))
             windows.append((start_idx, end_idx))
     
-    for i in tqdm(range(num_windows), desc="Computing perplexity"):
-        start_idx, end_idx = windows[i]
+    for window_idx in tqdm(range(num_windows), desc="Computing perplexity"):
+        start_idx, end_idx = windows[window_idx]
         window_tokens = token_ids[start_idx:end_idx]
         
         if len(window_tokens) < 2:
@@ -121,6 +121,21 @@ def calculate_perplexity(
             # prompt_logprobs[1] contains logprobs for window_tokens[1]
             # prompt_logprobs[i] contains logprobs for window_tokens[i]
             # Start from index 1 (skip None at index 0)
+            
+            # DEBUG: Verify correct token alignment for first window
+            if window_idx == 0 and len(output.prompt_logprobs) > 5:
+                print(f"\n[DEBUG] First window verification:")
+                print(f"  window_tokens[0:5] = {window_tokens[:5]}")
+                print(f"  len(prompt_logprobs) = {len(output.prompt_logprobs)}")
+                for i in range(1, min(6, len(output.prompt_logprobs))):
+                    logprobs_dict = output.prompt_logprobs[i]
+                    expected_token = window_tokens[i]
+                    if logprobs_dict:
+                        top_token = max(logprobs_dict.items(), key=lambda x: x[1].logprob)
+                        print(f"  Position {i}: expecting token {expected_token}, "
+                              f"got dict with keys {list(logprobs_dict.keys())[:3]}, "
+                              f"top token = {top_token[0]} (logprob={top_token[1].logprob:.4f})")
+            
             for i in range(1, len(output.prompt_logprobs)):
                 logprobs_dict = output.prompt_logprobs[i]
                 if logprobs_dict:
