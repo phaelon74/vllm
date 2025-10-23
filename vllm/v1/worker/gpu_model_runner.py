@@ -3035,8 +3035,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if not logprobs_tensors:
                 # Create empty logprobs CPU tensors for the entire prompt.
                 # If chunked, we'll copy in slice by slice.
+                # For score_mode, allocate only 1 column (target tokens only)
+                is_score_mode = (request.sampling_params and 
+                               hasattr(request.sampling_params, 'score_mode') and
+                               request.sampling_params.score_mode)
+                num_logprobs_cols = 1 if is_score_mode else (num_prompt_logprobs + 1)
+                
                 logprobs_tensors = LogprobsTensors.empty_cpu(
-                    num_prompt_tokens - 1, num_prompt_logprobs + 1
+                    num_prompt_tokens - 1, num_logprobs_cols
                 )
                 in_progress_dict[req_id] = logprobs_tensors
 
