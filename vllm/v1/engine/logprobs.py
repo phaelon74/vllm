@@ -48,13 +48,6 @@ class LogprobsProcessor:
         # Extract target_token_ids if provided (for score_mode optimization)
         target_token_ids = request.target_token_ids
         
-        # CRITICAL DEBUG
-        import sys
-        print(f"[DEBUG LogprobsProcessor.from_new_request] "
-              f"target_token_ids={'NOT NONE' if target_token_ids else 'NONE'}, "
-              f"length={len(target_token_ids) if target_token_ids else 0}",
-              file=sys.stderr, flush=True)
-        
         return cls(
             tokenizer=tokenizer,
             cumulative_logprob=(None if num_logprobs is None else 0.0),
@@ -126,12 +119,6 @@ class LogprobsProcessor:
 
         # FAST PATH: If target_token_ids provided, extract only those
         # (avoids creating 262M Logprob objects for full vocab)
-        import sys
-        print(f"[DEBUG _update_prompt_logprobs] "
-              f"target_token_ids={'NOT NONE' if self.target_token_ids else 'NONE'}, "
-              f"using_fast_path={self.target_token_ids is not None}",
-              file=sys.stderr, flush=True)
-        
         if self.target_token_ids is not None:
             self._update_prompt_logprobs_fast_path(
                 prompt_logprobs_tensors, self.target_token_ids
@@ -217,21 +204,9 @@ class LogprobsProcessor:
         
         # Data is already extracted by Sampler - just flatten and transfer to CPU!
         # token_ids_tensor.shape = [num_positions, 1], need to flatten to [num_positions]
-        import sys
-        print(f"[DEBUG fast_path] tensor shapes: token_ids={token_ids_tensor.shape}, "
-              f"logprobs={logprobs_tensor.shape}, ranks={ranks_tensor.shape}",
-              file=sys.stderr, flush=True)
-        
-        target_logprobs_cpu = logprobs_tensor.flatten().cpu().tolist()  # [num_positions, 1] -> [num_positions]
-        target_ranks_cpu = ranks_tensor.cpu().tolist()  # [num_positions]
-        target_token_ids_cpu = token_ids_tensor.flatten().cpu().tolist()  # [num_positions, 1] -> [num_positions]
-        
-        print(f"[DEBUG fast_path] expected tokens: {target_token_ids[:5]}, "
-              f"got tokens: {target_token_ids_cpu[:5]}, match={target_token_ids_cpu[:5] == target_token_ids[:5]}",
-              file=sys.stderr, flush=True)
-        
-        # Note: We don't validate here because gpu_model_runner might pass a chunk
-        # of target_token_ids (for chunked prefill), not the full list
+        target_logprobs_cpu = logprobs_tensor.flatten().cpu().tolist()
+        target_ranks_cpu = ranks_tensor.cpu().tolist()
+        target_token_ids_cpu = token_ids_tensor.flatten().cpu().tolist()
         
         # Optionally detokenize (only target tokens, very fast)
         decoded_tokens = (
@@ -242,16 +217,10 @@ class LogprobsProcessor:
         
         # Build minimal dict: only 1 Logprob object per position (starting from position 1)
         # Note: self.prompt_logprobs already has [None] at position 0 from __init__
-        import sys
         for pos, (token_id, logprob, rank, token) in enumerate(
             zip(target_token_ids_cpu, target_logprobs_cpu, target_ranks_cpu, decoded_tokens)
         ):
             # Create dict with single entry (target token only)
-            if pos < 5:  # Debug first 5
-                print(f"[DEBUG dict_build] pos={pos}, token_id={token_id}, "
-                      f"len(prompt_logprobs)={len(self.prompt_logprobs)}",
-                      file=sys.stderr, flush=True)
-            
             self.prompt_logprobs.append({
                 token_id: Logprob(
                     logprob=logprob,

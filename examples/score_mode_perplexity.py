@@ -120,27 +120,15 @@ def calculate_perplexity(
             # prompt_logprobs[0] is None (position 0 has no logprobs)
             # prompt_logprobs[1] contains logprobs for window_tokens[1]
             # prompt_logprobs[i] contains logprobs for window_tokens[i]
-            if len(output.prompt_logprobs) > 0:
-                print(f"[DEBUG SCRIPT] len(prompt_logprobs)={len(output.prompt_logprobs)}, "
-                      f"window_tokens[0:5]={window_tokens[:5]}")
             # Start from index 1 (skip None at index 0)
             for i in range(1, len(output.prompt_logprobs)):
                 logprobs_dict = output.prompt_logprobs[i]
                 if logprobs_dict:
-                    actual_token = window_tokens[i]  # Direct mapping now!
-                    if i < 5:
-                        print(f"[DEBUG SCRIPT] i={i}, actual_token={actual_token}, "
-                              f"dict_keys={list(logprobs_dict.keys())}")
+                    actual_token = window_tokens[i]
                     if actual_token in logprobs_dict:
                         logprob = logprobs_dict[actual_token].logprob
                         total_nll += -logprob
                         total_tokens += 1
-                    else:
-                        # This should never happen with our optimization - raise error to debug
-                        raise ValueError(
-                            f"Token {actual_token} not found in logprobs at position {i+1}. "
-                            f"Available tokens: {list(logprobs_dict.keys())[:10]}"
-                        )
     
     if total_tokens == 0:
         raise ValueError("No valid tokens found for perplexity calculation")
