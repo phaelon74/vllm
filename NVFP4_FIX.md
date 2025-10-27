@@ -30,13 +30,15 @@ Updated `CMakeLists.txt` to include both the base architecture and the suffixed 
 
 ### For CUDA 12.8+:
 ```cmake
-set(CUDA_SUPPORTED_ARCHS "7.0;7.2;7.5;8.0;8.6;8.7;8.9;9.0;12.0;12.0a")
+set(CUDA_SUPPORTED_ARCHS "7.0;7.2;7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.0a;12.0;12.0a")
 ```
 
 ### For CUDA 13.0+:
 ```cmake
-set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;12.0;12.0f")
+set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.0f;12.0;12.0f")
 ```
+
+**Important:** We include `10.0` and `10.0a/10.0f` even though we don't want to build most kernels for SM10.0. This is necessary because PyTorch 2.8.0+cu129 includes `sm_100` in its architecture list, and if we don't include it in CUDA_SUPPORTED_ARCHS, the architecture intersection logic breaks.
 
 The suffixes enable the architecture intersection logic to correctly identify that FP4 kernels should be built for your Blackwell GPUs.
 
@@ -104,11 +106,15 @@ The CMake `cuda_archs_loose_intersection()` function uses these suffixes to matc
 
 ### Why This Happened
 
-The stable vLLM build likely:
-1. Was built on a system that auto-detected the architecture with the suffix
-2. Or had the complete architecture list before SM10/SM11 removal
+**Two problems combined:**
 
-When you manually modified `CUDA_SUPPORTED_ARCHS`, the suffix was lost, breaking the FP4 kernel detection.
+1. **Missing architecture suffixes**: When you removed SM10.0 and SM11.0, you kept only `12.0` without the `12.0a` suffix that the FP4 build logic requires.
+
+2. **PyTorch architecture mismatch**: Your PyTorch 2.8.0+cu129 was compiled with `sm_100` and `sm_120`, which become `10.0` and `12.0` in CMake's architecture list. When `10.0` wasn't in `CUDA_SUPPORTED_ARCHS`, the architecture intersection logic failed, preventing `12.0a` from being properly matched.
+
+The stable vLLM build likely either:
+- Was built with an older PyTorch that didn't include `sm_100`
+- Or had the complete architecture list before SM10/SM11 removal
 
 ## Validation Checklist
 
