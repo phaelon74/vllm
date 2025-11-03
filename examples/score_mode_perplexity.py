@@ -283,24 +283,72 @@ def main():
         # Load dataset
         try:
             from datasets import load_dataset
+            import datasets
+            
+            print(f"Using datasets library version: {datasets.__version__}")
             
             # Load dataset with optional config
-            if args.dataset_config:
-                print(f"Loading dataset: {args.dataset} (config: {args.dataset_config})")
-                dataset = load_dataset(args.dataset, args.dataset_config, split="test")
-            else:
-                print(f"Loading dataset: {args.dataset}")
-                dataset = load_dataset(args.dataset, split="test")
+            # Try different splits (test, train, validation) automatically
+            dataset = None
+            split_name = None
+            for split in ["test", "train", "validation"]:
+                try:
+                    if args.dataset_config:
+                        print(f"Loading dataset: {args.dataset} (config: {args.dataset_config}, split: {split})")
+                        # Try with trust_remote_code to handle newer dataset formats
+                        dataset = load_dataset(
+                            args.dataset, 
+                            args.dataset_config, 
+                            split=split,
+                            trust_remote_code=True
+                        )
+                    else:
+                        print(f"Loading dataset: {args.dataset} (split: {split})")
+                        # Try with trust_remote_code to handle newer dataset formats
+                        dataset = load_dataset(
+                            args.dataset, 
+                            split=split,
+                            trust_remote_code=True
+                        )
+                    print(f"✓ Successfully loaded {len(dataset)} examples from '{split}' split")
+                    split_name = split
+                    break
+                except Exception as split_error:
+                    print(f"  Split '{split}' not available: {split_error}")
+                    continue
             
-            print(f"Loaded {len(dataset)} examples from dataset")
+            if dataset is None:
+                raise ValueError(
+                    "Could not load dataset with any split (test/train/validation).\n"
+                    "If you see 'Feature type List not found', try upgrading datasets:\n"
+                    "  pip install --upgrade datasets"
+                )
             
             # Determine how many samples to use
             num_samples = args.num_samples if args.num_samples else len(dataset)
             num_samples = min(num_samples, len(dataset))
             
             # Concatenate text samples
-            # For wikitext, join with double newline to separate articles
-            text = "\n\n".join(dataset["text"][:num_samples])
+            # Try to access 'text' field, or extract from 'messages' field
+            print(f"Dataset columns: {dataset.column_names}")
+            
+            if "text" in dataset.column_names:
+                print("Using 'text' field from dataset")
+                text = "\n\n".join(dataset["text"][:num_samples])
+            elif "messages" in dataset.column_names:
+                print("Using 'messages' field from dataset (extracting text)")
+                # For chat datasets (e.g., Neural Magic), extract text from messages
+                texts = []
+                for sample in dataset.select(range(num_samples)):
+                    if isinstance(sample["messages"], list):
+                        # Join all message contents
+                        texts.append(" ".join([msg.get("content", "") for msg in sample["messages"]]))
+                    else:
+                        texts.append(str(sample["messages"]))
+                text = "\n\n".join(texts)
+            else:
+                raise ValueError(f"Dataset must have 'text' or 'messages' field. Found: {dataset.column_names}")
+            
             print(f"Using {num_samples} samples ({len(text)} characters)")
             
         except ImportError:
@@ -309,10 +357,11 @@ def main():
             return
         except Exception as e:
             print(f"ERROR loading dataset: {e}")
-            print("\nFor WikiText-2, use:")
+            print("\nExamples:")
             print("  --dataset wikitext --dataset-config wikitext-2-raw-v1")
-            print("\nFor WikiText-103, use:")
-            print("  --dataset wikitext --dataset-config wikitext-103-raw-v1")
+            print("  --dataset neuralmagic/LLM_compression_calibration")
+            print("\nNote: If you see 'Feature type List not found', upgrade datasets:")
+            print("  pip install --upgrade datasets")
             return
     else:
         print("ERROR: Must provide either --text or --dataset")
