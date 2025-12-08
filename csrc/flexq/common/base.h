@@ -23,28 +23,16 @@
 // Define GPU_ARCH from __CUDA_ARCH__ if not already defined
 // __CUDA_ARCH__ is defined by NVCC (e.g., 800 for SM 8.0, 1200 for SM 12.0)
 // GPU_ARCH should be the major version (e.g., 80 for SM 8.0, 120 for SM 12.0)
-// For host code compilation, __CUDA_ARCH__ is not defined, so we default to 80
+// FlexQ kernels require SM 8.0+ (Ampere or later), so we default to 80
 #ifndef GPU_ARCH
 #if defined(__CUDA_ARCH__)
-#if __CUDA_ARCH__ >= 1200
-#define GPU_ARCH 120
-#elif __CUDA_ARCH__ >= 1100
-#define GPU_ARCH 110
-#elif __CUDA_ARCH__ >= 1000
-#define GPU_ARCH 100
-#elif __CUDA_ARCH__ >= 900
-#define GPU_ARCH 90
-#elif __CUDA_ARCH__ >= 800
-#define GPU_ARCH 80
-#elif __CUDA_ARCH__ >= 750
-#define GPU_ARCH 75
-#elif __CUDA_ARCH__ >= 700
-#define GPU_ARCH 70
+// Convert __CUDA_ARCH__ to GPU_ARCH (e.g., 800 -> 80, 1200 -> 120)
+// Use integer division: __CUDA_ARCH__ / 10
+#define GPU_ARCH_VALUE (__CUDA_ARCH__ / 10)
+#define GPU_ARCH GPU_ARCH_VALUE
 #else
-#define GPU_ARCH 60
-#endif
-#else
-// Default to 80 (Ampere) if __CUDA_ARCH__ is not defined (host code)
+// Default to 80 (Ampere) for host code compilation
+// FlexQ requires SM 8.0+, so this is safe
 #define GPU_ARCH 80
 #endif
 #endif

@@ -74,18 +74,14 @@ struct FQBMMAKernel {
     static constexpr bool GridMapping = GridMappingXYToMN;
     // determine the number of threads
     static constexpr int blockDims = 32 * WARPS_M_NUMS * WARPS_N_NUMS;
-#if GPU_ARCH >= 80
     // use multi-stage shared-mem buffer (needed by async copy)
     // data is copied directly from globalmem to shared memory without going through registers.
+    // Note: FlexQ kernels require SM 8.0+ (Ampere or later), so we always define this
     static constexpr size_t input_buffer_size_static =
         kThreadBlockStage * BLOCK_M * BLOCK_K * X_BITS / 8 +
         kThreadBlockStage * BLOCK_N * BLOCK_K * W_BITS / 8 + 
         kThreadBlockStage * SCALE_SIZE_X(BLOCK_M) * BLOCK_K / GROUP_SIZE * 4 + 
-        kThreadBlockStage * SCALE_SIZE_W(BLOCK_N) * BLOCK_K / GROUP_SIZE * 4;
-#else // GPU_ARCH < 80
-    // Not supported - define a default value to avoid compilation errors
-    static constexpr size_t input_buffer_size_static = 0;
-#endif 
+        kThreadBlockStage * SCALE_SIZE_W(BLOCK_N) * BLOCK_K / GROUP_SIZE * 4; 
 
     // The output results need to be stored in shem for scaling processing.
     // static constexpr size_t output_buffer_size_static =
