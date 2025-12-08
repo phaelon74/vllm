@@ -47,23 +47,24 @@ FQBMMAInitFn_t select_w6a16_kernel(int M, int N, int K) {
 
 // W6A8 GEMM function
 torch::Tensor flexq_w6a8_gemm(
-    torch::Tensor x,           // Input activations (FP16)
-    torch::Tensor w,           // Packed weights (int8/int32)
-    torch::Tensor x_scale,     // Activation scales (FP16)
-    torch::Tensor w_scale,     // Weight scales (FP16)
-    int group_size) {
+    torch::Tensor input,           // Input activations (FP16)
+    torch::Tensor weight_packed,   // Packed weights (int8/int32)
+    torch::Tensor input_scale,     // Activation scales (FP16)
+    torch::Tensor weight_scale,    // Weight scales (FP16)
+    int64_t group_size,
+    bool bias) {
     
-    TORCH_CHECK(x.dtype() == torch::kFloat16, "x must be FP16");
-    TORCH_CHECK(w.dtype() == torch::kInt8 || w.dtype() == torch::kInt32, "w must be int8 or int32");
-    TORCH_CHECK(x_scale.dtype() == torch::kFloat16, "x_scale must be FP16");
-    TORCH_CHECK(w_scale.dtype() == torch::kFloat16, "w_scale must be FP16");
+    TORCH_CHECK(input.dtype() == torch::kFloat16, "input must be FP16");
+    TORCH_CHECK(weight_packed.dtype() == torch::kInt8 || weight_packed.dtype() == torch::kInt32, "weight_packed must be int8 or int32");
+    TORCH_CHECK(input_scale.dtype() == torch::kFloat16, "input_scale must be FP16");
+    TORCH_CHECK(weight_scale.dtype() == torch::kFloat16, "weight_scale must be FP16");
     
-    int M = x.size(0);
-    int K = x.size(1);
-    int N = w.size(0);
+    int M = input.size(0);
+    int K = input.size(1);
+    int N = weight_packed.size(0);
     
     // Create output tensor
-    auto options = torch::TensorOptions().dtype(torch::kFloat16).device(x.device());
+    auto options = torch::TensorOptions().dtype(torch::kFloat16).device(input.device());
     auto output = torch::empty({M, N}, options);
     
     // Get CUDA stream
@@ -78,21 +79,21 @@ torch::Tensor flexq_w6a8_gemm(
     // For now, this is a placeholder - actual quantization should be done here
     
     // Convert tensors to the expected types
-    auto x_int8 = x.to(torch::kInt8);  // This is a placeholder - actual quantization needed
-    auto w_int32 = w.to(torch::kInt32);  // Unpack if needed
+    auto input_int8 = input.to(torch::kInt8);  // This is a placeholder - actual quantization needed
+    auto weight_int32 = weight_packed.to(torch::kInt32);  // Unpack if needed
     
     // Call the kernel initialization function
     // Note: FlexQ uses CUDA's half type (__half), not at::Half
     // We need to cast the pointers appropriately
     FQBMMAOpState state = init_fn(
-        x_int8.data_ptr<int>(),
-        w_int32.data_ptr<int>(),
-        reinterpret_cast<half*>(x_scale.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(w_scale.data_ptr<at::Half>()),
+        input_int8.data_ptr<int>(),
+        weight_int32.data_ptr<int>(),
+        reinterpret_cast<half*>(input_scale.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(weight_scale.data_ptr<at::Half>()),
         M, N, K,
         reinterpret_cast<half*>(output.data_ptr<at::Half>()),
-        group_size,
-        false  // bias
+        static_cast<int>(group_size),
+        bias
     );
     
     if (!state.initSuccess) {
@@ -108,26 +109,27 @@ torch::Tensor flexq_w6a8_gemm(
 
 // W6A16 GEMM function
 torch::Tensor flexq_w6a16_gemm(
-    torch::Tensor x,           // Input activations (FP16)
-    torch::Tensor w,           // Packed weights (int8/int32)
-    torch::Tensor x_scale,     // Activation scales (FP16)
-    torch::Tensor w_scale,     // Weight scales (FP16)
-    int group_size) {
+    torch::Tensor input,           // Input activations (FP16)
+    torch::Tensor weight_packed,   // Packed weights (int8/int32)
+    torch::Tensor input_scale,     // Activation scales (FP16)
+    torch::Tensor weight_scale,    // Weight scales (FP16)
+    int64_t group_size,
+    bool bias) {
     
-    TORCH_CHECK(x.dtype() == torch::kFloat16, "x must be FP16");
-    TORCH_CHECK(w.dtype() == torch::kInt8 || w.dtype() == torch::kInt32, "w must be int8 or int32");
-    TORCH_CHECK(x_scale.dtype() == torch::kFloat16, "x_scale must be FP16");
-    TORCH_CHECK(w_scale.dtype() == torch::kFloat16, "w_scale must be FP16");
+    TORCH_CHECK(input.dtype() == torch::kFloat16, "input must be FP16");
+    TORCH_CHECK(weight_packed.dtype() == torch::kInt8 || weight_packed.dtype() == torch::kInt32, "weight_packed must be int8 or int32");
+    TORCH_CHECK(input_scale.dtype() == torch::kFloat16, "input_scale must be FP16");
+    TORCH_CHECK(weight_scale.dtype() == torch::kFloat16, "weight_scale must be FP16");
     
     // For W6A16, we quantize FP16 activations to int8 and use W6A8 kernels
     // This is a simplified approach - ideally we'd have dedicated W6A16 kernels
     
     // Quantize activations from FP16 to int8
     // TODO: Implement proper quantization
-    auto x_int8 = x.to(torch::kInt8);  // Placeholder
+    auto input_int8 = input.to(torch::kInt8);  // Placeholder
     
     // Use the W6A8 kernel
-    return flexq_w6a8_gemm(x_int8, w, x_scale, w_scale, group_size);
+    return flexq_w6a8_gemm(input_int8, weight_packed, input_scale, weight_scale, group_size, bias);
 }
 
 #endif // USE_ROCM
