@@ -1,23 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-// Explicitly include Python.h FIRST to ensure Python headers are fully initialized
-// This must come before any standard library headers that might conflict
-#define PY_SSIZE_T_CLEAN
-#include <Python.h>
-
-// Now include PyTorch headers (torch/extension.h expects Python.h to be included)
-#include <torch/extension.h>
+// For CUDA files, we need to avoid Python headers during device code compilation
+// Include only what's needed for host code (torch::Tensor types)
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 
-// Include standard library headers
 #include <vector>
 #include <algorithm>
 #include <cassert>
 
-// Include FlexQ headers last - they include base.h and flexq_bmma_op.h (which has iostream)
-// Python headers are now fully initialized, so iostream shouldn't conflict
+// Include FlexQ headers - these contain CUDA device code
 #include "flexq/src/bgemm/flexq_bmma_library.h"
 #include "flexq/src/bgemm/flexq_bmma_op.h"
 
