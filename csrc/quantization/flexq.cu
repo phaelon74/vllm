@@ -27,6 +27,7 @@ namespace flexq {
 // The macro FQ_DECL_FUN(FQBMMA, 8, 6, true, 4, 16, 256, 32, 48, 128, 8, 8, 128, 2, 1)
 // generates: extern FQBMMAInitFn_t FQBMMA_8x6xtrue_4x16x256_32x48x128_8x8x128_2_1_InitFn;
 // Since these are declared extern in the header, we can reference them directly
+// Note: FQBMMAInitFn_t and FQBMMAExecFn_t are defined in global namespace, not vllm::flexq
 FQBMMAInitFn_t select_w6a8_kernel(int M, int N, int K) {
     // Select kernel based on M dimension
     // Using cta<4,16,256> warp<32,48,128> mma<8,8,128> with 2 stages as default
@@ -68,8 +69,8 @@ torch::Tensor flexq_w6a8_gemm(
     // Get CUDA stream
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
     
-    // Select kernel
-    vllm::flexq::FQBMMAInitFn_t init_fn = vllm::flexq::select_w6a8_kernel(M, N, K);
+    // Select kernel (FQBMMAInitFn_t is in global namespace)
+    FQBMMAInitFn_t init_fn = vllm::flexq::select_w6a8_kernel(M, N, K);
     
     // Prepare inputs
     // Note: FlexQ kernels expect quantized activations (int8), but we're passing FP16
@@ -96,8 +97,8 @@ torch::Tensor flexq_w6a8_gemm(
         TORCH_CHECK(false, "FlexQ kernel initialization failed");
     }
     
-    // Execute the kernel
-    vllm::flexq::FQBMMAExecFn_t exec_fn = FQBMMA_8x6xtrue_4x16x256_32x48x128_8x8x128_2_1_ExecFn;
+    // Execute the kernel (FQBMMAExecFn_t is in global namespace)
+    FQBMMAExecFn_t exec_fn = FQBMMA_8x6xtrue_4x16x256_32x48x128_8x8x128_2_1_ExecFn;
     exec_fn(state, stream.stream());
     
     return output;
