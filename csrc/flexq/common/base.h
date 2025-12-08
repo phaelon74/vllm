@@ -20,6 +20,35 @@
 #include <iostream>
 #include <string>
 
+// Define GPU_ARCH from __CUDA_ARCH__ if not already defined
+// __CUDA_ARCH__ is defined by NVCC (e.g., 800 for SM 8.0, 1200 for SM 12.0)
+// GPU_ARCH should be the major version (e.g., 80 for SM 8.0, 120 for SM 12.0)
+// For host code compilation, __CUDA_ARCH__ is not defined, so we default to 80
+#ifndef GPU_ARCH
+#if defined(__CUDA_ARCH__)
+#if __CUDA_ARCH__ >= 1200
+#define GPU_ARCH 120
+#elif __CUDA_ARCH__ >= 1100
+#define GPU_ARCH 110
+#elif __CUDA_ARCH__ >= 1000
+#define GPU_ARCH 100
+#elif __CUDA_ARCH__ >= 900
+#define GPU_ARCH 90
+#elif __CUDA_ARCH__ >= 800
+#define GPU_ARCH 80
+#elif __CUDA_ARCH__ >= 750
+#define GPU_ARCH 75
+#elif __CUDA_ARCH__ >= 700
+#define GPU_ARCH 70
+#else
+#define GPU_ARCH 60
+#endif
+#else
+// Default to 80 (Ampere) if __CUDA_ARCH__ is not defined (host code)
+#define GPU_ARCH 80
+#endif
+#endif
+
 // Define row/column major flag
 #define ROW_FIRST 0
 #define COL_FIRST 1
