@@ -79,7 +79,8 @@
 
 #define ASSEMBLY asm volatile
 
-#define CHECK(exp)                                                           \
+// Renamed from CHECK to CUDA_CHECK to avoid conflict with PyTorch's CHECK macro
+#define CUDA_CHECK(exp)                                                      \
     exp;                                                                     \
     const cudaError_t error = cudaGetLastError();                            \
     if (error != cudaSuccess) {                                              \
