@@ -5,12 +5,14 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 
-#include "flexq/src/bgemm/flexq_bmma_library.h"
-#include "flexq/src/bgemm/flexq_bmma_op.h"
-
 #include <vector>
 #include <algorithm>
 #include <cassert>
+
+// Include FlexQ headers after standard library and torch headers
+// to avoid conflicts with Python headers
+#include "flexq/src/bgemm/flexq_bmma_library.h"
+#include "flexq/src/bgemm/flexq_bmma_op.h"
 
 #ifndef USE_ROCM
 
