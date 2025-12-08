@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-// Include PyTorch headers first - this ensures Python headers are properly initialized
+// Explicitly include Python.h FIRST to ensure Python headers are fully initialized
+// This must come before any standard library headers that might conflict
+#define PY_SSIZE_T_CLEAN
+#include <Python.h>
+
+// Now include PyTorch headers (torch/extension.h expects Python.h to be included)
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -11,8 +16,8 @@
 #include <algorithm>
 #include <cassert>
 
-// Include FlexQ headers last - they include base.h which has iostream/string
-// By including torch/extension.h first, Python headers are already initialized
+// Include FlexQ headers last - they include base.h and flexq_bmma_op.h (which has iostream)
+// Python headers are now fully initialized, so iostream shouldn't conflict
 #include "flexq/src/bgemm/flexq_bmma_library.h"
 #include "flexq/src/bgemm/flexq_bmma_op.h"
 
