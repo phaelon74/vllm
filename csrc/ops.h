@@ -193,6 +193,20 @@ torch::Tensor awq_dequantize(torch::Tensor _kernel,
                              torch::Tensor _zeros, int64_t split_k_iters,
                              int64_t thx, int64_t thy);
 
+torch::Tensor flexq_w6a8_gemm(torch::Tensor input,
+                               torch::Tensor weight_packed,
+                               torch::Tensor input_scale,
+                               torch::Tensor weight_scale,
+                               int64_t group_size,
+                               bool bias = false);
+
+torch::Tensor flexq_w6a16_gemm(torch::Tensor input,
+                                torch::Tensor weight_packed,
+                                torch::Tensor input_scale,
+                                torch::Tensor weight_scale,
+                                int64_t group_size,
+                                bool bias = false);
+
 torch::Tensor permute_cols(torch::Tensor const& A, torch::Tensor const& perm);
 #endif
 

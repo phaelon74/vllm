@@ -44,6 +44,8 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A8Int,
     CompressedTensorsW4A16Fp4,
     CompressedTensorsW4A16Sparse24,
+    CompressedTensorsW6A8,
+    CompressedTensorsW6A16,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Int8,
     CompressedTensorsW8A16Fp8,
@@ -421,6 +423,94 @@ class CompressedTensorsConfig(QuantizationConfig):
         )
 
     @staticmethod
+    def _is_w6a8(
+        weight_quant: QuantizationArgs, input_quant: QuantizationArgs
+    ) -> bool:
+        """
+        Detect W6A8 quantization scheme for FlexQ kernels.
+        
+        Requirements:
+        - Weight quantization: 6 bits, GROUP strategy, symmetric, static
+        - Input quantization: 8 bits, TOKEN strategy, dynamic or static
+        - Group size: 128 (FlexQ requirement)
+        """
+        if weight_quant is None or input_quant is None:
+            return False
+        
+        is_weight_6_bits = weight_quant.num_bits == 6
+        is_activation_8_bits = input_quant.num_bits == 8
+        
+        # FlexQ uses GROUP quantization strategy
+        weight_strategy = weight_quant.strategy == QuantizationStrategy.GROUP.value
+        
+        # Input can be TOKEN or TENSOR strategy
+        input_strategy = (
+            input_quant.strategy == QuantizationStrategy.TOKEN.value
+            or input_quant.strategy == QuantizationStrategy.TENSOR.value
+        )
+        
+        # Weights must be static, symmetric
+        is_static_weight = not weight_quant.dynamic
+        is_symmetric_weight = weight_quant.symmetric
+        
+        # Input can be dynamic or static
+        # Both symmetric and asymmetric input quantization supported
+        is_symmetric_input = input_quant.symmetric
+        
+        # FlexQ uses group_size=128
+        is_group_size_128 = weight_quant.group_size == 128
+        
+        return (
+            is_weight_6_bits
+            and is_activation_8_bits
+            and weight_strategy
+            and input_strategy
+            and is_static_weight
+            and is_symmetric_weight
+            and is_group_size_128
+        )
+
+    @staticmethod
+    def _is_w6a16(
+        weight_quant: QuantizationArgs, input_quant: QuantizationArgs
+    ) -> bool:
+        """
+        Detect W6A16 quantization scheme for adapted FlexQ kernels.
+        
+        Requirements:
+        - Weight quantization: 6 bits, GROUP strategy, symmetric, static
+        - Input quantization: None (FP16 activations, no quantization)
+        - Group size: 128 (FlexQ requirement)
+        """
+        # W6A16 means weights are quantized but activations are FP16 (not quantized)
+        if weight_quant is None:
+            return False
+        
+        # Input should not be quantized (FP16 activations)
+        if input_quant is not None:
+            return False
+        
+        is_weight_6_bits = weight_quant.num_bits == 6
+        
+        # FlexQ uses GROUP quantization strategy
+        weight_strategy = weight_quant.strategy == QuantizationStrategy.GROUP.value
+        
+        # Weights must be static, symmetric
+        is_static_weight = not weight_quant.dynamic
+        is_symmetric_weight = weight_quant.symmetric
+        
+        # FlexQ uses group_size=128
+        is_group_size_128 = weight_quant.group_size == 128
+        
+        return (
+            is_weight_6_bits
+            and weight_strategy
+            and is_static_weight
+            and is_symmetric_weight
+            and is_group_size_128
+        )
+
+    @staticmethod
     def _is_fp8_w8a8(
         weight_quant: QuantizationArgs, input_quant: QuantizationArgs
     ) -> bool:
@@ -567,6 +657,14 @@ class CompressedTensorsConfig(QuantizationConfig):
                 actorder=weight_quant.actorder,
             )
 
+        # Check for W6A16 (weight-only with FlexQ kernels)
+        if self._is_w6a16(weight_quant, input_quant):
+            return CompressedTensorsW6A16(
+                num_bits=weight_quant.num_bits,
+                strategy=weight_quant.strategy,
+                group_size=weight_quant.group_size,
+            )
+
         if self._is_wNa16_group_channel(weight_quant, input_quant):
             if (
                 format == CompressionFormat.marlin_24.value
@@ -647,6 +745,16 @@ class CompressedTensorsConfig(QuantizationConfig):
             if self._is_dynamic_token_w4a8_int(weight_quant, input_quant):
                 is_static_input_scheme = input_quant and not input_quant.dynamic
                 return CompressedTensorsW4A8Int(
+                    num_bits=weight_quant.num_bits,
+                    strategy=weight_quant.strategy,
+                    group_size=weight_quant.group_size,
+                    is_static_input_scheme=is_static_input_scheme,
+                    input_symmetric=input_quant.symmetric,
+                )
+
+            if self._is_w6a8(weight_quant, input_quant):
+                is_static_input_scheme = input_quant and not input_quant.dynamic
+                return CompressedTensorsW6A8(
                     num_bits=weight_quant.num_bits,
                     strategy=weight_quant.strategy,
                     group_size=weight_quant.group_size,

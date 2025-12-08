@@ -561,6 +561,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("gptq_shuffle(Tensor! q_weight, Tensor q_perm, int bit) -> ()");
   ops.impl("gptq_shuffle", torch::kCUDA, &gptq_shuffle);
 
+#ifndef USE_ROCM
+  // FlexQ W6A8 GEMM
+  ops.def(
+      "flexq_w6a8_gemm(Tensor input, Tensor weight_packed, "
+      "Tensor input_scale, Tensor weight_scale, int group_size, bool bias) -> Tensor");
+  ops.impl("flexq_w6a8_gemm", torch::kCUDA, &flexq_w6a8_gemm);
+
+  // FlexQ W6A16 GEMM
+  ops.def(
+      "flexq_w6a16_gemm(Tensor input, Tensor weight_packed, "
+      "Tensor input_scale, Tensor weight_scale, int group_size, bool bias) -> Tensor");
+  ops.impl("flexq_w6a16_gemm", torch::kCUDA, &flexq_w6a16_gemm);
+#endif
+
   // Compute FP8 quantized tensor for given scaling factor.
   ops.def(
       "static_scaled_fp8_quant(Tensor! result, Tensor input, Tensor scale) -> "

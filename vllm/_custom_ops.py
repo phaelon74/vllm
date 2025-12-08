@@ -532,6 +532,33 @@ def gptq_gemm(
     )
 
 
+# flexq
+def flexq_w6a8_gemm(
+    input: torch.Tensor,
+    weight_packed: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    group_size: int,
+    bias: bool = False,
+) -> torch.Tensor:
+    return torch.ops._C.flexq_w6a8_gemm(
+        input, weight_packed, input_scale, weight_scale, group_size, bias
+    )
+
+
+def flexq_w6a16_gemm(
+    input: torch.Tensor,
+    weight_packed: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    group_size: int,
+    bias: bool = False,
+) -> torch.Tensor:
+    return torch.ops._C.flexq_w6a16_gemm(
+        input, weight_packed, input_scale, weight_scale, group_size, bias
+    )
+
+
 if hasattr(torch.ops._C, "gptq_gemm"):
 
     @register_fake("_C::gptq_gemm")
