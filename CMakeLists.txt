@@ -348,7 +348,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     "csrc/quantization/w8a8/int8/per_token_group_quant.cu"
     "csrc/flexq/src/bgemm/flexq_bmma_library.cu"
     "csrc/flexq/src/pack/bit_packing.cu"
-    "csrc/quantization/flexq.cpp")
+    "csrc/quantization/flexq.cu")
 
   set_gencode_flags_for_srcs(
     SRCS "${VLLM_EXT_SRC}"
