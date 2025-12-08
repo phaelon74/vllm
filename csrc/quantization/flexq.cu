@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-// For CUDA files, we need to avoid Python headers during device code compilation
-// Include only what's needed for host code (torch::Tensor types)
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
+// Use torch/all.h like other CUDA files (e.g., q_gemm.cu)
+// This provides torch::Tensor without Python header conflicts in CUDA context
+#include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 
