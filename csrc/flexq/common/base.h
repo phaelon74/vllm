@@ -17,8 +17,11 @@
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-// Note: iostream and string are NOT included here to avoid conflicts with Python headers
-// Include them directly in files that need them (e.g., flexq_bmma_op.h uses std::cerr)
+// Include iostream for isCudaSuccess function below
+// Note: This can cause conflicts with Python headers if included before Python.h
+// Files that include this header should include Python/torch headers first
+#include <iostream>
+#include <string>
 
 // Define GPU_ARCH from __CUDA_ARCH__ if not already defined
 // __CUDA_ARCH__ is defined by NVCC (e.g., 800 for SM 8.0, 1200 for SM 12.0)
