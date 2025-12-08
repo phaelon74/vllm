@@ -82,13 +82,15 @@ torch::Tensor flexq_w6a8_gemm(
     auto w_int32 = w.to(torch::kInt32);  // Unpack if needed
     
     // Call the kernel initialization function
+    // Note: FlexQ uses CUDA's half type (__half), not at::Half
+    // We need to cast the pointers appropriately
     FQBMMAOpState state = init_fn(
         x_int8.data_ptr<int>(),
         w_int32.data_ptr<int>(),
-        x_scale.data_ptr<at::Half>(),
-        w_scale.data_ptr<at::Half>(),
+        reinterpret_cast<half*>(x_scale.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(w_scale.data_ptr<at::Half>()),
         M, N, K,
-        output.data_ptr<at::Half>(),
+        reinterpret_cast<half*>(output.data_ptr<at::Half>()),
         group_size,
         false  // bias
     );
