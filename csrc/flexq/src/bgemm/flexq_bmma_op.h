@@ -15,7 +15,8 @@
 #pragma once
 #include "../../common/base.h"
 #include "flexq_bmma_kernel.h"
-// base.h already includes iostream, so std::cerr is available
+// Include iostream for std::cerr used in this file
+#include <iostream>
 
 struct FQBMMAOpState {
     size_t shared_mem_size;

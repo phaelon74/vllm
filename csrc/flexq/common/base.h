@@ -17,11 +17,8 @@
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-// Include iostream for isCudaSuccess function below
-// Note: This can cause conflicts with Python headers if included before Python.h
-// Files that include this header should include Python/torch headers first
-#include <iostream>
-#include <string>
+// Note: iostream and string are NOT included here to avoid Python header conflicts
+// Include them explicitly in files that need them
 
 // Define GPU_ARCH from __CUDA_ARCH__ if not already defined
 // __CUDA_ARCH__ is defined by NVCC (e.g., 800 for SM 8.0, 1200 for SM 12.0)
@@ -96,7 +93,8 @@ inline bool isCudaSuccess(cudaError_t status)
 {
     cudaError_t error = status;
     if (error != cudaSuccess) {
-        std::cerr << "Got bad cuda status: " << cudaGetErrorString(error) << std::endl;
+        // Use printf instead of std::cerr to avoid requiring <iostream>
+        printf("Got bad cuda status: %s\n", cudaGetErrorString(error));
         return false;
     }
     return true;
