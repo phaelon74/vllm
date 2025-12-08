@@ -17,8 +17,12 @@
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+// Conditionally include iostream and string to avoid conflicts with Python headers
+// These are only needed for error messages in host code
+#ifndef __CUDACC__
 #include <iostream>
 #include <string>
+#endif
 
 // Define GPU_ARCH from __CUDA_ARCH__ if not already defined
 // __CUDA_ARCH__ is defined by NVCC (e.g., 800 for SM 8.0, 1200 for SM 12.0)
