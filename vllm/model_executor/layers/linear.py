@@ -855,6 +855,25 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
         assert loaded_shard_id < len(self.output_sizes)
 
+        # Check if this is a scale-shaped checkpoint being loaded into a weight parameter
+        # (same logic as above, but for sharded weights)
+        is_scale_shape = len(loaded_weight.shape) >= 2 and loaded_weight.shape[-1] <= 10
+        is_weight_shape = len(param.data.shape) >= 2 and param.data.shape[-1] > 100
+        
+        if is_scale_shape and is_weight_shape:
+            # Try to find weight_scale parameter
+            from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w6a8 import FlexQScaleParameter
+            if hasattr(self, 'weight_scale') and isinstance(self.weight_scale, FlexQScaleParameter):
+                from vllm.logger import init_logger
+                logger = init_logger(__name__)
+                logger.warning(
+                    f"ColumnParallelLinear (sharded): Detected scale-shaped checkpoint (shape={loaded_weight.shape}) "
+                    f"being loaded into weight parameter (shape={param.data.shape}). "
+                    f"Redirecting to weight_scale."
+                )
+                self.weight_scale.load_row_parallel_weight(loaded_weight=loaded_weight)
+                return
+
         if isinstance(param, BlockQuantScaleParameter):
             assert self.quant_method is not None
             # Assume the weight block size has been set by quant method
@@ -873,6 +892,17 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         else:
             shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
             shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
+
+        # Debug logging before load_merged_column_weight
+        from vllm.logger import init_logger
+        logger = init_logger(__name__)
+        logger.info(
+            f"ColumnParallelLinear.load_merged_column_weight: "
+            f"param type={type(param).__name__}, "
+            f"param.data.shape={param.data.shape}, "
+            f"loaded_weight.shape={loaded_weight.shape}, "
+            f"shard_id={loaded_shard_id}, shard_offset={shard_offset}, shard_size={shard_size}"
+        )
 
         param.load_merged_column_weight(
             loaded_weight=loaded_weight,

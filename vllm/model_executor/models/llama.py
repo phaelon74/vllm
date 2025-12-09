@@ -458,6 +458,14 @@ class LlamaModel(nn.Module):
         ]
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        # Debug: Log all checkpoint parameter names for FlexQ debugging
+        all_checkpoint_names = [name for name, _ in weights]
+        if any("mlp.down_proj" in name for name in all_checkpoint_names):
+            from vllm.logger import init_logger
+            logger = init_logger(__name__)
+            mlp_params = [name for name in all_checkpoint_names if "mlp.down_proj" in name]
+            logger.info(f"Checkpoint parameters for mlp.down_proj: {mlp_params}")
+        
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
