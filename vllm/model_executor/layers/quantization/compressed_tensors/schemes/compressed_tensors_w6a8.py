@@ -37,7 +37,16 @@ class FlexQScaleParameter(BasevLLMParameter):
         Load weight scales for row parallel layers.
         Only shard along output dimension (dimension 0), not input dimension (dimension 1).
         """
+        # CRITICAL: This method MUST be called, not RowvLLMParameter.load_row_parallel_weight
+        # If this isn't being called, the parameter is not a FlexQScaleParameter instance
+        logger.info(
+            f"FlexQScaleParameter.load_row_parallel_weight CALLED: "
+            f"loaded_weight.shape={loaded_weight.shape}, self.data.shape={self.data.shape}, "
+            f"tp_rank={self.tp_rank}, type={type(self).__name__}"
+        )
+        
         # Shard along output dimension (dimension 0) only
+        # Never shard along input dimension (dimension 1) - checkpoint format is [output_size, 3]
         if loaded_weight.shape[0] != self.data.shape[0]:
             shard_size = self.data.shape[0]
             start_idx = self.tp_rank * shard_size
@@ -49,12 +58,19 @@ class FlexQScaleParameter(BasevLLMParameter):
                 loaded_weight = loaded_weight.narrow(0, start_idx, actual_size)
         
         # Copy the data (handling shape mismatches if needed)
+        # The checkpoint has shape [output_size, 3], we created [output_size_per_partition, 3]
+        # After sharding output dim, shapes should match or we copy what we can
         if loaded_weight.shape == self.data.shape:
             self.data.copy_(loaded_weight)
         else:
             # Handle shape mismatch - copy what we can
             min_out = min(loaded_weight.shape[0], self.data.shape[0])
             min_in = min(loaded_weight.shape[1], self.data.shape[1])
+            logger.warning(
+                f"FlexQScaleParameter shape mismatch: "
+                f"loaded_weight.shape={loaded_weight.shape}, self.data.shape={self.data.shape}, "
+                f"copying [{min_out}, {min_in}]"
+            )
             self.data[:min_out, :min_in].copy_(loaded_weight[:min_out, :min_in])
     
     def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
@@ -175,6 +191,10 @@ class CompressedTensorsW6A8(CompressedTensorsScheme):
             data=torch.empty(
                 output_size_per_partition, scales_and_zp_size_partition, dtype=torch.float16
             ),
+        )
+        logger.info(
+            f"Created FlexQScaleParameter: shape={weight_scale.data.shape}, "
+            f"type={type(weight_scale).__name__}, has load_row_parallel_weight={hasattr(weight_scale, 'load_row_parallel_weight')}"
         )
         layer.register_parameter("weight_scale", weight_scale)
         

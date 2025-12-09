@@ -1383,6 +1383,14 @@ class RowParallelLinear(LinearBase):
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
 
+        # Debug: Check parameter type before calling load_row_parallel_weight
+        from vllm.logger import init_logger
+        logger = init_logger(__name__)
+        logger.debug(
+            f"weight_loader_v2: param type={type(param).__name__}, "
+            f"loaded_weight.shape={loaded_weight.shape}, param.data.shape={param.data.shape if hasattr(param, 'data') else 'N/A'}"
+        )
+        
         param.load_row_parallel_weight(loaded_weight=loaded_weight)
 
     def forward(
