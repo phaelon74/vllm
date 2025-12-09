@@ -1766,25 +1766,45 @@ class EngineArgs:
             compilation_config.max_cudagraph_capture_size = (
                 self.max_cudagraph_capture_size
             )
-        config = VllmConfig(
-            model_config=model_config,
-            cache_config=cache_config,
-            parallel_config=parallel_config,
-            scheduler_config=scheduler_config,
-            device_config=device_config,
-            load_config=load_config,
-            attention_config=attention_config,
-            lora_config=lora_config,
-            speculative_config=speculative_config,
-            structured_outputs_config=self.structured_outputs_config,
-            observability_config=observability_config,
-            compilation_config=compilation_config,
-            kv_transfer_config=self.kv_transfer_config,
-            kv_events_config=self.kv_events_config,
-            ec_transfer_config=self.ec_transfer_config,
-            additional_config=self.additional_config,
-            optimization_level=self.optimization_level,
-        )
+        # Filter out any invalid fields from additional_config that might cause issues
+        # (e.g., scale_dtype, zp_dtype from compressed-tensors config)
+        filtered_additional_config = {}
+        if isinstance(self.additional_config, dict):
+            # Remove fields that aren't valid VllmConfig fields
+            invalid_fields = {"scale_dtype", "zp_dtype"}
+            filtered_additional_config = {
+                k: v for k, v in self.additional_config.items()
+                if k not in invalid_fields
+            }
+        else:
+            filtered_additional_config = self.additional_config
+        
+        # Build config dict, explicitly excluding any invalid fields
+        # that might come from model config or elsewhere
+        config_dict = {
+            "model_config": model_config,
+            "cache_config": cache_config,
+            "parallel_config": parallel_config,
+            "scheduler_config": scheduler_config,
+            "device_config": device_config,
+            "load_config": load_config,
+            "attention_config": attention_config,
+            "lora_config": lora_config,
+            "speculative_config": speculative_config,
+            "structured_outputs_config": self.structured_outputs_config,
+            "observability_config": observability_config,
+            "compilation_config": compilation_config,
+            "kv_transfer_config": self.kv_transfer_config,
+            "kv_events_config": self.kv_events_config,
+            "ec_transfer_config": self.ec_transfer_config,
+            "additional_config": filtered_additional_config,
+            "optimization_level": self.optimization_level,
+        }
+        # Remove any fields that might have been added incorrectly
+        # (e.g., scale_dtype, zp_dtype from compressed-tensors)
+        invalid_fields = {"scale_dtype", "zp_dtype"}
+        config_dict = {k: v for k, v in config_dict.items() if k not in invalid_fields}
+        config = VllmConfig(**config_dict)
 
         return config
 
