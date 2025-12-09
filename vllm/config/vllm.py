@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, get_args
 import torch
 from pydantic import ConfigDict, Field, model_validator
 from pydantic.dataclasses import dataclass
+from pydantic import field_validator
 
 import vllm.envs as envs
 from vllm.config.speculative import EagleModelTypes
@@ -238,6 +239,21 @@ class VllmConfig:
     performance, with -O0 having the best startup time and -O3 having the best
     performance. -02 is used by defult. See  OptimizationLevel for full
     description."""
+    
+    @model_validator(mode='before')
+    @classmethod
+    def filter_invalid_fields(cls, data: dict) -> dict:
+        """Filter out invalid fields that might come from compressed-tensors config.
+        
+        This validator runs before Pydantic validation and removes fields like
+        scale_dtype and zp_dtype that aren't part of VllmConfig but might be
+        passed from compressed-tensors configuration.
+        """
+        if isinstance(data, dict):
+            # Remove fields that aren't part of VllmConfig
+            invalid_fields = {'scale_dtype', 'zp_dtype'}
+            return {k: v for k, v in data.items() if k not in invalid_fields}
+        return data
 
     def compute_hash(self) -> str:
         """

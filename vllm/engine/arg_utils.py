@@ -1827,10 +1827,20 @@ class EngineArgs:
         # Get the valid field names from VllmConfig
         from dataclasses import fields as dataclass_fields
         valid_field_names = {f.name for f in dataclass_fields(VllmConfig)}
-        final_config_dict = {
-            k: v for k, v in filtered_config_dict.items() 
-            if k in valid_field_names
-        }
+        
+        # Explicitly filter to only valid fields and ensure invalid ones are removed
+        final_config_dict = {}
+        for k, v in filtered_config_dict.items():
+            if k in valid_field_names and k not in invalid_fields:
+                final_config_dict[k] = v
+        
+        # Final safety check - explicitly remove invalid fields
+        final_config_dict.pop('scale_dtype', None)
+        final_config_dict.pop('zp_dtype', None)
+        
+        # Verify no invalid fields remain
+        assert 'scale_dtype' not in final_config_dict, "scale_dtype still in config_dict!"
+        assert 'zp_dtype' not in final_config_dict, "zp_dtype still in config_dict!"
         
         config = VllmConfig(**final_config_dict)
 
