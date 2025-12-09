@@ -1386,14 +1386,40 @@ class RowParallelLinear(LinearBase):
         # Debug: Check parameter type before calling load_row_parallel_weight
         from vllm.logger import init_logger
         logger = init_logger(__name__)
+        # Try to get parameter name from the layer
+        param_name = None
+        for name, p in getattr(self, '_parameters', {}).items():
+            if p is param or (hasattr(p, 'data') and hasattr(param, 'data') and p.data.data_ptr() == param.data.data_ptr()):
+                param_name = name
+                break
+        
         logger.info(
-            f"weight_loader_v2: param type={type(param).__name__}, "
+            f"weight_loader_v2: param_name={param_name}, param type={type(param).__name__}, "
             f"loaded_weight.shape={loaded_weight.shape}, param.data.shape={param.data.shape if hasattr(param, 'data') else 'N/A'}, "
             f"hasattr(input_dim)={hasattr(param, 'input_dim')}, input_dim={getattr(param, 'input_dim', 'N/A')}"
         )
         
         # Check if this is a FlexQScaleParameter and handle it specially
         from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w6a8 import FlexQScaleParameter
+        
+        # Special handling: If we're loading a scale-shaped tensor (last dim is small, e.g., 3)
+        # into a weight parameter, this might be a scale checkpoint being loaded into the wrong parameter
+        # Check if loaded_weight looks like a scale (small last dimension) but param is a weight (large last dimension)
+        is_scale_shape = len(loaded_weight.shape) >= 2 and loaded_weight.shape[-1] <= 10
+        is_weight_shape = len(param.data.shape) >= 2 and param.data.shape[-1] > 100
+        
+        if is_scale_shape and is_weight_shape and param_name == "weight":
+            logger.warning(
+                f"Detected scale-shaped checkpoint (shape={loaded_weight.shape}) being loaded into weight parameter "
+                f"(shape={param.data.shape}). This might be a name mismatch. "
+                f"Trying to find weight_scale parameter instead."
+            )
+            # Try to find weight_scale parameter
+            if hasattr(self, 'weight_scale') and isinstance(self.weight_scale, FlexQScaleParameter):
+                logger.info("Found weight_scale parameter, loading scale there instead")
+                self.weight_scale.load_row_parallel_weight(loaded_weight=loaded_weight)
+                return
+        
         if isinstance(param, FlexQScaleParameter):
             logger.info("Detected FlexQScaleParameter, calling custom load_row_parallel_weight")
             param.load_row_parallel_weight(loaded_weight=loaded_weight)
