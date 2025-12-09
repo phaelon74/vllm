@@ -270,14 +270,31 @@ class CompressedTensorsW6A8(CompressedTensorsScheme):
         weight_packed = layer.weight  # Same as layer.weight_packed (both registered)
         weight_scale = layer.weight_scale
         
+        # Ensure input is FP16 (FlexQ kernels require FP16 input)
+        # During torch.compile, inputs might be converted to BF16 or other dtypes
+        if x.dtype != torch.float16:
+            x = x.to(torch.float16)
+        
         # Get input scale if static quantization
         # If not static, create a dummy scale tensor (FlexQ kernels require it)
         if self.is_static_input_scheme and hasattr(layer, "input_scale"):
-            input_scale = layer.input_scale
+            input_scale = layer.input_scale.data if hasattr(layer.input_scale, 'data') else layer.input_scale
         else:
             # Create a dummy scale tensor for dynamic quantization
             # FlexQ kernels handle dynamic quantization internally
             input_scale = torch.ones(1, dtype=torch.float16, device=x.device)
+        
+        # Ensure input_scale is FP16 and has the right shape
+        if isinstance(input_scale, torch.Tensor):
+            if input_scale.dtype != torch.float16:
+                input_scale = input_scale.to(torch.float16)
+        else:
+            input_scale = torch.ones(1, dtype=torch.float16, device=x.device)
+        
+        # Extract weight_scale data (it's a FlexQScaleParameter)
+        weight_scale_data = weight_scale.data if hasattr(weight_scale, 'data') else weight_scale
+        if weight_scale_data.dtype != torch.float16:
+            weight_scale_data = weight_scale_data.to(torch.float16)
         
         # Call FlexQ kernel
         # flexq_w6a8_gemm signature: (input, weight_packed, input_scale, weight_scale, group_size, bias)
@@ -293,7 +310,7 @@ class CompressedTensorsW6A8(CompressedTensorsScheme):
             x,  # input activations (FP16)
             weight_packed,  # packed weights (int32)
             input_scale,  # input scales (FP16)
-            weight_scale.data,  # weight scales (FP16) - extract data from parameter
+            weight_scale_data,  # weight scales (FP16)
             layer.flexq_group_size,  # group_size
             bias is not None,  # bias flag
         )
