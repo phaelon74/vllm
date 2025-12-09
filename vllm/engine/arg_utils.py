@@ -1802,9 +1802,16 @@ class EngineArgs:
         }
         # Remove any fields that might have been added incorrectly
         # (e.g., scale_dtype, zp_dtype from compressed-tensors)
+        # These fields are not part of VllmConfig and will cause validation errors
         invalid_fields = {"scale_dtype", "zp_dtype"}
-        config_dict = {k: v for k, v in config_dict.items() if k not in invalid_fields}
-        config = VllmConfig(**config_dict)
+        filtered_config_dict = {
+            k: v for k, v in config_dict.items() 
+            if k not in invalid_fields
+        }
+        
+        # Use model_validate which respects extra='ignore' from ConfigDict
+        # This ensures invalid fields are properly ignored
+        config = VllmConfig.model_validate(filtered_config_dict)
 
         return config
 
