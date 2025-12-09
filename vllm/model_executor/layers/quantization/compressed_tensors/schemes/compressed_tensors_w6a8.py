@@ -14,6 +14,7 @@ from vllm.model_executor.parameter import (
     ChannelQuantScaleParameter,
     GroupQuantScaleParameter,
     ModelWeightParameter,
+    _ColumnvLLMParameter,
 )
 from vllm.scalar_type import scalar_types
 
@@ -126,14 +127,13 @@ class CompressedTensorsW6A8(CompressedTensorsScheme):
         layer.register_parameter("weight_packed", weight)
         
         # Determine scale partitioning
-        # For row parallel layers, use ChannelQuantScaleParameter which only shards along output_dim
-        # This avoids shape mismatch issues when loading from checkpoint
-        # The checkpoint format might have scales with a different shape than expected
+        # For row parallel layers, use FlexQScaleParameter which handles shape mismatches
+        # The checkpoint format might have scales with shape [output_size, 3] or similar
+        # which doesn't match our expected [output_size_per_partition, scales_per_group]
         if row_parallel:
-            # For row parallel layers, use ChannelQuantScaleParameter
-            # which only shards along output_dim (column parallel)
-            # and doesn't try to shard along input_dim (row parallel)
-            weight_scale = ChannelQuantScaleParameter(
+            # For row parallel layers, use FlexQScaleParameter
+            # which handles shape mismatches during loading
+            weight_scale = FlexQScaleParameter(
                 output_dim=0,
                 weight_loader=weight_loader,
                 data=torch.empty(
@@ -177,7 +177,12 @@ class CompressedTensorsW6A8(CompressedTensorsScheme):
         """
         # FlexQ weights are expected to be pre-packed, so no processing needed
         # However, we may need to verify the format or convert if needed
-        pass
+        # The weight scales might need reshaping if the checkpoint format differs
+        if hasattr(layer, "weight_scale"):
+            weight_scale = layer.weight_scale
+            # Check if the scale shape matches what we expect
+            # If not, we might need to reshape or broadcast
+            pass
     
     def apply_weights(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None
