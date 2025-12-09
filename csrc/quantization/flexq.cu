@@ -80,28 +80,32 @@ torch::Tensor flexq_w6a8_gemm(
     // Select kernel (FQBMMAInitFn_t is in global namespace)
     FQBMMAInitFn_t init_fn = vllm::flexq::select_w6a8_kernel(M, N, K);
     
-    // Prepare inputs
-    // FlexQ kernels expect int* for quantized X and W inputs
-    // The kernel handles quantization internally, so we pass FP16 input
-    // but the kernel interface expects int* pointers
-    // NOTE: This requires the kernel to handle FP16->int8 quantization internally
-    // If the kernel doesn't support this, we need to quantize before calling
+    // Quantize FP16 input activations to int8 using input_scale
+    // Formula: quantized = clamp(round(input / scale), -128, 127)
+    // The kernel expects int* pointers, so we'll convert int8 to int32
     torch::Tensor input_contiguous = input.contiguous();
     
-    // For now, we'll pass FP16 data by casting the pointer to int*
-    // This is a workaround - proper implementation should quantize FP16 to int8/int32
-    // The kernel should handle quantization internally using the scales provided
-    // WARNING: This assumes the kernel can handle FP16 input internally
-    // If not, this will cause incorrect results
-    // TODO: Implement proper quantization from FP16 to int8/int32 before calling the kernel
+    // Get the scale value (input_scale might be a scalar or per-channel)
+    // For now, assume it's a scalar or broadcastable tensor
+    torch::Tensor input_fp32 = input_contiguous.to(torch::kFloat32);
+    torch::Tensor scale_fp32 = input_scale.to(torch::kFloat32);
+    
+    // Quantize: quantized = round(input / scale)
+    torch::Tensor input_quantized_fp32 = input_fp32 / scale_fp32;
+    
+    // Clamp to int8 range and convert to int8
+    input_quantized_fp32 = torch::clamp(torch::round(input_quantized_fp32), -128.0f, 127.0f);
+    torch::Tensor input_int8 = input_quantized_fp32.to(torch::kInt8);
+    
+    // Convert int8 to int32 (kernel expects int*)
+    // Each int32 will contain one int8 value (sign-extended)
+    torch::Tensor input_int32 = input_int8.to(torch::kInt32).contiguous();
     
     // Call the kernel initialization function
     // Note: FlexQ uses CUDA's half type (__half), not at::Half
     // We need to cast the pointers appropriately
-    // The kernel expects int* for X and W, but we're passing FP16 data
-    // This is incorrect and needs to be fixed with proper quantization
     FQBMMAOpState state = init_fn(
-        reinterpret_cast<int*>(input_contiguous.data_ptr<at::Half>()),
+        input_int32.data_ptr<int>(),
         weight_int32.data_ptr<int>(),
         reinterpret_cast<half*>(input_scale.data_ptr<at::Half>()),
         reinterpret_cast<half*>(weight_scale.data_ptr<at::Half>()),
