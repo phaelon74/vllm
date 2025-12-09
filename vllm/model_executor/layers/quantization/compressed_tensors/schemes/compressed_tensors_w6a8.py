@@ -270,6 +270,10 @@ class CompressedTensorsW6A8(CompressedTensorsScheme):
         weight_packed = layer.weight  # Same as layer.weight_packed (both registered)
         weight_scale = layer.weight_scale
         
+        # Store original dtype to restore it after FlexQ computation
+        # FlexQ kernels require FP16 input, but we want to preserve the original dtype
+        original_dtype = x.dtype
+        
         # Ensure input is FP16 (FlexQ kernels require FP16 input)
         # During torch.compile, inputs might be converted to BF16 or other dtypes
         if x.dtype != torch.float16:
@@ -317,6 +321,12 @@ class CompressedTensorsW6A8(CompressedTensorsScheme):
         
         if bias is not None:
             output = output + bias
+        
+        # Convert output back to the original input dtype
+        # FlexQ outputs FP16, but we need to match the original dtype
+        # to prevent dtype mismatches in downstream layers
+        if output.dtype != original_dtype:
+            output = output.to(original_dtype)
         
         return output
 
