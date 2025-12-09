@@ -14,7 +14,6 @@ from vllm.model_executor.parameter import (
     ChannelQuantScaleParameter,
     GroupQuantScaleParameter,
     ModelWeightParameter,
-    _ColumnvLLMParameter,
 )
 from vllm.scalar_type import scalar_types
 
@@ -24,58 +23,43 @@ __all__ = ["CompressedTensorsW6A8"]
 W6A8_SUPPORTED_BITS = [6]
 
 
-class FlexQScaleParameter(_ColumnvLLMParameter):
+class FlexQScaleParameter(BasevLLMParameter):
     """
     Custom parameter class for FlexQ weight scales.
     
-    Handles loading scales from checkpoint format which may have different shapes
-    than expected. The checkpoint format stores scales with shape [output_size, 3]
-    but we need to reshape/broadcast to [output_size_per_partition, scales_per_group].
-    
-    Note: This only inherits from _ColumnvLLMParameter (not RowvLLMParameter) because
-    we handle row parallelism manually in load_row_parallel_weight.
+    The checkpoint format stores scales with shape [output_size, 3].
+    FlexQ kernels handle quantization internally, so we just need to load the checkpoint format.
+    We only shard along output dimension (dimension 0), never along input dimension (dimension 1).
     """
     
     def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
         """
         Load weight scales for row parallel layers.
-        
-        The checkpoint format has scales with shape [output_size, 3] (or similar).
-        For row parallel layers, we only shard along output_dim (dimension 0), not input_dim.
-        The checkpoint scales are already in the correct format - we just need to shard the output dimension.
+        Only shard along output dimension (dimension 0), not input dimension (dimension 1).
         """
         # Shard along output dimension (dimension 0) only
-        # Don't shard along input dimension (dimension 1) because checkpoint format is [output_size, 3]
         if loaded_weight.shape[0] != self.data.shape[0]:
-            # Need to shard along output dimension
             shard_size = self.data.shape[0]
             start_idx = self.tp_rank * shard_size
-            if start_idx + shard_size > loaded_weight.shape[0]:
-                # Handle edge case where shard doesn't fit
-                actual_size = min(shard_size, loaded_weight.shape[0] - start_idx)
-                loaded_weight = loaded_weight.narrow(0, start_idx, actual_size)
-                # Copy what we can
-                self.data[:actual_size].copy_(loaded_weight)
-            else:
+            if start_idx + shard_size <= loaded_weight.shape[0]:
                 loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
-                # After sharding output dim, shapes should match
-                if loaded_weight.shape == self.data.shape:
-                    self.data.copy_(loaded_weight)
-                elif loaded_weight.shape[1] == self.data.shape[1]:
-                    # Same input dim, copy output dim
-                    self.data.copy_(loaded_weight)
-                else:
-                    # Input dim mismatch - copy what we can
-                    min_in = min(loaded_weight.shape[1], self.data.shape[1])
-                    self.data[:, :min_in].copy_(loaded_weight[:, :min_in])
-        else:
-            # Output dimensions match, just copy (handling input dim mismatch if needed)
-            if loaded_weight.shape == self.data.shape:
-                self.data.copy_(loaded_weight)
             else:
-                # Input dimension mismatch - copy what we can
-                min_in = min(loaded_weight.shape[1], self.data.shape[1])
-                self.data[:, :min_in].copy_(loaded_weight[:, :min_in])
+                # Edge case: take what we can
+                actual_size = loaded_weight.shape[0] - start_idx
+                loaded_weight = loaded_weight.narrow(0, start_idx, actual_size)
+        
+        # Copy the data (handling shape mismatches if needed)
+        if loaded_weight.shape == self.data.shape:
+            self.data.copy_(loaded_weight)
+        else:
+            # Handle shape mismatch - copy what we can
+            min_out = min(loaded_weight.shape[0], self.data.shape[0])
+            min_in = min(loaded_weight.shape[1], self.data.shape[1])
+            self.data[:min_out, :min_in].copy_(loaded_weight[:min_out, :min_in])
+    
+    def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
+        """Load weight scales for column parallel layers - same logic as row parallel."""
+        self.load_row_parallel_weight(loaded_weight)
 
 
 class CompressedTensorsW6A8(CompressedTensorsScheme):
