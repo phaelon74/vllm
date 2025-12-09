@@ -11,6 +11,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
 )
 from vllm.model_executor.parameter import (
     BasevLLMParameter,
+    ChannelQuantScaleParameter,
     GroupQuantScaleParameter,
     ModelWeightParameter,
 )
@@ -103,7 +104,10 @@ class CompressedTensorsW6A8(CompressedTensorsScheme):
         # Calculate scale sizes
         # Weight scales: [output_size_per_partition, input_size_per_partition // group_size]
         # Each scale is FP16 (half), stored as half2 pairs
-        scales_and_zp_size = input_size_per_partition // effective_group_size
+        # For checkpoint loading, we need to use the full input_size to calculate scale size
+        # The checkpoint has scales with shape [output_size, input_size // group_size]
+        scales_and_zp_size_full = input_size // effective_group_size
+        scales_and_zp_size_partition = input_size_per_partition // effective_group_size
         
         # Weight tensor: packed 6-bit weights
         # Format: [output_size_per_partition, input_size_per_partition * 6 / 32] (int32)
@@ -121,15 +125,32 @@ class CompressedTensorsW6A8(CompressedTensorsScheme):
         layer.register_parameter("weight", weight)
         layer.register_parameter("weight_packed", weight)
         
-        # Weight scales: FP16, stored as half2 pairs
-        weight_scale = GroupQuantScaleParameter(
-            output_dim=0,
-            input_dim=1,
-            weight_loader=weight_loader,
-            data=torch.empty(
-                output_size_per_partition, scales_and_zp_size, dtype=torch.float16
-            ),
-        )
+        # Determine scale partitioning
+        # For row parallel layers, use ChannelQuantScaleParameter which only shards along output_dim
+        # This avoids shape mismatch issues when loading from checkpoint
+        # The checkpoint format might have scales with a different shape than expected
+        if row_parallel:
+            # For row parallel layers, use ChannelQuantScaleParameter
+            # which only shards along output_dim (column parallel)
+            # and doesn't try to shard along input_dim (row parallel)
+            weight_scale = ChannelQuantScaleParameter(
+                output_dim=0,
+                weight_loader=weight_loader,
+                data=torch.empty(
+                    output_size_per_partition, scales_and_zp_size_partition, dtype=torch.float16
+                ),
+            )
+        else:
+            # For column parallel layers, use GroupQuantScaleParameter
+            # which shards along both dimensions
+            weight_scale = GroupQuantScaleParameter(
+                output_dim=0,
+                input_dim=1,
+                weight_loader=weight_loader,
+                data=torch.empty(
+                    output_size_per_partition, scales_and_zp_size_partition, dtype=torch.float16
+                ),
+            )
         layer.register_parameter("weight_scale", weight_scale)
         
         # Input activation scales (if static quantization)
