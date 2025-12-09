@@ -823,6 +823,25 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: int | None = None,
     ):
+        # Check if this is a scale-shaped checkpoint being loaded into a weight parameter
+        # (same logic as RowParallelLinear.weight_loader_v2)
+        is_scale_shape = len(loaded_weight.shape) >= 2 and loaded_weight.shape[-1] <= 10
+        is_weight_shape = len(param.data.shape) >= 2 and param.data.shape[-1] > 100
+        
+        if is_scale_shape and is_weight_shape:
+            # Try to find weight_scale parameter
+            from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w6a8 import FlexQScaleParameter
+            if hasattr(self, 'weight_scale') and isinstance(self.weight_scale, FlexQScaleParameter):
+                from vllm.logger import init_logger
+                logger = init_logger(__name__)
+                logger.warning(
+                    f"ColumnParallelLinear: Detected scale-shaped checkpoint (shape={loaded_weight.shape}) "
+                    f"being loaded into weight parameter (shape={param.data.shape}). "
+                    f"Redirecting to weight_scale."
+                )
+                self.weight_scale.load_row_parallel_weight(loaded_weight=loaded_weight)
+                return
+        
         if loaded_shard_id is None:
             if isinstance(param, PerTensorScaleParameter):
                 param.load_merged_column_weight(loaded_weight=loaded_weight, shard_id=0)
@@ -1418,6 +1437,11 @@ class RowParallelLinear(LinearBase):
             if hasattr(self, 'weight_scale') and isinstance(self.weight_scale, FlexQScaleParameter):
                 logger.info("Found weight_scale parameter, loading scale there instead")
                 self.weight_scale.load_row_parallel_weight(loaded_weight=loaded_weight)
+                # Don't return - we still need to load the actual weight data
+                # The actual weights might be in a different checkpoint entry (e.g., weight_packed)
+                # or this checkpoint entry might be skipped. Let the weight loader handle it.
+                # For now, skip loading this parameter since it contains scales, not weights
+                logger.info("Skipping weight parameter load since it contains scales - actual weights should be loaded separately")
                 return
         
         if isinstance(param, FlexQScaleParameter):

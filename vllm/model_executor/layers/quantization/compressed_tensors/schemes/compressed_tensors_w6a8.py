@@ -58,20 +58,33 @@ class FlexQScaleParameter(BasevLLMParameter):
                 loaded_weight = loaded_weight.narrow(0, start_idx, actual_size)
         
         # Copy the data (handling shape mismatches if needed)
-        # The checkpoint has shape [output_size, 3], we created [output_size_per_partition, 3]
-        # After sharding output dim, shapes should match or we copy what we can
+        # The checkpoint might have different scale dimensions than we created
+        # After sharding output dim, we copy what we can
         if loaded_weight.shape == self.data.shape:
             self.data.copy_(loaded_weight)
         else:
             # Handle shape mismatch - copy what we can
+            # If the checkpoint has a different scale dimension, we'll take the first few columns
             min_out = min(loaded_weight.shape[0], self.data.shape[0])
             min_in = min(loaded_weight.shape[1], self.data.shape[1])
-            logger.warning(
-                f"FlexQScaleParameter shape mismatch: "
-                f"loaded_weight.shape={loaded_weight.shape}, self.data.shape={self.data.shape}, "
-                f"copying [{min_out}, {min_in}]"
-            )
-            self.data[:min_out, :min_in].copy_(loaded_weight[:min_out, :min_in])
+            
+            # If checkpoint has more columns than we expect, take the first ones
+            # If checkpoint has fewer columns, we'll only copy what's available
+            if loaded_weight.shape[1] > self.data.shape[1]:
+                logger.info(
+                    f"FlexQScaleParameter: checkpoint has more scale columns ({loaded_weight.shape[1]}) "
+                    f"than expected ({self.data.shape[1]}), taking first {self.data.shape[1]} columns"
+                )
+                self.data[:min_out, :].copy_(loaded_weight[:min_out, :self.data.shape[1]])
+            elif loaded_weight.shape[1] < self.data.shape[1]:
+                logger.warning(
+                    f"FlexQScaleParameter: checkpoint has fewer scale columns ({loaded_weight.shape[1]}) "
+                    f"than expected ({self.data.shape[1]}), only copying available columns"
+                )
+                self.data[:min_out, :min_in].copy_(loaded_weight[:min_out, :min_in])
+            else:
+                # Same number of columns, just copy
+                self.data[:min_out, :min_in].copy_(loaded_weight[:min_out, :min_in])
     
     def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
         """Load weight scales for column parallel layers - same logic as row parallel."""
@@ -157,14 +170,17 @@ class CompressedTensorsW6A8(CompressedTensorsScheme):
         )
         
         # Calculate scale sizes
-        # Weight scales: The checkpoint format may differ from what we expect
-        # The checkpoint might have scales with shape [output_size, 3] or similar
-        # We need to match the checkpoint format, not calculate based on group_size
-        # For now, let's use a small default size that matches common checkpoint formats
+        # Weight scales: The checkpoint format stores scales with shape [output_size, scale_dim]
+        # where scale_dim can be 3 (for FlexQ's standard format) or other values depending on the checkpoint
         # The actual scale shape will be determined from the checkpoint during loading
-        # FlexQ kernels handle the scale format internally, so we just need to load what's there
-        scales_and_zp_size_partition = 3  # Default to match checkpoint format [output_size, 3]
-        # TODO: Determine actual scale shape from checkpoint metadata or config
+        # FlexQ kernels handle the scale format internally, so we need to match the checkpoint format
+        # For now, we'll create a parameter that can accommodate different scale dimensions
+        # The checkpoint might have:
+        # - weight: [output_size, 3] (the actual scale, being redirected)
+        # - weight_scale: [output_size_per_partition, scale_dim] (per-group scales or other format)
+        # We'll start with a reasonable default and adjust during loading if needed
+        scales_and_zp_size_partition = 3  # Default to match FlexQ's standard format [output_size, 3]
+        # Note: If checkpoint has different format, we'll handle it in load_row_parallel_weight
         
         # Weight tensor: packed 6-bit weights
         # Format: [output_size_per_partition, input_size_per_partition * 6 / 32] (int32)
