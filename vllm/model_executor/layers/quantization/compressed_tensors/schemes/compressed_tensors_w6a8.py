@@ -10,6 +10,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
 from vllm.model_executor.parameter import (
+    BasevLLMParameter,
     GroupQuantScaleParameter,
     ModelWeightParameter,
 )
@@ -135,7 +136,8 @@ class CompressedTensorsW6A8(CompressedTensorsScheme):
         if self.is_static_input_scheme:
             # Input scales: per-token or per-tensor depending on strategy
             # For now, assume per-tensor scaling
-            input_scale = ModelWeightParameter(
+            # Use BasevLLMParameter for scalar scales (no dimension requirements)
+            input_scale = BasevLLMParameter(
                 data=torch.empty(1, dtype=torch.float16),
                 weight_loader=weight_loader,
             )
