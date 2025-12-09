@@ -559,6 +559,40 @@ def flexq_w6a16_gemm(
     )
 
 
+if hasattr(torch.ops._C, "flexq_w6a8_gemm"):
+
+    @register_fake("_C::flexq_w6a8_gemm")
+    def _flexq_w6a8_gemm_fake(
+        input: torch.Tensor,
+        weight_packed: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        group_size: int,
+        bias: bool = False,
+    ) -> torch.Tensor:
+        # Output shape: [M, N] where M = input.shape[0], N = weight_packed.shape[0]
+        m = input.size(0)
+        n = weight_packed.size(0)
+        return torch.empty((m, n), dtype=input.dtype, device=input.device)
+
+
+if hasattr(torch.ops._C, "flexq_w6a16_gemm"):
+
+    @register_fake("_C::flexq_w6a16_gemm")
+    def _flexq_w6a16_gemm_fake(
+        input: torch.Tensor,
+        weight_packed: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        group_size: int,
+        bias: bool = False,
+    ) -> torch.Tensor:
+        # Output shape: [M, N] where M = input.shape[0], N = weight_packed.shape[0]
+        m = input.size(0)
+        n = weight_packed.size(0)
+        return torch.empty((m, n), dtype=input.dtype, device=input.device)
+
+
 if hasattr(torch.ops._C, "gptq_gemm"):
 
     @register_fake("_C::gptq_gemm")
