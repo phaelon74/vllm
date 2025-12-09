@@ -59,9 +59,16 @@ torch::Tensor flexq_w6a8_gemm(
     TORCH_CHECK(input_scale.dtype() == torch::kFloat16, "input_scale must be FP16");
     TORCH_CHECK(weight_scale.dtype() == torch::kFloat16, "weight_scale must be FP16");
     
+    // Convert weight_packed to int32 unconditionally (FlexQ kernels require int32)
+    // This must happen before any other operations to ensure PyTorch compiler sees it
+    // Always convert to ensure dtype is int32, even if it's already int32
+    // This prevents PyTorch compiler from optimizing away the conversion
+    // Use .contiguous() to ensure the tensor is properly formatted
+    torch::Tensor weight_int32 = weight_packed.to(torch::kInt32).contiguous();
+    
     int M = input.size(0);
     int K = input.size(1);
-    int N = weight_packed.size(0);
+    int N = weight_int32.size(0);
     
     // Create output tensor
     auto options = torch::TensorOptions().dtype(torch::kFloat16).device(input.device());
@@ -74,19 +81,17 @@ torch::Tensor flexq_w6a8_gemm(
     FQBMMAInitFn_t init_fn = vllm::flexq::select_w6a8_kernel(M, N, K);
     
     // Prepare inputs
-    // Note: FlexQ kernels expect quantized activations (int8), but we're passing FP16
-    // We need to quantize activations to int8 first
-    // For now, this is a placeholder - actual quantization should be done here
-    
-    // Convert tensors to the expected types
-    auto input_int8 = input.to(torch::kInt8);  // This is a placeholder - actual quantization needed
-    auto weight_int32 = weight_packed.to(torch::kInt32);  // Unpack if needed
+    // FlexQ kernels expect int* for both X and W inputs
+    // Convert input to int32 (quantization will be handled by the kernel or preprocessing)
+    // For now, we convert FP16 to int32 as a placeholder
+    // TODO: Implement proper quantization from FP16 to int8/int32
+    torch::Tensor input_int32 = input.to(torch::kInt32).contiguous();
     
     // Call the kernel initialization function
     // Note: FlexQ uses CUDA's half type (__half), not at::Half
     // We need to cast the pointers appropriately
     FQBMMAOpState state = init_fn(
-        input_int8.data_ptr<int>(),
+        input_int32.data_ptr<int>(),
         weight_int32.data_ptr<int>(),
         reinterpret_cast<half*>(input_scale.data_ptr<at::Half>()),
         reinterpret_cast<half*>(weight_scale.data_ptr<at::Half>()),
