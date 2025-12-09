@@ -242,7 +242,7 @@ class VllmConfig:
     
     @model_validator(mode='before')
     @classmethod
-    def filter_invalid_fields(cls, data: dict) -> dict:
+    def filter_invalid_fields(cls, data: Any) -> Any:
         """Filter out invalid fields that might come from compressed-tensors config.
         
         This validator runs before Pydantic validation and removes fields like
@@ -252,7 +252,11 @@ class VllmConfig:
         if isinstance(data, dict):
             # Remove fields that aren't part of VllmConfig
             invalid_fields = {'scale_dtype', 'zp_dtype'}
-            return {k: v for k, v in data.items() if k not in invalid_fields}
+            filtered = {k: v for k, v in data.items() if k not in invalid_fields}
+            # Double-check: explicitly remove if they somehow got through
+            filtered.pop('scale_dtype', None)
+            filtered.pop('zp_dtype', None)
+            return filtered
         return data
 
     def compute_hash(self) -> str:

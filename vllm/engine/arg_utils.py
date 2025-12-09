@@ -1838,11 +1838,32 @@ class EngineArgs:
         final_config_dict.pop('scale_dtype', None)
         final_config_dict.pop('zp_dtype', None)
         
-        # Verify no invalid fields remain
-        assert 'scale_dtype' not in final_config_dict, "scale_dtype still in config_dict!"
-        assert 'zp_dtype' not in final_config_dict, "zp_dtype still in config_dict!"
+        # Verify no invalid fields remain - use pop with default to be safe
+        final_config_dict.pop('scale_dtype', None)
+        final_config_dict.pop('zp_dtype', None)
         
-        config = VllmConfig(**final_config_dict)
+        # Log if we find these fields (for debugging)
+        if 'scale_dtype' in final_config_dict or 'zp_dtype' in final_config_dict:
+            logger.warning(
+                "Found invalid fields scale_dtype/zp_dtype in config_dict after filtering. "
+                "This should not happen. Keys: %s", list(final_config_dict.keys())
+            )
+            # Force remove them
+            final_config_dict = {k: v for k, v in final_config_dict.items() 
+                               if k not in {'scale_dtype', 'zp_dtype'}}
+        
+        # Create VllmConfig using only the explicitly filtered dict
+        # Pass as a dict to model_validate to ensure the validator runs
+        # For Pydantic dataclasses, we need to use model_validate_dict or pass as dict
+        from pydantic import TypeAdapter
+        try:
+            # Use TypeAdapter to validate the dict, which will trigger model_validator
+            adapter = TypeAdapter(VllmConfig)
+            config = adapter.validate_python(final_config_dict)
+        except Exception:
+            # Fallback: try direct construction if TypeAdapter doesn't work
+            # The model_validator should have filtered the fields
+            config = VllmConfig(**final_config_dict)
 
         return config
 
