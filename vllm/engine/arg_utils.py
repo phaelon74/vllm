@@ -1800,19 +1800,39 @@ class EngineArgs:
             "additional_config": filtered_additional_config,
             "optimization_level": self.optimization_level,
         }
+        
         # Remove any fields that might have been added incorrectly
         # (e.g., scale_dtype, zp_dtype from compressed-tensors)
         # These fields are not part of VllmConfig and will cause validation errors
+        # Check if they exist in config_dict and remove them explicitly
         invalid_fields = {"scale_dtype", "zp_dtype"}
         filtered_config_dict = {
             k: v for k, v in config_dict.items() 
             if k not in invalid_fields
         }
         
-        # For Pydantic dataclasses, use the regular constructor
-        # The extra='ignore' in ConfigDict should handle invalid fields,
-        # but we filter them explicitly as a safety measure
-        config = VllmConfig(**filtered_config_dict)
+        # Double-check: ensure invalid fields are not present
+        # This is a safety measure since Pydantic dataclasses may not respect extra='ignore'
+        for field in invalid_fields:
+            filtered_config_dict.pop(field, None)
+        
+        # Check if self has these attributes and remove them if they're being passed
+        # These might be coming from EngineArgs attributes
+        if hasattr(self, 'scale_dtype'):
+            filtered_config_dict.pop('scale_dtype', None)
+        if hasattr(self, 'zp_dtype'):
+            filtered_config_dict.pop('zp_dtype', None)
+        
+        # For Pydantic dataclasses, manually construct with only valid fields
+        # Get the valid field names from VllmConfig
+        from dataclasses import fields as dataclass_fields
+        valid_field_names = {f.name for f in dataclass_fields(VllmConfig)}
+        final_config_dict = {
+            k: v for k, v in filtered_config_dict.items() 
+            if k in valid_field_names
+        }
+        
+        config = VllmConfig(**final_config_dict)
 
         return config
 
