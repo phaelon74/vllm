@@ -1809,9 +1809,10 @@ class EngineArgs:
             if k not in invalid_fields
         }
         
-        # Use model_validate which respects extra='ignore' from ConfigDict
-        # This ensures invalid fields are properly ignored
-        config = VllmConfig.model_validate(filtered_config_dict)
+        # For Pydantic dataclasses, use the regular constructor
+        # The extra='ignore' in ConfigDict should handle invalid fields,
+        # but we filter them explicitly as a safety measure
+        config = VllmConfig(**filtered_config_dict)
 
         return config
 
