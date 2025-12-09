@@ -1386,12 +1386,19 @@ class RowParallelLinear(LinearBase):
         # Debug: Check parameter type before calling load_row_parallel_weight
         from vllm.logger import init_logger
         logger = init_logger(__name__)
-        logger.debug(
+        logger.info(
             f"weight_loader_v2: param type={type(param).__name__}, "
-            f"loaded_weight.shape={loaded_weight.shape}, param.data.shape={param.data.shape if hasattr(param, 'data') else 'N/A'}"
+            f"loaded_weight.shape={loaded_weight.shape}, param.data.shape={param.data.shape if hasattr(param, 'data') else 'N/A'}, "
+            f"hasattr(input_dim)={hasattr(param, 'input_dim')}, input_dim={getattr(param, 'input_dim', 'N/A')}"
         )
         
-        param.load_row_parallel_weight(loaded_weight=loaded_weight)
+        # Check if this is a FlexQScaleParameter and handle it specially
+        from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w6a8 import FlexQScaleParameter
+        if isinstance(param, FlexQScaleParameter):
+            logger.info("Detected FlexQScaleParameter, calling custom load_row_parallel_weight")
+            param.load_row_parallel_weight(loaded_weight=loaded_weight)
+        else:
+            param.load_row_parallel_weight(loaded_weight=loaded_weight)
 
     def forward(
         self,

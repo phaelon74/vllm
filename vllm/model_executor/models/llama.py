@@ -506,6 +506,16 @@ class LlamaModel(nn.Module):
                     continue
 
                 param = params_dict[name]
+                # Debug: Check parameter type for weight_scale
+                if "weight_scale" in name:
+                    from vllm.logger import init_logger
+                    logger = init_logger(__name__)
+                    logger.info(
+                        f"Loading weight_scale parameter '{name}': "
+                        f"type={type(param).__name__}, "
+                        f"shape={param.data.shape if hasattr(param, 'data') else 'N/A'}, "
+                        f"loaded_weight.shape={loaded_weight.shape if 'loaded_weight' in locals() else 'N/A'}"
+                    )
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
