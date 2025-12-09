@@ -171,7 +171,6 @@ class CompressedTensorsW6A8(CompressedTensorsScheme):
         # FlexQ kernels handle quantization internally, so we just need to match the checkpoint format
         # Use FlexQScaleParameter for all layers to handle the checkpoint format correctly
         weight_scale = FlexQScaleParameter(
-            output_dim=0,
             weight_loader=weight_loader,
             data=torch.empty(
                 output_size_per_partition, scales_and_zp_size_partition, dtype=torch.float16
