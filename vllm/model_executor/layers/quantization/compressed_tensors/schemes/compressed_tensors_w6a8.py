@@ -261,43 +261,45 @@ class CompressedTensorsW6A8(CompressedTensorsScheme):
         """
         # Import FlexQ ops here to avoid circular imports
         try:
-            from vllm._custom_ops import flexq_bmma_w6a8
+            from vllm._custom_ops import flexq_w6a8_gemm
         except ImportError:
             raise RuntimeError(
                 "FlexQ kernels not available. Please ensure FlexQ CUDA extensions are compiled."
             )
         
-        weight_packed = layer.weight_packed
+        weight_packed = layer.weight  # Same as layer.weight_packed (both registered)
         weight_scale = layer.weight_scale
         
         # Get input scale if static quantization
-        input_scale = None
+        # If not static, create a dummy scale tensor (FlexQ kernels require it)
         if self.is_static_input_scheme and hasattr(layer, "input_scale"):
             input_scale = layer.input_scale
-        
-        # Quantize input activations to 8-bit if needed
-        # For now, assume activations are already quantized or will be quantized elsewhere
-        # TODO: Implement activation quantization if needed
+        else:
+            # Create a dummy scale tensor for dynamic quantization
+            # FlexQ kernels handle dynamic quantization internally
+            input_scale = torch.ones(1, dtype=torch.float16, device=x.device)
         
         # Call FlexQ kernel
-        # FlexQ kernel signature: (X, W, X_SCALE, W_SCALE, M, N, K, D, group_size, bias)
+        # flexq_w6a8_gemm signature: (input, weight_packed, input_scale, weight_scale, group_size, bias)
         # Where:
-        # - X: quantized activations (int32, bit-packed)
-        # - W: quantized weights (int32, bit-packed) 
-        # - X_SCALE: FP16 scales
-        # - M, N, K: matrix dimensions
-        # - D: output tensor (FP16)
+        # - input: FP16 input activations (will be quantized to int8 internally)
+        # - weight_packed: int32 packed 6-bit weights
+        # - input_scale: FP16 scales for input quantization
+        # - weight_scale: FP16 scales for weight quantization
         # - group_size: quantization group size (128)
-        # - bias: optional bias
+        # - bias: bool indicating if bias is present
         
-        M = x.shape[0]  # batch size (or sequence length)
-        K = x.shape[-1]  # input dimension
-        N = weight_packed.shape[0]  # output dimension
-        
-        # For now, we'll need to implement the kernel wrapper
-        # This is a placeholder - actual implementation will be in the C++ wrapper
-        raise NotImplementedError(
-            "FlexQ kernel integration not yet complete. "
-            "Need to implement C++ wrapper and pybind11 bindings."
+        output = flexq_w6a8_gemm(
+            x,  # input activations (FP16)
+            weight_packed,  # packed weights (int32)
+            input_scale,  # input scales (FP16)
+            weight_scale.data,  # weight scales (FP16) - extract data from parameter
+            layer.flexq_group_size,  # group_size
+            bias is not None,  # bias flag
         )
+        
+        if bias is not None:
+            output = output + bias
+        
+        return output
 
