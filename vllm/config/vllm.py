@@ -171,7 +171,7 @@ OPTIMIZATION_LEVEL_TO_CONFIG = {
 
 
 @config
-@dataclass(config=ConfigDict(arbitrary_types_allowed=True))
+@dataclass(config=ConfigDict(arbitrary_types_allowed=True, extra='ignore'))
 class VllmConfig:
     """Dataclass which contains all vllm-related configuration. This
     simplifies passing around the distinct configurations in the codebase.
