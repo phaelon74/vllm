@@ -406,6 +406,8 @@ class Ministral3Model(nn.Module):
             (".gate_up_proj", ".up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
+        # Also include buffers for quantization parameters
+        buffers_dict = dict(self.named_buffers())
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
@@ -419,13 +421,14 @@ class Ministral3Model(nn.Module):
                 scale_name := self.quant_config.get_cache_scale(name)
             ):
                 # Loading kv cache quantization scales
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = (
-                    loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
-                )
-                weight_loader(param, loaded_weight)
-                loaded_params.add(scale_name)
+                if scale_name in params_dict:
+                    param = params_dict[scale_name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    loaded_weight = (
+                        loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
+                    )
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(scale_name)
                 continue
             if "scale" in name:
                 # Remapping the name of FP8 kv-scale.
@@ -443,6 +446,10 @@ class Ministral3Model(nn.Module):
                 if is_pp_missing_parameter(name, self):
                     continue
 
+                if name not in params_dict:
+                    # Skip if not a parameter (might be a quantization buffer handled elsewhere)
+                    continue
+
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -453,6 +460,14 @@ class Ministral3Model(nn.Module):
                     continue
 
                 if is_pp_missing_parameter(name, self):
+                    continue
+
+                # Check if it's a quantization parameter (buffer) - these are handled
+                # by the Linear layer's weight_loader automatically
+                if name not in params_dict:
+                    # Quantization parameters like activation_scale are buffers,
+                    # not parameters. They're handled by AutoWeightsLoader or
+                    # the Linear layer's weight_loader, so we skip them here.
                     continue
 
                 param = params_dict[name]
