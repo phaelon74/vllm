@@ -17,10 +17,13 @@ from vllm.outputs import (
 from vllm.sampling_params import RequestOutputKind
 from vllm.tokenizers import TokenizerLike
 from vllm.tracing import SpanAttributes, SpanKind, Tracer, extract_trace_context
+from vllm.logger import init_logger
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
+
+logger = init_logger(__name__)
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import (
     IterationStats,
@@ -487,6 +490,20 @@ class OutputProcessor:
             kv_transfer_params = engine_core_output.kv_transfer_params
             req_state.num_cached_tokens = engine_core_output.num_cached_tokens
             req_state.is_prefilling = False
+
+            # Debug logging for token IDs
+            if new_token_ids and len(new_token_ids) > 0:
+                if all(tid == 0 for tid in new_token_ids):
+                    logger.warning(
+                        f"WARNING: All token IDs are 0! "
+                        f"new_token_ids={new_token_ids[:10]}..., "
+                        f"request_id={req_state.request_id}"
+                    )
+                elif len(new_token_ids) <= 5:
+                    logger.info(
+                        f"Engine output token IDs: {new_token_ids}, "
+                        f"request_id={req_state.request_id}"
+                    )
 
             if pooling_output is None:
                 assert req_state.detokenizer is not None
