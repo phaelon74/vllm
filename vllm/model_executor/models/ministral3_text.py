@@ -557,7 +557,38 @@ class Ministral3ForCausalLM(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        from vllm.distributed import get_pp_group
+        from vllm.logger import init_logger
+        
+        logger = init_logger(__name__)
+        
+        # Check if we're on the last rank (where lm_head exists)
+        if not get_pp_group().is_last_rank:
+            # This shouldn't happen with TP=1, but log if it does
+            logger.warning("Ministral3ForCausalLM.compute_logits called on non-last rank!")
+            return None
+        
+        if self.lm_head is None:
+            logger.error("Ministral3ForCausalLM.compute_logits: lm_head is None!")
+            return None
+        
         logits = self.logits_processor(self.lm_head, hidden_states)
+        
+        # Debug logging for first few calls
+        if not hasattr(self, '_logits_call_count'):
+            self._logits_call_count = 0
+        self._logits_call_count += 1
+        
+        if self._logits_call_count <= 3:
+            logger.info(
+                f"Ministral3ForCausalLM.compute_logits (call #{self._logits_call_count}): "
+                f"hidden_states.shape={hidden_states.shape}, "
+                f"logits.shape={logits.shape if logits is not None else None}, "
+                f"logits.dtype={logits.dtype if logits is not None else None}, "
+                f"logits.min()={logits.min().item() if logits is not None else None}, "
+                f"logits.max()={logits.max().item() if logits is not None else None}"
+            )
+        
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
