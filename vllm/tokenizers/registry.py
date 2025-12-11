@@ -159,6 +159,9 @@ def get_tokenizer(
             revision=revision,
         )
         if len(files_list) > 0:
+            logger.info(
+                f"Detected Mistral tokenizer files ({files_list}), using tokenizer_mode='mistral'"
+            )
             tokenizer_mode = "mistral"
 
     # Fallback to HF tokenizer
@@ -188,11 +191,15 @@ def get_tokenizer(
 
         tokenizer_mode = str(tokenizer_name)
 
+    logger.info(
+        f"Loading tokenizer with mode='{tokenizer_mode}' for model: {tokenizer_name}"
+    )
     tokenizer = TokenizerRegistry.get_tokenizer(
         tokenizer_mode,
         *tokenizer_args,
         **tokenizer_kwargs,
     )
+    logger.info(f"Loaded tokenizer type: {type(tokenizer).__name__}")
     if not tokenizer.is_fast:
         logger.warning(
             "Using a slow tokenizer. This might cause a significant "
