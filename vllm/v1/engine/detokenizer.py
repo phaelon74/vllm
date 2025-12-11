@@ -365,14 +365,9 @@ class MistralIncrementalDetokenizer(BaseIncrementalDetokenizer):
         prompt_token_ids = request.prompt_token_ids or []
         self.token_ids.extend(prompt_token_ids)
         
-        # Store the last decoded text to compute deltas
-        # Initialize with decoded prompt text
-        self.last_decoded_text = ""
-        if prompt_token_ids:
-            self.last_decoded_text = self.tokenizer.decode(
-                prompt_token_ids,
-                skip_special_tokens=params.skip_special_tokens
-            )
+        # Store the last decoded OUTPUT text (excluding prompt) to compute deltas
+        # Initialize empty since we haven't generated any output yet
+        self.last_decoded_output_text = ""
         
         self.skip_special_tokens = params.skip_special_tokens
         
@@ -391,7 +386,7 @@ class MistralIncrementalDetokenizer(BaseIncrementalDetokenizer):
         self.token_ids before calling this method, so self.token_ids already
         contains the new token.
         """
-        # Get all tokens from prompt onwards (including the new token that was just added)
+        # Get all OUTPUT tokens (excluding prompt) - including the new token that was just added
         output_token_ids = (
             self.token_ids
             if not self.prompt_len
@@ -401,17 +396,30 @@ class MistralIncrementalDetokenizer(BaseIncrementalDetokenizer):
         if not output_token_ids:
             return ""
         
-        # Decode the full output sequence (including the new token)
-        current_text = self.tokenizer.decode(
+        # Decode the full OUTPUT sequence (excluding prompt, including the new token)
+        current_output_text = self.tokenizer.decode(
             output_token_ids,
             skip_special_tokens=self.skip_special_tokens
         )
         
         # Compute delta: new text since last decode
-        new_text = current_text[len(self.last_decoded_text):]
+        # current_output_text is the full generated text so far
+        # last_decoded_output_text is the previous full generated text
+        new_text = current_output_text[len(self.last_decoded_output_text):]
         
-        # Update last decoded text for next iteration
-        self.last_decoded_text = current_text
+        # Debug logging (only log first few calls to avoid spam)
+        if len(output_token_ids) <= 3:
+            logger.debug(
+                f"MistralIncrementalDetokenizer.decode_next: "
+                f"token_id={next_token_id}, "
+                f"output_token_ids={output_token_ids}, "
+                f"current_output_text='{current_output_text}', "
+                f"last_decoded='{self.last_decoded_output_text}', "
+                f"new_text='{new_text}'"
+            )
+        
+        # Update last decoded output text for next iteration
+        self.last_decoded_output_text = current_output_text
         
         return new_text
 
