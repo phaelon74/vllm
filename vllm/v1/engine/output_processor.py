@@ -494,16 +494,23 @@ class OutputProcessor:
             # Debug logging for token IDs
             if new_token_ids and len(new_token_ids) > 0:
                 if all(tid == 0 for tid in new_token_ids):
-                    logger.warning(
-                        f"WARNING: All token IDs are 0! "
+                    logger.error(
+                        f"CRITICAL: All token IDs are 0! "
                         f"new_token_ids={new_token_ids[:10]}..., "
-                        f"request_id={req_state.request_id}"
+                        f"request_id={req_state.request_id}, "
+                        f"len={len(new_token_ids)}. "
+                        f"This suggests a tensor-parallelism issue where token IDs "
+                        f"aren't being gathered from the last rank."
                     )
                 elif len(new_token_ids) <= 5:
                     logger.info(
                         f"Engine output token IDs: {new_token_ids}, "
                         f"request_id={req_state.request_id}"
                     )
+            elif new_token_ids is not None and len(new_token_ids) == 0:
+                logger.warning(
+                    f"Empty token IDs list for request_id={req_state.request_id}"
+                )
 
             if pooling_output is None:
                 assert req_state.detokenizer is not None
