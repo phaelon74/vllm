@@ -20,7 +20,7 @@ from vllm.v1.engine import EngineCoreRequest
 # Import MistralTokenizer for type checking
 try:
     from vllm.tokenizers.mistral import MistralTokenizer
-except ImportError:
+except (ImportError, ModuleNotFoundError):
     MistralTokenizer = None
 
 logger = init_logger(__name__)
@@ -62,7 +62,12 @@ class IncrementalDetokenizer:
 
         # MistralTokenizer needs special handling - it's not a PreTrainedTokenizerFast
         # but it has is_fast=True and uses a different decoding mechanism
-        if MistralTokenizer is not None and isinstance(tokenizer, MistralTokenizer):
+        # Check by class name as well in case import failed
+        is_mistral_tokenizer = (
+            (MistralTokenizer is not None and isinstance(tokenizer, MistralTokenizer))
+            or type(tokenizer).__name__ == "MistralTokenizer"
+        )
+        if is_mistral_tokenizer:
             # Use custom detokenizer for MistralTokenizer that uses direct decode calls
             return MistralIncrementalDetokenizer(tokenizer, request)
 
@@ -344,9 +349,9 @@ class MistralIncrementalDetokenizer(BaseIncrementalDetokenizer):
         self.token_ids.extend(prompt_token_ids)
         
         # Store the last decoded text to compute deltas
+        # Initialize with decoded prompt text
         self.last_decoded_text = ""
         if prompt_token_ids:
-            # Decode prompt to initialize last_decoded_text
             self.last_decoded_text = self.tokenizer.decode(
                 prompt_token_ids,
                 skip_special_tokens=params.skip_special_tokens
@@ -363,11 +368,13 @@ class MistralIncrementalDetokenizer(BaseIncrementalDetokenizer):
         )
     
     def decode_next(self, next_token_id: int) -> str:
-        """Decode the next token ID using MistralTokenizer's decode method."""
-        # Add the new token ID
-        self.token_ids.append(next_token_id)
+        """Decode the next token ID using MistralTokenizer's decode method.
         
-        # Decode all tokens from the prompt onwards
+        Note: BaseIncrementalDetokenizer.update() already adds next_token_id to
+        self.token_ids before calling this method, so self.token_ids already
+        contains the new token.
+        """
+        # Get all tokens from prompt onwards (including the new token that was just added)
         output_token_ids = (
             self.token_ids
             if not self.prompt_len
@@ -377,7 +384,7 @@ class MistralIncrementalDetokenizer(BaseIncrementalDetokenizer):
         if not output_token_ids:
             return ""
         
-        # Decode the full output sequence
+        # Decode the full output sequence (including the new token)
         current_text = self.tokenizer.decode(
             output_token_ids,
             skip_special_tokens=self.skip_special_tokens
@@ -386,7 +393,7 @@ class MistralIncrementalDetokenizer(BaseIncrementalDetokenizer):
         # Compute delta: new text since last decode
         new_text = current_text[len(self.last_decoded_text):]
         
-        # Update last decoded text
+        # Update last decoded text for next iteration
         self.last_decoded_text = current_text
         
         return new_text
