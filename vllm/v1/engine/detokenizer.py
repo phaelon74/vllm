@@ -17,6 +17,12 @@ from vllm.tokenizers.detokenizer_utils import (
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine import EngineCoreRequest
 
+# Import MistralTokenizer for type checking
+try:
+    from vllm.tokenizers.mistral import MistralTokenizer
+except ImportError:
+    MistralTokenizer = None
+
 logger = init_logger(__name__)
 
 # Only tokenizers >= 0.21.1 supports DecodeStream used for
@@ -53,6 +59,12 @@ class IncrementalDetokenizer:
         if tokenizer is None:
             # No tokenizer => skipping detokenization.
             return IncrementalDetokenizer()
+
+        # MistralTokenizer needs special handling - it's not a PreTrainedTokenizerFast
+        # but it has is_fast=True and uses a different decoding mechanism
+        if MistralTokenizer is not None and isinstance(tokenizer, MistralTokenizer):
+            # Use custom detokenizer for MistralTokenizer that uses direct decode calls
+            return MistralIncrementalDetokenizer(tokenizer, request)
 
         if USE_FAST_DETOKENIZER and isinstance(tokenizer, PreTrainedTokenizerFast):
             # Fast tokenizer => use tokenizers library DecodeStream.
@@ -311,6 +323,73 @@ class SlowIncrementalDetokenizer(BaseIncrementalDetokenizer):
         self.read_offset = read_offset
 
         return decoded_text
+
+
+class MistralIncrementalDetokenizer(BaseIncrementalDetokenizer):
+    """Custom detokenizer for MistralTokenizer that uses direct decode calls."""
+    
+    def __init__(self, tokenizer: "MistralTokenizer", request: EngineCoreRequest):
+        super().__init__(request)
+        
+        self.tokenizer = tokenizer
+        params = request.sampling_params
+        assert params is not None
+        
+        self.prompt_len = length_from_prompt_token_ids_or_embeds(
+            request.prompt_token_ids, request.prompt_embeds
+        )
+        
+        # Store prompt token IDs for incremental decoding
+        prompt_token_ids = request.prompt_token_ids or []
+        self.token_ids.extend(prompt_token_ids)
+        
+        # Store the last decoded text to compute deltas
+        self.last_decoded_text = ""
+        if prompt_token_ids:
+            # Decode prompt to initialize last_decoded_text
+            self.last_decoded_text = self.tokenizer.decode(
+                prompt_token_ids,
+                skip_special_tokens=params.skip_special_tokens
+            )
+        
+        self.skip_special_tokens = params.skip_special_tokens
+        
+    @property
+    def output_token_ids(self) -> list[int]:
+        return (
+            self.token_ids
+            if not self.prompt_len
+            else (self.token_ids[self.prompt_len :])
+        )
+    
+    def decode_next(self, next_token_id: int) -> str:
+        """Decode the next token ID using MistralTokenizer's decode method."""
+        # Add the new token ID
+        self.token_ids.append(next_token_id)
+        
+        # Decode all tokens from the prompt onwards
+        output_token_ids = (
+            self.token_ids
+            if not self.prompt_len
+            else self.token_ids[self.prompt_len:]
+        )
+        
+        if not output_token_ids:
+            return ""
+        
+        # Decode the full output sequence
+        current_text = self.tokenizer.decode(
+            output_token_ids,
+            skip_special_tokens=self.skip_special_tokens
+        )
+        
+        # Compute delta: new text since last decode
+        new_text = current_text[len(self.last_decoded_text):]
+        
+        # Update last decoded text
+        self.last_decoded_text = current_text
+        
+        return new_text
 
 
 def check_stop_strings(
