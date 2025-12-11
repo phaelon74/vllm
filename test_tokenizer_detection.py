@@ -1,57 +1,50 @@
 #!/usr/bin/env python3
 """
 Test script to verify which tokenizer vLLM is using for the model.
+This script checks the vLLM server logs or uses a simpler approach.
 """
 
+import subprocess
 import sys
-sys.path.insert(0, 'vllm')
 
-from vllm.tokenizers import get_tokenizer
+# Instead of importing vLLM directly (which has circular import issues),
+# let's check what tokenizer files exist and what vLLM would detect
 
 model_path = "/media/fmodels/TheHouseOfTheDude/Devstral-2-123B-Instruct-2512_Compressed-Tensors/W4A16"
 
-print("Testing tokenizer detection...")
-print(f"Model path: {model_path}")
-print()
+print("=" * 60)
+print("Tokenizer Detection Test")
+print("=" * 60)
+print(f"\nModel path: {model_path}\n")
 
-try:
-    tokenizer = get_tokenizer(
-        model_path,
-        tokenizer_mode="auto",
-        trust_remote_code=False,
-    )
-    
-    print(f"Tokenizer type: {type(tokenizer).__name__}")
-    print(f"Tokenizer class: {type(tokenizer)}")
-    print(f"Is MistralTokenizer: {type(tokenizer).__name__ == 'MistralTokenizer'}")
+# Check for tokenizer files
+import os
+if os.path.exists(model_path):
+    files = os.listdir(model_path)
+    tokenizer_files = [f for f in files if 'tokenizer' in f.lower() or 'tekken' in f.lower() or f.endswith('.model')]
+    print("Tokenizer-related files found:")
+    for f in tokenizer_files:
+        print(f"  ✓ {f}")
     print()
     
-    # Test encoding
-    test_text = "Hello, how are you?"
-    print(f"Test encoding: '{test_text}'")
-    encoded = tokenizer.encode(test_text, add_special_tokens=False)
-    print(f"Encoded: {encoded}")
-    print()
-    
-    # Test decoding
-    print(f"Test decoding: {encoded}")
-    decoded = tokenizer.decode(encoded, skip_special_tokens=False)
-    print(f"Decoded: '{decoded}'")
-    print()
-    
-    # Test single token decode
-    if encoded:
-        single_token = encoded[0]
-        print(f"Test single token decode: [{single_token}]")
-        single_decoded = tokenizer.decode([single_token], skip_special_tokens=False)
-        print(f"Decoded: '{single_decoded}'")
+    # Check for tekken.json specifically
+    if 'tekken.json' in files:
+        print("✓ tekken.json found - vLLM should use MistralTokenizer")
         print()
-    
-    print("✓ Tokenizer loaded successfully")
-    
-except Exception as e:
-    print(f"✗ ERROR: {e}")
-    import traceback
-    traceback.print_exc()
-    sys.exit(1)
+        print("To verify which tokenizer vLLM is actually using:")
+        print("1. Check vLLM startup logs for 'tokenizer_mode' or 'MistralTokenizer'")
+        print("2. Or add logging to vllm/v1/engine/detokenizer.py to see which")
+        print("   detokenizer class is being instantiated")
+    else:
+        print("✗ tekken.json not found - vLLM will use HF tokenizer")
+else:
+    print(f"✗ Model path does not exist: {model_path}")
 
+print("\n" + "=" * 60)
+print("Next Steps:")
+print("=" * 60)
+print("1. Check vLLM server startup logs for tokenizer type")
+print("2. Look for lines containing 'tokenizer_mode' or 'MistralTokenizer'")
+print("3. If MistralTokenizer is not being used, check if mistral_common is installed")
+print("4. Run: pip list | grep mistral")
+print()

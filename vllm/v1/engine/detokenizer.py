@@ -63,13 +63,30 @@ class IncrementalDetokenizer:
         # MistralTokenizer needs special handling - it's not a PreTrainedTokenizerFast
         # but it has is_fast=True and uses a different decoding mechanism
         # Check by class name as well in case import failed
+        tokenizer_type_name = type(tokenizer).__name__
+        
+        # Check if it's MistralTokenizer by class name or by checking for mistral-specific attributes
         is_mistral_tokenizer = (
             (MistralTokenizer is not None and isinstance(tokenizer, MistralTokenizer))
-            or type(tokenizer).__name__ == "MistralTokenizer"
+            or tokenizer_type_name == "MistralTokenizer"
+            or (
+                hasattr(tokenizer, 'transformers_tokenizer')
+                and hasattr(tokenizer, 'mistral')
+                and hasattr(tokenizer, 'is_tekken')
+            )
         )
+        
         if is_mistral_tokenizer:
+            logger.info(
+                f"Using MistralIncrementalDetokenizer for tokenizer type: {tokenizer_type_name}"
+            )
             # Use custom detokenizer for MistralTokenizer that uses direct decode calls
             return MistralIncrementalDetokenizer(tokenizer, request)
+        else:
+            logger.debug_once(
+                f"Not using MistralIncrementalDetokenizer. Tokenizer type: {tokenizer_type_name}, "
+                f"MistralTokenizer available: {MistralTokenizer is not None}"
+            )
 
         if USE_FAST_DETOKENIZER and isinstance(tokenizer, PreTrainedTokenizerFast):
             # Fast tokenizer => use tokenizers library DecodeStream.
