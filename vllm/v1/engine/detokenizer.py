@@ -379,6 +379,23 @@ class MistralIncrementalDetokenizer(BaseIncrementalDetokenizer):
             else (self.token_ids[self.prompt_len :])
         )
     
+    def update(self, new_token_ids: list[int], stop_terminated: bool) -> str | None:
+        """Override update to add logging."""
+        if not new_token_ids:
+            logger.warning("MistralIncrementalDetokenizer.update called with empty new_token_ids")
+            return None
+        
+        # Log first update call
+        if len(self.token_ids) == self.prompt_len:
+            logger.info(
+                f"MistralIncrementalDetokenizer.update: "
+                f"prompt_len={self.prompt_len}, "
+                f"new_token_ids={new_token_ids[:10]}..."
+            )
+        
+        # Call parent update which will call decode_next
+        return super().update(new_token_ids, stop_terminated)
+    
     def decode_next(self, next_token_id: int) -> str:
         """Decode the next token ID using MistralTokenizer's decode method.
         
@@ -397,10 +414,17 @@ class MistralIncrementalDetokenizer(BaseIncrementalDetokenizer):
             return ""
         
         # Decode the full OUTPUT sequence (excluding prompt, including the new token)
-        current_output_text = self.tokenizer.decode(
-            output_token_ids,
-            skip_special_tokens=self.skip_special_tokens
-        )
+        try:
+            current_output_text = self.tokenizer.decode(
+                output_token_ids,
+                skip_special_tokens=self.skip_special_tokens
+            )
+        except Exception as e:
+            logger.error(
+                f"MistralIncrementalDetokenizer.decode_next failed: {e}, "
+                f"output_token_ids={output_token_ids[:10]}..."
+            )
+            return ""
         
         # Compute delta: new text since last decode
         # current_output_text is the full generated text so far
@@ -408,14 +432,14 @@ class MistralIncrementalDetokenizer(BaseIncrementalDetokenizer):
         new_text = current_output_text[len(self.last_decoded_output_text):]
         
         # Debug logging (only log first few calls to avoid spam)
-        if len(output_token_ids) <= 3:
-            logger.debug(
+        if len(output_token_ids) <= 5:
+            logger.info(
                 f"MistralIncrementalDetokenizer.decode_next: "
                 f"token_id={next_token_id}, "
-                f"output_token_ids={output_token_ids}, "
-                f"current_output_text='{current_output_text}', "
-                f"last_decoded='{self.last_decoded_output_text}', "
-                f"new_text='{new_text}'"
+                f"output_token_ids={output_token_ids[:10]}..., "
+                f"current_output_text='{current_output_text[:50]}...', "
+                f"last_decoded='{self.last_decoded_output_text[:50]}...', "
+                f"new_text='{new_text[:50]}...'"
             )
         
         # Update last decoded output text for next iteration
