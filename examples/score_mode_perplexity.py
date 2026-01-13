@@ -74,9 +74,57 @@ def calculate_perplexity(
     # This creates windows of exactly eval_len tokens
     num_tokens = len(tokens)
     windows_processed = 0
+    
     # EXL3's exact pattern: range(0, num_tokens - eval_len, eval_stride)
-    # This ensures all windows are exactly context_length tokens
-    for start_idx in range(0, num_tokens - context_length, stride):
+    # If num_tokens < eval_len, we can't create any full windows
+    # In that case, process the entire sequence as one window (if it has at least 2 tokens)
+    if num_tokens < context_length:
+        if debug:
+            print(f"Warning: Only {num_tokens} tokens, less than context_length {context_length}")
+            print("Processing entire sequence as single window")
+        
+        if num_tokens >= 2:
+            # Process entire sequence as one window
+            window_tokens = tokens
+            target_token_ids = window_tokens[1:]
+            
+            prompt: TokensPrompt = {
+                "prompt_token_ids": window_tokens,
+                "target_token_ids": target_token_ids,
+            }
+            
+            sampling_params = SamplingParams(
+                prompt_logprobs=1,
+                max_tokens=1,
+                score_mode=True,
+            )
+            
+            outputs = llm.generate([prompt], sampling_params=sampling_params)
+            output = outputs[0]
+            if debug:
+                print(f"  prompt_logprobs is None: {output.prompt_logprobs is None}")
+                if output.prompt_logprobs:
+                    print(f"  prompt_logprobs length: {len(output.prompt_logprobs)}")
+                    print(f"  window_tokens length: {len(window_tokens)}")
+            if output.prompt_logprobs:
+                for i in range(1, len(output.prompt_logprobs)):
+                    logprobs_dict = output.prompt_logprobs[i]
+                    if logprobs_dict:
+                        actual_token = window_tokens[i]
+                        if actual_token in logprobs_dict:
+                            logprob = logprobs_dict[actual_token].logprob
+                            total_nll += -logprob
+                            total_tokens += 1
+                        elif debug:
+                            print(f"  Position {i}: token {actual_token} not in logprobs_dict. Keys: {list(logprobs_dict.keys())[:5]}")
+                    elif debug:
+                        print(f"  Position {i}: logprobs_dict is None or empty")
+            elif debug:
+                print(f"  ERROR: output.prompt_logprobs is None or empty")
+    else:
+        # EXL3's exact pattern: range(0, num_tokens - eval_len, eval_stride)
+        # This ensures all windows are exactly context_length tokens
+        for start_idx in range(0, num_tokens - context_length, stride):
             # Create window: [start_idx : start_idx + context_length]
             # EXL3: eval_tokens[:, a:b] where b = a + eval_len (exactly eval_len tokens)
             end_idx = start_idx + context_length
@@ -121,6 +169,10 @@ def calculate_perplexity(
             # Extract logprobs from output
             # EXL3 evaluates ALL tokens in the window (positions 1 through len-1)
             output = outputs[0]
+            if debug and windows_processed <= 3:
+                print(f"  prompt_logprobs is None: {output.prompt_logprobs is None}")
+                if output.prompt_logprobs:
+                    print(f"  prompt_logprobs length: {len(output.prompt_logprobs)}, expected: {len(window_tokens)}")
             if output.prompt_logprobs:
                 # prompt_logprobs[0] is None (position 0 has no logprobs)
                 # prompt_logprobs[1] contains logprobs for window_tokens[1] given context [window_tokens[0]]
