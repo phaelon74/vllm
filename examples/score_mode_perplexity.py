@@ -88,6 +88,12 @@ def calculate_perplexity(
             window_tokens = tokens
             target_token_ids = window_tokens[1:]
             
+            if debug:
+                print(f"  Window tokens length: {len(window_tokens)}")
+                print(f"  Target tokens length: {len(target_token_ids)}")
+                print(f"  First 10 window tokens: {window_tokens[:10]}")
+                print(f"  First 10 target tokens: {target_token_ids[:10]}")
+            
             prompt: TokensPrompt = {
                 "prompt_token_ids": window_tokens,
                 "target_token_ids": target_token_ids,
@@ -101,11 +107,16 @@ def calculate_perplexity(
             
             outputs = llm.generate([prompt], sampling_params=sampling_params)
             output = outputs[0]
+            
             if debug:
                 print(f"  prompt_logprobs is None: {output.prompt_logprobs is None}")
                 if output.prompt_logprobs:
                     print(f"  prompt_logprobs length: {len(output.prompt_logprobs)}")
-                    print(f"  window_tokens length: {len(window_tokens)}")
+                    print(f"  prompt_logprobs[0] is None: {output.prompt_logprobs[0] is None if len(output.prompt_logprobs) > 0 else 'N/A'}")
+                    if len(output.prompt_logprobs) > 1:
+                        print(f"  prompt_logprobs[1] type: {type(output.prompt_logprobs[1])}")
+                        print(f"  prompt_logprobs[1] value: {output.prompt_logprobs[1]}")
+            
             if output.prompt_logprobs:
                 for i in range(1, len(output.prompt_logprobs)):
                     logprobs_dict = output.prompt_logprobs[i]
@@ -115,12 +126,17 @@ def calculate_perplexity(
                             logprob = logprobs_dict[actual_token].logprob
                             total_nll += -logprob
                             total_tokens += 1
+                            if debug and i <= 5:
+                                print(f"    Position {i}: token={actual_token}, logprob={logprob:.6f}")
                         elif debug:
-                            print(f"  Position {i}: token {actual_token} not in logprobs_dict. Keys: {list(logprobs_dict.keys())[:5]}")
+                            print(f"    Position {i}: token {actual_token} not in logprobs_dict. Keys: {list(logprobs_dict.keys())[:5]}")
                     elif debug:
-                        print(f"  Position {i}: logprobs_dict is None or empty")
-            elif debug:
-                print(f"  ERROR: output.prompt_logprobs is None or empty")
+                        print(f"    Position {i}: logprobs_dict is None or empty")
+            else:
+                error_msg = "ERROR: output.prompt_logprobs is None or empty"
+                if debug:
+                    print(f"  {error_msg}")
+                raise ValueError(error_msg)
     else:
         # EXL3's exact pattern: range(0, num_tokens - eval_len, eval_stride)
         # This ensures all windows are exactly context_length tokens
