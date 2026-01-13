@@ -65,13 +65,22 @@ def calculate_perplexity(
         print(f"Tokenization check:")
         print(f"  First 10 token IDs: {tokens[:10]}")
         print(f"  Last 10 token IDs: {tokens[-10:]}")
-        print(f"  Total tokens: {len(tokens)}")
+        print(f"  Total tokens before limiting: {len(tokens)}")
 
     if len(tokens) < 2:
         raise ValueError("Not enough tokens after concatenation")
     
+    # EXL3 limits to first (context_length + 99*stride) tokens
+    # For context_length=2048, stride=512: 2048 + 99*512 = 52,736 tokens
+    # This matches EXL3's "first 2048+99*512 tokens" comment
+    max_tokens_for_eval = context_length + 99 * stride
+    if len(tokens) > max_tokens_for_eval:
+        tokens = tokens[:max_tokens_for_eval]
+        if debug:
+            print(f"  Limited to first {max_tokens_for_eval} tokens (matching EXL3)")
+    
     if debug:
-        print(f"Total tokens after concatenation: {len(tokens)}")
+        print(f"Total tokens after concatenation (and limiting): {len(tokens)}")
         print(f"First 20 tokens: {tokens[:20]}")
         print(f"Last 20 tokens: {tokens[-20:]}")
 
