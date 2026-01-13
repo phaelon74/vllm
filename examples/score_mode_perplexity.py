@@ -165,16 +165,17 @@ def calculate_perplexity(
         # EXL3's exact pattern: range(0, num_tokens - eval_len, eval_stride)
         # But windows are actually (eval_len + 1) tokens long to evaluate eval_len tokens
         # With num_tokens=52736, context_length=2048, actual_window_size=2049, stride=512:
-        # Last window starts at: 52736 - 2049 = 50687
-        # But we want windows that evaluate 2048 tokens, so we need windows of 2049 tokens
-        # range(0, num_tokens - actual_window_size + stride, stride) to include last window
-        for start_idx in range(0, num_tokens - actual_window_size + stride, stride):
+        # We need to find all valid window start positions
+        # Last valid window start: 52736 - 2049 = 50687
+        # But with stride 512, we want windows at: 0, 512, 1024, ..., up to the last valid start
+        # range(0, num_tokens - actual_window_size + 1, stride) ensures we include all valid windows
+        for start_idx in range(0, num_tokens - actual_window_size + 1, stride):
             # Create window: [start_idx : start_idx + actual_window_size]
             # EXL3: eval_tokens[:, a:b] where b = a + eval_len + 1 (exactly eval_len + 1 tokens)
             # This allows evaluating eval_len tokens (positions 1 through eval_len)
             end_idx = start_idx + actual_window_size
             
-            # Skip if window would exceed available tokens
+            # Skip if window would exceed available tokens (shouldn't happen with correct range, but safety check)
             if end_idx > num_tokens:
                 break
                 
@@ -272,6 +273,10 @@ def calculate_perplexity(
             # Progress logging
             if windows_processed % 100 == 0:
                 print(f"Processed {windows_processed} windows, {total_tokens} tokens evaluated")
+            if debug and windows_processed == 1:
+                print(f"  First window: evaluated {window_token_count} tokens, expected {expected_tokens_per_window}")
+            if debug and windows_processed == 100:
+                print(f"  Last window: evaluated {window_token_count} tokens, expected {expected_tokens_per_window}")
         
         if debug:
             print(f"\nWindow processing summary:")
