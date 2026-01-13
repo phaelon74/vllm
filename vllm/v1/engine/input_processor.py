@@ -582,6 +582,7 @@ class InputProcessor:
                         mm_position=decoder_mm_positions[modality][idx],
                         mm_hash=base_mm_hash,
                     )
+                )
 
         # Extract target_token_ids from TokensPrompt if present
         target_token_ids: list[int] | None = None
