@@ -71,8 +71,12 @@ def calculate_perplexity(
         raise ValueError("Not enough tokens after concatenation")
     
     # EXL3 limits to first (context_length + 99*stride) tokens
+    # But EXL3 actually uses windows of (context_length + 1) tokens to evaluate context_length tokens
     # For context_length=2048, stride=512: 2048 + 99*512 = 52,736 tokens
+    # But windows are actually 2049 tokens long to evaluate 2048 tokens per window
     # This matches EXL3's "first 2048+99*512 tokens" comment
+    # But we need windows of 2049 tokens to evaluate 2048 tokens per window
+    actual_window_size = context_length + 1  # 2049 tokens to evaluate 2048 tokens
     max_tokens_for_eval = context_length + 99 * stride
     if len(tokens) > max_tokens_for_eval:
         tokens = tokens[:max_tokens_for_eval]
@@ -88,20 +92,23 @@ def calculate_perplexity(
     # EXL3: for a in range(0, num_tokens - eval_len, eval_stride):
     #       b = a + eval_len
     #       seqs.append(eval_tokens[:, a:b])
-    # This creates windows of exactly eval_len tokens
+    # But EXL3 actually uses windows of (eval_len + 1) tokens to evaluate eval_len tokens
+    # So windows are 2049 tokens long to evaluate 2048 tokens per window
     num_tokens = len(tokens)
     windows_processed = 0
     
     # EXL3's exact pattern: range(0, num_tokens - eval_len, eval_stride)
-    # If num_tokens < eval_len, we can't create any full windows
+    # But windows are actually (eval_len + 1) tokens long
+    # If num_tokens < actual_window_size, we can't create any full windows
     # In that case, process the entire sequence as one window (if it has at least 2 tokens)
-    if num_tokens < context_length:
+    if num_tokens < actual_window_size:
         if debug:
             print(f"Warning: Only {num_tokens} tokens, less than context_length {context_length}")
             print("Processing entire sequence as single window")
         
         if num_tokens >= 2:
             # Process entire sequence as one window
+            # For short sequences, use the actual sequence length
             window_tokens = tokens
             target_token_ids = window_tokens[1:]
             
@@ -156,17 +163,16 @@ def calculate_perplexity(
                 raise ValueError(error_msg)
     else:
         # EXL3's exact pattern: range(0, num_tokens - eval_len, eval_stride)
-        # But we need to include the last window, so we add stride to the end
-        # This ensures all windows are exactly context_length tokens
-        # With num_tokens=52736, context_length=2048, stride=512:
-        # Last window starts at: 52736 - 2048 = 50688
-        # range(0, 50688, 512) gives: 0, 512, ..., 50176 (99 windows)
-        # We need: range(0, 50688 + 512, 512) = range(0, 51200, 512) to include 50688
-        # But we must check that end_idx doesn't exceed num_tokens
-        for start_idx in range(0, num_tokens - context_length + stride, stride):
-            # Create window: [start_idx : start_idx + context_length]
-            # EXL3: eval_tokens[:, a:b] where b = a + eval_len (exactly eval_len tokens)
-            end_idx = start_idx + context_length
+        # But windows are actually (eval_len + 1) tokens long to evaluate eval_len tokens
+        # With num_tokens=52736, context_length=2048, actual_window_size=2049, stride=512:
+        # Last window starts at: 52736 - 2049 = 50687
+        # But we want windows that evaluate 2048 tokens, so we need windows of 2049 tokens
+        # range(0, num_tokens - actual_window_size + stride, stride) to include last window
+        for start_idx in range(0, num_tokens - actual_window_size + stride, stride):
+            # Create window: [start_idx : start_idx + actual_window_size]
+            # EXL3: eval_tokens[:, a:b] where b = a + eval_len + 1 (exactly eval_len + 1 tokens)
+            # This allows evaluating eval_len tokens (positions 1 through eval_len)
+            end_idx = start_idx + actual_window_size
             
             # Skip if window would exceed available tokens
             if end_idx > num_tokens:
@@ -174,8 +180,8 @@ def calculate_perplexity(
                 
             window_tokens = tokens[start_idx:end_idx]
             
-            # All windows should be exactly context_length tokens (guaranteed by range and check above)
-            assert len(window_tokens) == context_length, f"Window length mismatch: {len(window_tokens)} != {context_length}"
+            # All windows should be exactly actual_window_size tokens (guaranteed by range and check above)
+            assert len(window_tokens) == actual_window_size, f"Window length mismatch: {len(window_tokens)} != {actual_window_size}"
 
             if len(window_tokens) < 2:
                 continue
@@ -234,12 +240,9 @@ def calculate_perplexity(
                 window_token_count = 0
                 # Evaluate positions 1 through len(window_tokens)-1 (matching EXL3)
                 # EXL3 uses logits[:, :-1] with target_ids[:, 1:]
-                # This evaluates positions 1 through len-1 (2047 tokens for a 2048-token window)
-                # But EXL3 reports 2048 tokens per window, so maybe they evaluate position 0 too?
-                # Or maybe they evaluate positions 1-2048 (requiring window of 2049 tokens)?
-                # For now, evaluate positions 1 through len-1 as per logits[:, :-1] pattern
-                # Note: len(output.prompt_logprobs) should equal len(window_tokens) = context_length
-                expected_tokens_per_window = len(window_tokens) - 1  # positions 1 through len-1
+                # With windows of 2049 tokens, this evaluates positions 1 through 2048 (2048 tokens)
+                # Note: len(output.prompt_logprobs) should equal len(window_tokens) = actual_window_size
+                expected_tokens_per_window = actual_window_size - 1  # positions 1 through len-1
                 for i in range(1, len(output.prompt_logprobs)):
                     logprobs_dict = output.prompt_logprobs[i]
                     if logprobs_dict:
@@ -273,7 +276,8 @@ def calculate_perplexity(
         if debug:
             print(f"\nWindow processing summary:")
             print(f"  Total windows processed: {windows_processed}")
-            print(f"  Expected tokens (100 windows * 2047): {windows_processed * 2047}")
+            print(f"  Window size: {actual_window_size} tokens (to evaluate {expected_tokens_per_window} tokens per window)")
+            print(f"  Expected tokens ({windows_processed} windows * {expected_tokens_per_window}): {windows_processed * expected_tokens_per_window}")
             print(f"  Actual tokens evaluated: {total_tokens}")
             if windows_processed > 0:
                 print(f"  Tokens per window (avg): {total_tokens / windows_processed:.2f}")
