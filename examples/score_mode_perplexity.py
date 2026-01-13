@@ -156,14 +156,25 @@ def calculate_perplexity(
                 raise ValueError(error_msg)
     else:
         # EXL3's exact pattern: range(0, num_tokens - eval_len, eval_stride)
+        # But we need to include the last window, so we add stride to the end
         # This ensures all windows are exactly context_length tokens
-        for start_idx in range(0, num_tokens - context_length, stride):
+        # With num_tokens=52736, context_length=2048, stride=512:
+        # Last window starts at: 52736 - 2048 = 50688
+        # range(0, 50688, 512) gives: 0, 512, ..., 50176 (99 windows)
+        # We need: range(0, 50688 + 512, 512) = range(0, 51200, 512) to include 50688
+        # But we must check that end_idx doesn't exceed num_tokens
+        for start_idx in range(0, num_tokens - context_length + stride, stride):
             # Create window: [start_idx : start_idx + context_length]
             # EXL3: eval_tokens[:, a:b] where b = a + eval_len (exactly eval_len tokens)
             end_idx = start_idx + context_length
+            
+            # Skip if window would exceed available tokens
+            if end_idx > num_tokens:
+                break
+                
             window_tokens = tokens[start_idx:end_idx]
             
-            # All windows should be exactly context_length tokens (guaranteed by range)
+            # All windows should be exactly context_length tokens (guaranteed by range and check above)
             assert len(window_tokens) == context_length, f"Window length mismatch: {len(window_tokens)} != {context_length}"
 
             if len(window_tokens) < 2:
