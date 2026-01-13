@@ -76,9 +76,10 @@ def calculate_perplexity(
             }
 
             # Use score_mode for efficient logprob extraction
+            # Note: max_tokens must be at least 1, but we only use prompt logprobs
             sampling_params = SamplingParams(
                 prompt_logprobs=1,  # Request prompt logprobs
-                max_tokens=0,  # Don't generate any tokens
+                max_tokens=1,  # Required to be >= 1, but we only use prompt logprobs
                 score_mode=True,  # Enable score mode for GPU-side extraction
             )
 
