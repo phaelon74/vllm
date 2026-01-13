@@ -99,7 +99,7 @@ def calculate_perplexity(
     # But windows are actually (eval_len + 1) tokens long
     # If num_tokens < context_length, we can't create any full windows
     # In that case, process the entire sequence as one window (if it has at least 2 tokens)
-    if num_tokens < actual_window_size:
+    if num_tokens < context_length:
         if debug:
             print(f"Warning: Only {num_tokens} tokens, less than context_length {context_length}")
             print("Processing entire sequence as single window")
