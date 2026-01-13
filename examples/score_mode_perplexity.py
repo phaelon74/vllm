@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import math
 import time
 from typing import Any
 
@@ -108,8 +109,9 @@ def calculate_perplexity(
     if total_tokens == 0:
         raise ValueError("No valid tokens found for perplexity calculation")
 
-    perplexity = (total_nll / total_tokens).exp()
-    return perplexity.item(), total_tokens
+    avg_nll = total_nll / total_tokens
+    perplexity = math.exp(avg_nll)
+    return perplexity, total_tokens
 
 
 def load_dataset_texts(
