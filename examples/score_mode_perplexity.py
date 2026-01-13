@@ -45,10 +45,10 @@ def calculate_perplexity(
         debug: Enable debug logging for first few windows
 
     Returns:
-        Tuple of (perplexity, total_tokens)
+        Tuple of (perplexity, logprob_count)
     """
-    total_nll = 0.0
-    total_tokens = 0
+    logprob_sum = 0.0  # Accumulate log probabilities (negative values)
+    logprob_count = 0  # Count of tokens evaluated
 
     samples_to_process = texts[:num_samples] if num_samples else texts
 
@@ -146,8 +146,9 @@ def calculate_perplexity(
                         actual_token = window_tokens[i]
                         if actual_token in logprobs_dict:
                             logprob = logprobs_dict[actual_token].logprob
-                            total_nll += -logprob
-                            total_tokens += 1
+                            # EXL3: logprob_sum += target_log_probs.sum().item()
+                            logprob_sum += logprob
+                            logprob_count += 1
                             if debug and i <= 5:
                                 print(f"    Position {i}: token={actual_token}, logprob={logprob:.6f}")
                         elif debug:
@@ -250,15 +251,13 @@ def calculate_perplexity(
                         if actual_token in logprobs_dict:
                             logprob = logprobs_dict[actual_token].logprob
                             # EXL3: logprob_sum += target_log_probs.sum().item()
-                            # We accumulate negative log probabilities
-                            nll = -logprob
-                            total_nll += nll
-                            total_tokens += 1
-                            window_nll += nll
+                            logprob_sum += logprob
+                            logprob_count += 1
+                            window_nll += -logprob  # Keep for debug output
                             window_token_count += 1
                             
                             if debug and windows_processed <= 3 and i <= 5:
-                                print(f"    Position {i}: token={actual_token}, logprob={logprob:.6f}, nll={nll:.6f}")
+                                print(f"    Position {i}: token={actual_token}, logprob={logprob:.6f}, nll={-logprob:.6f}")
                         elif debug and windows_processed <= 3:
                             print(f"    WARNING: Position {i}: token {actual_token} not in logprobs_dict. Keys: {list(logprobs_dict.keys())[:5]}")
                     elif debug and windows_processed <= 3:
@@ -271,7 +270,7 @@ def calculate_perplexity(
             
             # Progress logging
             if windows_processed % 100 == 0:
-                print(f"Processed {windows_processed} windows, {total_tokens} tokens evaluated")
+                print(f"Processed {windows_processed} windows, {logprob_count} tokens evaluated")
             if debug and windows_processed <= 3:
                 print(f"  Window {windows_processed}: evaluated {window_token_count} tokens, expected {expected_tokens_per_window}, start_idx={start_idx}, end_idx={end_idx}")
             if debug and windows_processed >= 98:
@@ -282,27 +281,29 @@ def calculate_perplexity(
             print(f"  Total windows processed: {windows_processed}")
             print(f"  Window size: {context_length} tokens (to evaluate {expected_tokens_per_window} tokens per window)")
             print(f"  Expected tokens ({windows_processed} windows * {expected_tokens_per_window}): {windows_processed * expected_tokens_per_window}")
-            print(f"  Actual tokens evaluated: {total_tokens}")
+            print(f"  Actual tokens evaluated: {logprob_count}")
             if windows_processed > 0:
-                print(f"  Tokens per window (avg): {total_tokens / windows_processed:.2f}")
+                print(f"  Tokens per window (avg): {logprob_count / windows_processed:.2f}")
                 print(f"  EXL3 expects: 2048 tokens per window")
-                print(f"  Difference per window: {2048 - (total_tokens / windows_processed):.2f}")
+                print(f"  Difference per window: {2048 - (logprob_count / windows_processed):.2f}")
 
-    if total_tokens == 0:
+    if logprob_count == 0:
         raise ValueError("No valid tokens found for perplexity calculation")
 
-    avg_nll = total_nll / total_tokens
-    perplexity = math.exp(avg_nll)
+    # EXL3: mean_log_prob = logprob_sum / logprob_count
+    mean_log_prob = logprob_sum / logprob_count
+    # EXL3: perplexity = math.exp(-mean_log_prob)
+    perplexity = math.exp(-mean_log_prob)
     
     if debug:
         print(f"\nPerplexity calculation summary:")
-        print(f"  Total NLL: {total_nll:.6f}")
-        print(f"  Total tokens evaluated: {total_tokens}")
-        print(f"  Average NLL: {avg_nll:.6f}")
+        print(f"  Total logprob sum: {logprob_sum:.6f}")
+        print(f"  Total tokens evaluated: {logprob_count}")
+        print(f"  Mean log probability: {mean_log_prob:.6f}")
         print(f"  Perplexity: {perplexity:.6f}")
         print(f"  Windows processed: {windows_processed}")
     
-    return perplexity, total_tokens
+    return perplexity, logprob_count
 
 
 def load_dataset_texts(

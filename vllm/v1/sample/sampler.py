@@ -204,7 +204,7 @@ class Sampler(nn.Module):
 
     @staticmethod
     def compute_logprobs(logits: torch.Tensor) -> torch.Tensor:
-        return logits.log_softmax(dim=-1, dtype=torch.float32)
+        return logits.float().log_softmax(dim=-1)
 
     @staticmethod
     def gather_logprobs(
