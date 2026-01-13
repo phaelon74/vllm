@@ -170,17 +170,17 @@ def calculate_perplexity(
                 continue
             
             windows_processed += 1
+
+            # EXL3 approach: target_ids = input_ids[:, 1:]
+            # Target tokens are all tokens after the first one
+            # We evaluate positions 1 through len-1 (all tokens except first)
+            target_token_ids = window_tokens[1:]
             
             if debug and windows_processed <= 3:
                 print(f"\nWindow {windows_processed}:")
                 print(f"  Start index: {start_idx}, End index: {end_idx}")
                 print(f"  Window tokens (first 10): {window_tokens[:10]}")
                 print(f"  Target tokens (first 10): {target_token_ids[:10]}")
-
-            # EXL3 approach: target_ids = input_ids[:, 1:]
-            # Target tokens are all tokens after the first one
-            # We evaluate positions 1 through len-1 (all tokens except first)
-            target_token_ids = window_tokens[1:]
 
             # Create prompt with target_token_ids for score mode
             prompt: TokensPrompt = {
