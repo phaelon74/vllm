@@ -57,7 +57,15 @@ def calculate_perplexity(
     concatenated_text = "\n\n".join(samples_to_process)
     
     # Tokenize the entire concatenated text as one sequence
+    # EXL3 uses tokenize_transformers which likely uses add_special_tokens=False
+    # but we should verify this matches EXL3's tokenization exactly
     tokens = llm.llm_engine.tokenizer.encode(concatenated_text, add_special_tokens=False)
+    
+    if debug:
+        print(f"Tokenization check:")
+        print(f"  First 10 token IDs: {tokens[:10]}")
+        print(f"  Last 10 token IDs: {tokens[-10:]}")
+        print(f"  Total tokens: {len(tokens)}")
 
     if len(tokens) < 2:
         raise ValueError("Not enough tokens after concatenation")
@@ -194,8 +202,17 @@ def calculate_perplexity(
                 # prompt_logprobs[1] contains logprobs for window_tokens[1] given context [window_tokens[0]]
                 # prompt_logprobs[i] contains logprobs for window_tokens[i] given context [window_tokens[0:i]]
                 # We evaluate positions 1 through len(window_tokens)-1 (matching EXL3's logits[:, :-1])
+                # EXL3 evaluates: logits[:, :-1] with target_ids[:, 1:]
+                # This means: evaluate positions 1 through len-1 (all tokens except first)
+                # Verify length matches
+                if len(output.prompt_logprobs) != len(window_tokens):
+                    raise ValueError(
+                        f"prompt_logprobs length ({len(output.prompt_logprobs)}) "
+                        f"does not match window_tokens length ({len(window_tokens)})"
+                    )
                 window_nll = 0.0
                 window_token_count = 0
+                # Evaluate positions 1 through len(window_tokens)-1 (matching EXL3)
                 for i in range(1, len(output.prompt_logprobs)):
                     logprobs_dict = output.prompt_logprobs[i]
                     if logprobs_dict:
@@ -229,6 +246,15 @@ def calculate_perplexity(
 
     avg_nll = total_nll / total_tokens
     perplexity = math.exp(avg_nll)
+    
+    if debug:
+        print(f"\nPerplexity calculation summary:")
+        print(f"  Total NLL: {total_nll:.6f}")
+        print(f"  Total tokens evaluated: {total_tokens}")
+        print(f"  Average NLL: {avg_nll:.6f}")
+        print(f"  Perplexity: {perplexity:.6f}")
+        print(f"  Windows processed: {windows_processed}")
+    
     return perplexity, total_tokens
 
 
