@@ -50,9 +50,8 @@ def calculate_perplexity(
     samples_to_process = texts[:num_samples] if num_samples else texts
 
     for sample_idx, text in enumerate(samples_to_process):
-        # Tokenize the text
-        tokenizer = llm.llm_engine.tokenizer.tokenizer
-        tokens = tokenizer.encode(text, add_special_tokens=False)
+        # Tokenize the text using vLLM's tokenizer
+        tokens = llm.llm_engine.tokenizer.encode(text, add_special_tokens=False)
 
         if len(tokens) < 2:
             continue
