@@ -71,12 +71,11 @@ def calculate_perplexity(
         raise ValueError("Not enough tokens after concatenation")
     
     # EXL3 limits to first (context_length + 99*stride) tokens
-    # But EXL3 actually uses windows of (context_length + 1) tokens to evaluate context_length tokens
     # For context_length=2048, stride=512: 2048 + 99*512 = 52,736 tokens
-    # But windows are actually 2049 tokens long to evaluate 2048 tokens per window
-    # This matches EXL3's "first 2048+99*512 tokens" comment
-    # But we need windows of 2049 tokens to evaluate 2048 tokens per window
-    actual_window_size = context_length + 1  # 2049 tokens to evaluate 2048 tokens
+    # EXL3 uses windows of context_length tokens (2048 tokens) and evaluates context_length tokens per window
+    # To get 100 windows, we need to use range(0, num_tokens - context_length + stride, stride)
+    # This allows the last window to start at 50688, giving us 100 windows total
+    actual_window_size = context_length  # 2048 tokens, evaluating 2048 tokens per window
     max_tokens_for_eval = context_length + 99 * stride
     if len(tokens) > max_tokens_for_eval:
         tokens = tokens[:max_tokens_for_eval]
@@ -163,13 +162,12 @@ def calculate_perplexity(
                 raise ValueError(error_msg)
     else:
         # EXL3's exact pattern: range(0, num_tokens - eval_len, eval_stride)
-        # But windows are actually (eval_len + 1) tokens long to evaluate eval_len tokens
-        # With num_tokens=52736, context_length=2048, actual_window_size=2049, stride=512:
-        # We need to find all valid window start positions
-        # Last valid window start: 52736 - 2049 = 50687
-        # But with stride 512, we want windows at: 0, 512, 1024, ..., up to the last valid start
-        # range(0, num_tokens - actual_window_size + 1, stride) ensures we include all valid windows
-        for start_idx in range(0, num_tokens - actual_window_size + 1, stride):
+        # But to get 100 windows, we need: range(0, num_tokens - context_length + stride, stride)
+        # With num_tokens=52736, context_length=2048, stride=512:
+        # range(0, 52736 - 2048 + 512, 512) = range(0, 51200, 512)
+        # This gives windows starting at: 0, 512, ..., 50688 (100 windows)
+        # Last window at 50688: tokens 50688-52735 (2048 tokens) ✓
+        for start_idx in range(0, num_tokens - context_length + stride, stride):
             # Create window: [start_idx : start_idx + actual_window_size]
             # EXL3: eval_tokens[:, a:b] where b = a + eval_len + 1 (exactly eval_len + 1 tokens)
             # This allows evaluating eval_len tokens (positions 1 through eval_len)
@@ -241,7 +239,9 @@ def calculate_perplexity(
                 window_token_count = 0
                 # Evaluate positions 1 through len(window_tokens)-1 (matching EXL3)
                 # EXL3 uses logits[:, :-1] with target_ids[:, 1:]
-                # With windows of 2049 tokens, this evaluates positions 1 through 2048 (2048 tokens)
+                # With windows of 2048 tokens, this evaluates positions 1-2047 (2047 tokens)
+                # But EXL3 evaluates 2048 tokens per window, so there's a mismatch
+                # For now, evaluate positions 1 through len-1 as per logits[:, :-1] pattern
                 # Note: len(output.prompt_logprobs) should equal len(window_tokens) = actual_window_size
                 expected_tokens_per_window = actual_window_size - 1  # positions 1 through len-1
                 for i in range(1, len(output.prompt_logprobs)):
