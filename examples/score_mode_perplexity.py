@@ -273,10 +273,10 @@ def calculate_perplexity(
             # Progress logging
             if windows_processed % 100 == 0:
                 print(f"Processed {windows_processed} windows, {total_tokens} tokens evaluated")
-            if debug and windows_processed == 1:
-                print(f"  First window: evaluated {window_token_count} tokens, expected {expected_tokens_per_window}")
-            if debug and windows_processed == 100:
-                print(f"  Last window: evaluated {window_token_count} tokens, expected {expected_tokens_per_window}")
+            if debug and windows_processed <= 3:
+                print(f"  Window {windows_processed}: evaluated {window_token_count} tokens, expected {expected_tokens_per_window}, start_idx={start_idx}, end_idx={end_idx}")
+            if debug and windows_processed >= 98:
+                print(f"  Window {windows_processed}: evaluated {window_token_count} tokens, expected {expected_tokens_per_window}, start_idx={start_idx}, end_idx={end_idx}")
         
         if debug:
             print(f"\nWindow processing summary:")
