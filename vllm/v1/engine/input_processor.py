@@ -9,6 +9,7 @@ from typing import Any, Literal, cast
 from vllm.config import VllmConfig
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import ProcessorInputs, PromptType, SingletonInputs
+from vllm.inputs.data import is_tokens_prompt
 from vllm.inputs.parse import split_enc_dec_inputs
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
@@ -581,7 +582,11 @@ class InputProcessor:
                         mm_position=decoder_mm_positions[modality][idx],
                         mm_hash=base_mm_hash,
                     )
-                )
+
+        # Extract target_token_ids from TokensPrompt if present
+        target_token_ids: list[int] | None = None
+        if is_tokens_prompt(prompt):
+            target_token_ids = cast(dict, prompt).get("target_token_ids")
 
         return EngineCoreRequest(
             request_id=request_id,
@@ -597,6 +602,7 @@ class InputProcessor:
             priority=priority,
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
+            target_token_ids=target_token_ids,
         )
 
     def _validate_model_inputs(

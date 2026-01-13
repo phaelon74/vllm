@@ -92,6 +92,12 @@ class TokensPrompt(TypedDict):
     Optional cache salt to be used for prefix caching.
     """
 
+    target_token_ids: NotRequired[list[int]]
+    """
+    Optional target token IDs for score mode perplexity calculation.
+    When provided, only logprobs for these tokens are extracted on GPU.
+    """
+
 
 class EmbedsPrompt(TypedDict):
     """Schema for a prompt provided via token embeddings."""

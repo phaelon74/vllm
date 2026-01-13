@@ -44,6 +44,7 @@ class Request:
         priority: int = 0,
         trace_headers: Mapping[str, str] | None = None,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
+        target_token_ids: list[int] | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -102,6 +103,7 @@ class Request:
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
+        self.target_token_ids: list[int] | None = target_token_ids
 
         # Multi-modal related
         self.mm_features = mm_features or []
@@ -158,6 +160,7 @@ class Request:
             priority=request.priority,
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
+            target_token_ids=request.target_token_ids,
         )
 
     def append_output_token_ids(

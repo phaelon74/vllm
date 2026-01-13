@@ -4047,13 +4047,21 @@ class GPUModelRunner(
                 self.device, non_blocking=True
             )
 
+            # Check if score_mode is enabled
+            is_score_mode = (
+                request.sampling_params is not None
+                and request.sampling_params.score_mode
+            )
+
             # Set up target LogprobsTensors object.
             logprobs_tensors = in_progress_dict.get(req_id)
             if not logprobs_tensors:
                 # Create empty logprobs CPU tensors for the entire prompt.
                 # If chunked, we'll copy in slice by slice.
+                # In score_mode, we only need [N, 1] tensors
+                num_logprobs_cols = 1 if is_score_mode else num_prompt_logprobs + 1
                 logprobs_tensors = LogprobsTensors.empty_cpu(
-                    num_prompt_tokens - 1, num_prompt_logprobs + 1
+                    num_prompt_tokens - 1, num_logprobs_cols
                 )
                 in_progress_dict[req_id] = logprobs_tensors
 
@@ -4094,9 +4102,18 @@ class GPUModelRunner(
 
             # Compute prompt logprobs.
             logprobs = self.sampler.compute_logprobs(logits)
-            token_ids, logprobs, ranks = self.sampler.gather_logprobs(
-                logprobs, num_prompt_logprobs, tgt_token_ids
-            )
+
+            # Use fast path if score_mode is enabled
+            if is_score_mode:
+                # Convert to int64 for gather_target_logprobs
+                tgt_token_ids_int64 = tgt_token_ids.to(torch.int64)
+                token_ids, logprobs, ranks = self.sampler.gather_target_logprobs(
+                    logprobs, tgt_token_ids_int64
+                )
+            else:
+                token_ids, logprobs, ranks = self.sampler.gather_logprobs(
+                    logprobs, num_prompt_logprobs, tgt_token_ids
+                )
 
             # Transfer GPU->CPU async.
             chunk_slice = slice(start_idx, start_idx + num_logits)

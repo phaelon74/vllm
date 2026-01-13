@@ -247,6 +247,11 @@ class SamplingParams(
 
     skip_reading_prefix_cache: bool | None = None
 
+    score_mode: bool = False
+    """When True, enables score mode for perplexity calculation. In this mode,
+    only target token logprobs are extracted on GPU, avoiding the overhead of
+    transferring full vocabulary logprobs to CPU."""
+
     @staticmethod
     def from_optional(
         n: int | None = 1,
