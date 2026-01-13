@@ -222,6 +222,11 @@ def calculate_perplexity(
                 window_nll = 0.0
                 window_token_count = 0
                 # Evaluate positions 1 through len(window_tokens)-1 (matching EXL3)
+                # EXL3 uses logits[:, :-1] with target_ids[:, 1:]
+                # This evaluates positions 1 through len-1 (2047 tokens for a 2048-token window)
+                # But EXL3 reports 2048 tokens per window, so maybe they evaluate position 0 too?
+                # Or maybe they evaluate positions 1-2048 (requiring window of 2049 tokens)?
+                # For now, evaluate positions 1 through len-1 as per logits[:, :-1] pattern
                 for i in range(1, len(output.prompt_logprobs)):
                     logprobs_dict = output.prompt_logprobs[i]
                     if logprobs_dict:
@@ -249,6 +254,16 @@ def calculate_perplexity(
             # Progress logging
             if windows_processed % 100 == 0:
                 print(f"Processed {windows_processed} windows, {total_tokens} tokens evaluated")
+        
+        if debug:
+            print(f"\nWindow processing summary:")
+            print(f"  Total windows processed: {windows_processed}")
+            print(f"  Expected tokens (100 windows * 2047): {windows_processed * 2047}")
+            print(f"  Actual tokens evaluated: {total_tokens}")
+            if windows_processed > 0:
+                print(f"  Tokens per window (avg): {total_tokens / windows_processed:.2f}")
+                print(f"  EXL3 expects: 2048 tokens per window")
+                print(f"  Difference per window: {2048 - (total_tokens / windows_processed):.2f}")
 
     if total_tokens == 0:
         raise ValueError("No valid tokens found for perplexity calculation")
