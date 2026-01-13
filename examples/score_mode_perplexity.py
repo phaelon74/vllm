@@ -31,6 +31,7 @@ def calculate_perplexity(
     context_length: int,
     stride: int,
     num_samples: int | None = None,
+    debug: bool = False,
 ) -> tuple[float, int]:
     """
     Calculate perplexity using EXL3-compatible sliding window approach.
@@ -41,6 +42,7 @@ def calculate_perplexity(
         context_length: Maximum context length for each window
         stride: Stride between windows (overlap = context_length - stride)
         num_samples: Maximum number of samples to process (None = all)
+        debug: Enable debug logging for first few windows
 
     Returns:
         Tuple of (perplexity, total_tokens)
@@ -50,24 +52,53 @@ def calculate_perplexity(
 
     samples_to_process = texts[:num_samples] if num_samples else texts
 
-    for sample_idx, text in enumerate(samples_to_process):
-        # Tokenize the text using vLLM's tokenizer
-        tokens = llm.llm_engine.tokenizer.encode(text, add_special_tokens=False)
+    # EXL3 approach: Join all texts with "\n\n" separator before tokenizing
+    # This matches EXL3's dataset preparation exactly
+    concatenated_text = "\n\n".join(samples_to_process)
+    
+    # Tokenize the entire concatenated text as one sequence
+    tokens = llm.llm_engine.tokenizer.encode(concatenated_text, add_special_tokens=False)
 
-        if len(tokens) < 2:
-            continue
+    if len(tokens) < 2:
+        raise ValueError("Not enough tokens after concatenation")
+    
+    if debug:
+        print(f"Total tokens after concatenation: {len(tokens)}")
+        print(f"First 20 tokens: {tokens[:20]}")
+        print(f"Last 20 tokens: {tokens[-20:]}")
 
-        # Process with sliding windows
-        for start_idx in range(0, len(tokens) - 1, stride):
+    # Process with sliding windows (matching EXL3's pattern exactly)
+    # EXL3: for a in range(0, num_tokens - eval_len, eval_stride):
+    #       b = a + eval_len
+    #       seqs.append(eval_tokens[:, a:b])
+    # This creates windows of exactly eval_len tokens
+    num_tokens = len(tokens)
+    windows_processed = 0
+    # EXL3's exact pattern: range(0, num_tokens - eval_len, eval_stride)
+    # This ensures all windows are exactly context_length tokens
+    for start_idx in range(0, num_tokens - context_length, stride):
             # Create window: [start_idx : start_idx + context_length]
-            end_idx = min(start_idx + context_length, len(tokens))
+            # EXL3: eval_tokens[:, a:b] where b = a + eval_len (exactly eval_len tokens)
+            end_idx = start_idx + context_length
             window_tokens = tokens[start_idx:end_idx]
+            
+            # All windows should be exactly context_length tokens (guaranteed by range)
+            assert len(window_tokens) == context_length, f"Window length mismatch: {len(window_tokens)} != {context_length}"
 
             if len(window_tokens) < 2:
                 continue
+            
+            windows_processed += 1
+            
+            if debug and windows_processed <= 3:
+                print(f"\nWindow {windows_processed}:")
+                print(f"  Start index: {start_idx}, End index: {end_idx}")
+                print(f"  Window tokens (first 10): {window_tokens[:10]}")
+                print(f"  Target tokens (first 10): {target_token_ids[:10]}")
 
+            # EXL3 approach: target_ids = input_ids[:, 1:]
             # Target tokens are all tokens after the first one
-            # For position i, we want the logprob of token at position i+1
+            # We evaluate positions 1 through len-1 (all tokens except first)
             target_token_ids = window_tokens[1:]
 
             # Create prompt with target_token_ids for score mode
@@ -88,23 +119,42 @@ def calculate_perplexity(
             outputs = llm.generate([prompt], sampling_params=sampling_params)
 
             # Extract logprobs from output
+            # EXL3 evaluates ALL tokens in the window (positions 1 through len-1)
             output = outputs[0]
             if output.prompt_logprobs:
                 # prompt_logprobs[0] is None (position 0 has no logprobs)
-                # prompt_logprobs[1] contains logprobs for window_tokens[1]
-                # prompt_logprobs[i] contains logprobs for window_tokens[i]
-                # Start from index 1 (skip None at index 0)
+                # prompt_logprobs[1] contains logprobs for window_tokens[1] given context [window_tokens[0]]
+                # prompt_logprobs[i] contains logprobs for window_tokens[i] given context [window_tokens[0:i]]
+                # We evaluate positions 1 through len(window_tokens)-1 (matching EXL3's logits[:, :-1])
+                window_nll = 0.0
+                window_token_count = 0
                 for i in range(1, len(output.prompt_logprobs)):
                     logprobs_dict = output.prompt_logprobs[i]
                     if logprobs_dict:
                         actual_token = window_tokens[i]
                         if actual_token in logprobs_dict:
                             logprob = logprobs_dict[actual_token].logprob
-                            total_nll += -logprob
+                            # EXL3: logprob_sum += target_log_probs.sum().item()
+                            # We accumulate negative log probabilities
+                            nll = -logprob
+                            total_nll += nll
                             total_tokens += 1
-
-        if (sample_idx + 1) % 10 == 0:
-            print(f"Processed {sample_idx + 1}/{len(samples_to_process)} samples")
+                            window_nll += nll
+                            window_token_count += 1
+                            
+                            if debug and windows_processed <= 3 and i <= 5:
+                                print(f"    Position {i}: token={actual_token}, logprob={logprob:.6f}, nll={nll:.6f}")
+                        elif debug and windows_processed <= 3:
+                            print(f"    WARNING: Position {i}: token {actual_token} not in logprobs_dict. Keys: {list(logprobs_dict.keys())[:5]}")
+                    elif debug and windows_processed <= 3:
+                        print(f"    WARNING: Position {i}: logprobs_dict is None or empty")
+                
+                if debug and windows_processed <= 3:
+                    print(f"  Window {windows_processed} summary: {window_token_count} tokens, avg_nll={window_nll/window_token_count if window_token_count > 0 else 0:.6f}")
+            
+            # Progress logging
+            if windows_processed % 100 == 0:
+                print(f"Processed {windows_processed} windows, {total_tokens} tokens evaluated")
 
     if total_tokens == 0:
         raise ValueError("No valid tokens found for perplexity calculation")
@@ -243,6 +293,11 @@ def main():
         action="store_true",
         help="Trust remote code when loading model",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging to compare with EXL3",
+    )
 
     args = parser.parse_args()
 
@@ -277,6 +332,7 @@ def main():
         args.context_length,
         args.stride,
         args.num_samples,
+        debug=args.debug,
     )
     elapsed_time = time.time() - start_time
 
