@@ -586,8 +586,13 @@ class InputProcessor:
 
         # Extract target_token_ids from TokensPrompt if present
         target_token_ids: list[int] | None = None
+        reference_logits_path: str | None = None
+        reference_logits_key: str | None = None
         if is_tokens_prompt(prompt):
-            target_token_ids = cast(dict, prompt).get("target_token_ids")
+            prompt_dict = cast(dict, prompt)
+            target_token_ids = prompt_dict.get("target_token_ids")
+            reference_logits_path = prompt_dict.get("reference_logits_path")
+            reference_logits_key = prompt_dict.get("reference_logits_key")
 
         return EngineCoreRequest(
             request_id=request_id,
@@ -604,6 +609,8 @@ class InputProcessor:
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
             target_token_ids=target_token_ids,
+            reference_logits_path=reference_logits_path,
+            reference_logits_key=reference_logits_key,
         )
 
     def _validate_model_inputs(

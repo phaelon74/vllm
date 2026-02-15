@@ -98,6 +98,18 @@ class TokensPrompt(TypedDict):
     When provided, only logprobs for these tokens are extracted on GPU.
     """
 
+    reference_logits_path: NotRequired[str]
+    """
+    Optional path to safetensors file containing reference logits for KLD mode.
+    When provided with reference_logits_key, enables GPU-side KLD computation.
+    """
+
+    reference_logits_key: NotRequired[str]
+    """
+    Optional key for loading reference logits from the safetensors file.
+    Used with reference_logits_path for KLD mode.
+    """
+
 
 class EmbedsPrompt(TypedDict):
     """Schema for a prompt provided via token embeddings."""

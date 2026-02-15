@@ -4,6 +4,7 @@
 import itertools
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Any
 
 from vllm.logger import init_logger
 from vllm.logprobs import (
@@ -40,6 +41,12 @@ class LogprobsProcessor:
     target_token_ids: list[int] | None = None
     """Target token IDs for score mode perplexity calculation.
     When provided, enables fast path processing of [N, 1] logprobs tensors."""
+
+    prompt_logits: Any = None
+    """Raw logits for prompt positions when return_prompt_logits."""
+
+    kld_result: tuple[float, int] | None = None
+    """(kld_sum, kld_count) when kld_mode."""
 
     @classmethod
     def from_new_request(
@@ -332,3 +339,7 @@ class LogprobsProcessor:
                 )
             else:
                 self._update_prompt_logprobs(output.new_prompt_logprobs_tensors)
+        if output.new_prompt_logits is not None:
+            self.prompt_logits = output.new_prompt_logits
+        if output.kld_result is not None:
+            self.kld_result = output.kld_result
