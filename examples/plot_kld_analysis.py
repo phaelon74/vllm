@@ -2,7 +2,7 @@
 """
 Plot KLD (Kullback-Leibler Divergence) vs model file size for quantization analysis.
 
-Categories: INT AWQ (W4A16, W8A16, FP8-INT4), NVFP4, GGUF - each with distinct color/shape.
+Categories: INT AWQ, NVFP4, W8A8-FP8, GGUF - each with distinct color/shape.
 
 Usage:
     pip install matplotlib
@@ -20,7 +20,7 @@ except ImportError:
 
 # --- Edit your data here ---
 # Format: (file_size_gib, mean_kld, bpw, label, category)
-# category: "original" | "int_awq" | "nvfp4" | "gguf"
+# category: "original" | "int_awq" | "nvfp4" | "fp8" | "gguf"
 DATA = [
     # Original
     (30.0, 0.0, 16.0, "Original (Llama-3.1-8B bf16)", "original"),
@@ -30,7 +30,8 @@ DATA = [
     (6.2, 0.033707, 4.0, "FP8_INT4", "int_awq"),
     # NVFP4
     (5.7, 0.109275, 4.0, "NVFP4", "nvfp4"),
-    (8.5, 0.006547, 8.0, "W8A8-FP8_BLOCK", "nvfp4"),
+    # FP8 (W8A8-FP8 - distinct from NVFP4)
+    (8.5, 0.006547, 8.0, "W8A8-FP8_BLOCK", "fp8"),
     # GGUF (from reference chart)
     (3.5, 0.1241, 3.50, "IQ3_XS", "gguf"),
     (3.65, 0.1782, 3.64, "Q3_K_S", "gguf"),
@@ -49,6 +50,7 @@ STYLES = {
     "original": ("#7f7f7f", "o"),
     "int_awq": ("#1f77b4", "s"),
     "nvfp4": ("#ff7f0e", "^"),
+    "fp8": ("#9467bd", "P"),
     "gguf": ("#2ca02c", "D"),
 }
 
@@ -64,17 +66,30 @@ def main():
     )
     args = parser.parse_args()
 
-    fig, ax = plt.subplots(figsize=(16, 10))
+    fig, ax = plt.subplots(figsize=(20, 12))
 
     # Track legend entries to avoid duplicates
     legend_added = set()
 
-    # Stagger label positions to reduce overlap (alternate quadrants)
-    offsets = [
-        (25, 20), (25, -30), (-100, 20), (25, 20), (-100, -30),
-        (25, -30), (-100, 20), (25, 20), (-100, -30), (25, 20),
-        (-100, -30), (25, -30), (-100, 20), (25, 20), (-100, -30),
-        (25, -30),
+    # Per-point label offsets (x, y) in points - place labels right/up to use empty space
+    # Stacks labels vertically to avoid overlap in dense regions
+    LABEL_OFFSETS = [
+        (-140, 10),    # Original - left of point
+        (90, 0),       # W4A16
+        (90, 35),      # W8A16 - stacked
+        (90, 0),       # FP8_INT4
+        (90, 0),       # NVFP4
+        (90, 70),      # W8A8-FP8 - stacked
+        (110, 0),      # IQ3_XS - right column
+        (110, 28),     # Q3_K_S
+        (110, 56),     # Q3_K_M
+        (110, 84),     # IQ4_XS
+        (110, 112),    # Q4_K_S
+        (110, 140),    # Q4_K_M
+        (110, 168),    # Q5_K_S
+        (110, 196),    # Q5_K_M
+        (110, 224),    # Q6_K
+        (90, 105),     # Q8_0 - stacked with W8A16/W8A8
     ]
 
     for i, (size_gib, kld, bpw, label, category) in enumerate(DATA):
@@ -86,7 +101,8 @@ def main():
             legend_label = {
                 "original": "Original (bf16)",
                 "int_awq": "INT AWQ (W4A16, W8A16, FP8-INT4)",
-                "nvfp4": "NVFP4 / W8A8-FP8",
+                "nvfp4": "NVFP4",
+                "fp8": "W8A8-FP8",
                 "gguf": "GGUF",
             }[category]
             ax.scatter(
@@ -99,12 +115,9 @@ def main():
         # Annotate with model name, KLD, bpw (like reference graph)
         text = f"{full_label}\n{kld:.4f}\n{bpw:.2f}bpw"
 
-        if category == "original":
-            xytext = (-120, 15)
-        else:
-            xytext = offsets[i % len(offsets)]
+        xytext = LABEL_OFFSETS[i] if i < len(LABEL_OFFSETS) else (90, 0)
         ha = "left" if xytext[0] > 0 else "right"
-        va = "bottom" if xytext[1] > 0 else "top"
+        va = "bottom" if xytext[1] > 0 else "center" if xytext[1] == 0 else "top"
         ax.annotate(
             text,
             (size_gib, kld),
@@ -127,9 +140,9 @@ def main():
     ax.set_ylim(bottom=-0.02)
     ax.set_xlim(left=2.5, right=32)
 
-    plt.tight_layout()
+    plt.subplots_adjust(left=0.08, right=0.85, top=0.94, bottom=0.08)
     if args.output:
-        plt.savefig(args.output, dpi=150)
+        plt.savefig(args.output, dpi=150, bbox_inches="tight")
         print(f"Saved to {args.output}")
     else:
         plt.show()
