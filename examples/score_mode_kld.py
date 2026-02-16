@@ -8,14 +8,19 @@ full-precision model) to measure quantization quality. All KL math is
 computed on GPU when reference logits are provided.
 
 Usage:
-    # Two-phase: reference model + test model
+    # Two-phase: reference model + test model (run Phase 1, then Phase 2 in same process)
     python examples/score_mode_kld.py \
         --model /path/to/quantized_model \
         --reference-model /path/to/reference_model \
         --dataset wikitext \
         --dataset-config wikitext-2-raw-v1 \
         --context-length 2048 \
-        --stride 512
+        --stride 512 \
+        --gpu-memory-utilization 0.35
+
+    # IMPORTANT: gpu-memory-utilization reserves that fraction of EACH GPU.
+    # 0.7 on 95GB GPUs = 66GB/GPU reserved - excessive for 8B models (~8GB).
+    # Use 0.35 or lower to avoid OOM.
 
     # Using pre-saved reference logits
     python examples/score_mode_kld.py \
@@ -149,8 +154,13 @@ def calculate_kld(
     samples_to_process = texts[:num_samples] if num_samples else texts
     concatenated_text = "\n\n".join(samples_to_process)
 
-    # Tokenize with standalone tokenizer (no model load) to avoid sequence length warning
+    # Truncate text before tokenization to avoid "Token indices sequence length
+    # longer than model_max_length" warning (tokenizer may warn before truncating)
     max_tokens_for_eval = context_length + 99 * stride
+    max_chars = max_tokens_for_eval * 5  # ~5 chars/token for English
+    if len(concatenated_text) > max_chars:
+        concatenated_text = concatenated_text[:max_chars]
+
     tokenizer_path = reference_model_path if reference_model_path else model_path
     tokenizer = AutoTokenizer.from_pretrained(
         tokenizer_path, trust_remote_code=trust_remote_code
@@ -376,8 +386,10 @@ def main():
     parser.add_argument(
         "--gpu-memory-utilization",
         type=float,
-        default=0.30,
-        help="GPU memory utilization (default: 0.30)",
+        default=0.35,
+        help="GPU memory utilization (default: 0.35). vLLM reserves this fraction "
+        "of each GPU for model+KV cache. 0.7 on 95GB GPUs = 66GB/GPU, which "
+        "is excessive for 8B models (~8GB). Use 0.35 or lower.",
     )
     parser.add_argument(
         "--trust-remote-code",
