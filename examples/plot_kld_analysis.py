@@ -42,24 +42,24 @@ def main():
     )
     args = parser.parse_args()
 
-    sizes = [d[0] for d in DATA]
-    klds = [d[1] for d in DATA]
-    labels = [d[2] for d in DATA]
-
     fig, ax = plt.subplots(figsize=(10, 6))
-    colors = ["gray" if k == 0 else "blue" for k in klds]
-    markers = ["o" if k == 0 else "s" for k in klds]
+
+    # Unique style per point: original=gray circle, quants=distinct markers+colors
+    QUANT_MARKERS = ["s", "^", "D", "v", "p", "h", "8", "*", "P", "X"]
+    QUANT_COLORS = [
+        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+        "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+    ]
 
     for i, (s, k, lbl) in enumerate(DATA):
-        ax.scatter(s, k, label=lbl, color=colors[i], s=120, marker=markers[i], zorder=3)
-        ax.annotate(
-            f"{k:.4f}",
-            (s, k),
-            textcoords="offset points",
-            xytext=(0, 10),
-            ha="center",
-            fontsize=9,
-        )
+        if k == 0:
+            color, marker = "gray", "o"
+        else:
+            idx = (i - 1) % len(QUANT_MARKERS)
+            color = QUANT_COLORS[idx % len(QUANT_COLORS)]
+            marker = QUANT_MARKERS[idx % len(QUANT_MARKERS)]
+        legend_label = f"{lbl} ({k:.4f})" if k > 0 else lbl
+        ax.scatter(s, k, label=legend_label, color=color, s=120, marker=marker, zorder=3)
 
     ax.set_xlabel("File Size (GiB)")
     ax.set_ylabel("Mean KL Divergence (Lower is Better)")
