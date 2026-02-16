@@ -18,16 +18,26 @@ except ImportError:
     raise SystemExit(1)
 
 
+# Llama 3.1 8B parameter count (from Hugging Face model card)
+LLAMA_31_8B_PARAMS = 8.03e9
+
+
+def bpw_from_file_size(size_gib: float) -> float:
+    """Compute bits-per-weight from file size (GiB) for Llama 3.1 8B."""
+    return round((size_gib * (1024**3) * 8) / LLAMA_31_8B_PARAMS, 2)
+
+
 # --- Edit your data here ---
 # Format: (file_size_gib, mean_kld, bpw, label)
+# For non-GGUF: use bpw_from_file_size(size_gib) or leave None to auto-compute
 DATA = [
     (30.0, 0.0, 16.0, "Original (bf16)"),
-    (5.4, 0.076226, 4.25, "W4A16_GS128"),
-    (8.6, 0.000899, 8.25, "W8A16_GS128"),
-    (6.2, 0.033707, 4.0, "FP8_INT4"),
-    (5.7, 0.109275, 4.0, "NVFP4"),
-    (5.7, 0.089775, 4.0, "NVFP4_New"),
-    (8.5, 0.006547, 8.0, "W8A8-FP8_BLOCK"),
+    (5.4, 0.076226, bpw_from_file_size(5.4), "W4A16_GS128"),
+    (8.6, 0.000899, bpw_from_file_size(8.6), "W8A16_GS128"),
+    (6.2, 0.033707, bpw_from_file_size(6.2), "FP8_INT4"),
+    (5.7, 0.109275, bpw_from_file_size(5.7), "NVFP4"),
+    (5.7, 0.089775, bpw_from_file_size(5.7), "NVFP4_New"),
+    (8.5, 0.006547, bpw_from_file_size(8.5), "W8A8-FP8_BLOCK"),
     (3.5, 0.1241, 3.50, "IQ3_XS"),
     (3.65, 0.1782, 3.64, "Q3_K_S"),
     (4.0, 0.0744, 4.00, "Q3_K_M"),
