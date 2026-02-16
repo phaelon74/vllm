@@ -33,7 +33,9 @@ def bpw_from_file_size(size_gib: float) -> float:
 DATA = [
     (30.0, 0.0, 16.0, "Original (bf16)"),
     (5.4, 0.076226, bpw_from_file_size(5.4), "W4A16_GS128"),
+    (5.7, 0.048686, bpw_from_file_size(5.7), "W4A16_GS32"),
     (8.6, 0.000899, bpw_from_file_size(8.6), "W8A16_GS128"),
+    (8.9, 0.000813, bpw_from_file_size(8.9), "W8A16_GS32"),
     (6.2, 0.033707, bpw_from_file_size(6.2), "FP8_INT4"),
     (5.7, 0.109275, bpw_from_file_size(5.7), "NVFP4"),
     (5.7, 0.089775, bpw_from_file_size(5.7), "NVFP4_New"),
@@ -51,11 +53,12 @@ DATA = [
 ]
 
 # Unique markers and colors for each model (cycle if more models than entries)
-MARKERS = ["o", "s", "^", "D", "v", "p", "h", "8", "*", "P", "X", "d", "<", ">", "H", "1", "2"]
+MARKERS = ["o", "s", "^", "D", "v", "p", "h", "8", "*", "P", "X", "d", "<", ">", "H", "1", "2", "3", "4"]
 COLORS = [
     "#7f7f7f", "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
     "#8c564b", "#e377c2", "#bcbd22", "#17becf", "#aec7e8", "#ffbb78",
-    "#98df8a", "#ff9896", "#c5b0d5", "#c49c94", "#f7b6d2",
+    "#98df8a", "#ff9896", "#c5b0d5", "#c49c94", "#f7b6d2", "#2e8b57",
+    "#6a0dad",
 ]
 
 
