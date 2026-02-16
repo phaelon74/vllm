@@ -29,7 +29,7 @@ def bpw_from_file_size(size_gib: float) -> float:
 
 # --- Edit your data here ---
 # Format: (file_size_gib, mean_kld, bpw, label)
-# For non-GGUF: use bpw_from_file_size(size_gib) or leave None to auto-compute
+# For non-GGUF: use bpw_from_file_size(size_gib) or leave None to auto-compute Updating.
 DATA = [
     (30.0, 0.0, 16.0, "Original (bf16)"),
     (5.4, 0.076226, bpw_from_file_size(5.4), "W4A16_GS128"),
