@@ -23,6 +23,10 @@ except ImportError:
 DATA = [
     (30.0, 0.0, "Original (Llama-3.1-8B bf16)"),
     (6.2, 0.033707, "Quantized (FP8_INT4)"),
+    (5.4, 0.076226, "Quantized (W4A16_GS128)"),
+    (5.7, 0.109275, "Quantized (NVFP4)"),
+    (8.6, 0.000899, "Quantized (W8A16_GS128)"),
+    (8.5, 0.006547, "Quantized (W8A8-FP8_BLOCK)"),
 ]
 # Add more: DATA.append((size_gib, kld, "Label"))
 
