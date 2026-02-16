@@ -922,6 +922,12 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                reference_logits_path=getattr(
+                    new_req_data, "reference_logits_path", None
+                ),
+                reference_logits_key=getattr(
+                    new_req_data, "reference_logits_key", None
+                ),
             )
             self.requests[req_id] = req_state
 
