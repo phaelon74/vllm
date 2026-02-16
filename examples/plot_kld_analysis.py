@@ -2,7 +2,7 @@
 """
 Plot KLD (Kullback-Leibler Divergence) vs model file size for quantization analysis.
 
-Categories: INT AWQ, NVFP4, W8A8-FP8, GGUF - each with distinct color/shape.
+Each model gets a unique color and shape. All models are listed in the legend.
 
 Usage:
     pip install matplotlib
@@ -19,40 +19,34 @@ except ImportError:
 
 
 # --- Edit your data here ---
-# Format: (file_size_gib, mean_kld, bpw, label, category)
-# category: "original" | "int_awq" | "nvfp4" | "fp8" | "gguf"
+# Format: (file_size_gib, mean_kld, bpw, label)
 DATA = [
-    # Original
-    (30.0, 0.0, 16.0, "Original (Llama-3.1-8B bf16)", "original"),
-    # INT AWQ: W4A16, W8A16, FP8-INT4
-    (5.4, 0.076226, 4.25, "W4A16_GS128", "int_awq"),
-    (8.6, 0.000899, 8.25, "W8A16_GS128", "int_awq"),
-    (6.2, 0.033707, 4.0, "FP8_INT4", "int_awq"),
-    # NVFP4
-    (5.7, 0.109275, 4.0, "NVFP4", "nvfp4"),
-    # FP8 (W8A8-FP8 - distinct from NVFP4)
-    (8.5, 0.006547, 8.0, "W8A8-FP8_BLOCK", "fp8"),
-    # GGUF (from reference chart)
-    (3.5, 0.1241, 3.50, "IQ3_XS", "gguf"),
-    (3.65, 0.1782, 3.64, "Q3_K_S", "gguf"),
-    (4.0, 0.0744, 4.00, "Q3_K_M", "gguf"),
-    (4.4, 0.0327, 4.42, "IQ4_XS", "gguf"),
-    (4.7, 0.0305, 4.67, "Q4_K_S", "gguf"),
-    (4.9, 0.0267, 4.89, "Q4_K_M", "gguf"),
-    (5.6, 0.0102, 5.57, "Q5_K_S", "gguf"),
-    (5.7, 0.0092, 5.70, "Q5_K_M", "gguf"),
-    (6.6, 0.0040, 6.56, "Q6_K", "gguf"),
-    (8.0, 0.0011, 8.50, "Q8_0", "gguf"),
+    (30.0, 0.0, 16.0, "Original (bf16)"),
+    (5.4, 0.076226, 4.25, "W4A16_GS128"),
+    (8.6, 0.000899, 8.25, "W8A16_GS128"),
+    (6.2, 0.033707, 4.0, "FP8_INT4"),
+    (5.7, 0.109275, 4.0, "NVFP4"),
+    (5.7, 0.089775, 4.0, "NVFP4_New"),
+    (8.5, 0.006547, 8.0, "W8A8-FP8_BLOCK"),
+    (3.5, 0.1241, 3.50, "IQ3_XS"),
+    (3.65, 0.1782, 3.64, "Q3_K_S"),
+    (4.0, 0.0744, 4.00, "Q3_K_M"),
+    (4.4, 0.0327, 4.42, "IQ4_XS"),
+    (4.7, 0.0305, 4.67, "Q4_K_S"),
+    (4.9, 0.0267, 4.89, "Q4_K_M"),
+    (5.6, 0.0102, 5.57, "Q5_K_S"),
+    (5.7, 0.0092, 5.70, "Q5_K_M"),
+    (6.6, 0.0040, 6.56, "Q6_K"),
+    (8.0, 0.0011, 8.50, "Q8_0"),
 ]
 
-# Category styles: (color, marker)
-STYLES = {
-    "original": ("#7f7f7f", "o"),
-    "int_awq": ("#1f77b4", "s"),
-    "nvfp4": ("#ff7f0e", "^"),
-    "fp8": ("#9467bd", "P"),
-    "gguf": ("#2ca02c", "D"),
-}
+# Unique markers and colors for each model (cycle if more models than entries)
+MARKERS = ["o", "s", "^", "D", "v", "p", "h", "8", "*", "P", "X", "d", "<", ">", "H", "1", "2"]
+COLORS = [
+    "#7f7f7f", "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+    "#8c564b", "#e377c2", "#bcbd22", "#17becf", "#aec7e8", "#ffbb78",
+    "#98df8a", "#ff9896", "#c5b0d5", "#c49c94", "#f7b6d2",
+]
 
 
 def main():
@@ -66,67 +60,21 @@ def main():
     )
     args = parser.parse_args()
 
-    fig, ax = plt.subplots(figsize=(20, 12))
+    fig, ax = plt.subplots(figsize=(14, 9))
 
-    # Track legend entries to avoid duplicates
-    legend_added = set()
+    for i, (size_gib, kld, bpw, label) in enumerate(DATA):
+        color = COLORS[i % len(COLORS)]
+        marker = MARKERS[i % len(MARKERS)]
+        legend_label = f"{label} ({kld:.4f}, {bpw:.2f}bpw)"
 
-    # Per-point label offsets (x, y) in points - place labels right/up to use empty space
-    # Stacks labels vertically to avoid overlap in dense regions
-    LABEL_OFFSETS = [
-        (-140, 10),    # Original - left of point
-        (90, 0),       # W4A16
-        (90, 35),      # W8A16 - stacked
-        (90, 0),       # FP8_INT4
-        (90, 0),       # NVFP4
-        (90, 70),      # W8A8-FP8 - stacked
-        (110, 0),      # IQ3_XS - right column
-        (110, 28),     # Q3_K_S
-        (110, 56),     # Q3_K_M
-        (110, 84),     # IQ4_XS
-        (110, 112),    # Q4_K_S
-        (110, 140),    # Q4_K_M
-        (110, 168),    # Q5_K_S
-        (110, 196),    # Q5_K_M
-        (110, 224),    # Q6_K
-        (90, 105),     # Q8_0 - stacked with W8A16/W8A8
-    ]
-
-    for i, (size_gib, kld, bpw, label, category) in enumerate(DATA):
-        color, marker = STYLES[category]
-        full_label = f"Llama-3.1-8B-Instruct-{label}" if category != "original" else label
-
-        # Add to legend only once per category
-        if category not in legend_added:
-            legend_label = {
-                "original": "Original (bf16)",
-                "int_awq": "INT AWQ (W4A16, W8A16, FP8-INT4)",
-                "nvfp4": "NVFP4",
-                "fp8": "W8A8-FP8",
-                "gguf": "GGUF",
-            }[category]
-            ax.scatter(
-                [], [], color=color, marker=marker, s=120, label=legend_label
-            )
-            legend_added.add(category)
-
-        ax.scatter(size_gib, kld, color=color, s=120, marker=marker, zorder=3)
-
-        # Annotate with model name, KLD, bpw (like reference graph)
-        text = f"{full_label}\n{kld:.4f}\n{bpw:.2f}bpw"
-
-        xytext = LABEL_OFFSETS[i] if i < len(LABEL_OFFSETS) else (90, 0)
-        ha = "left" if xytext[0] > 0 else "right"
-        va = "bottom" if xytext[1] > 0 else "center" if xytext[1] == 0 else "top"
-        ax.annotate(
-            text,
-            (size_gib, kld),
-            xytext=xytext,
-            textcoords="offset points",
-            fontsize=8,
-            ha=ha,
-            va=va,
-            arrowprops=dict(arrowstyle="-", color="gray", lw=0.5),
+        ax.scatter(
+            size_gib,
+            kld,
+            color=color,
+            s=100,
+            marker=marker,
+            zorder=3,
+            label=legend_label,
         )
 
     ax.set_xlabel("File Size (GiB)", fontsize=12)
@@ -135,12 +83,17 @@ def main():
         "Llama-3.1-8B-Instruct Quantization Analysis: Mean KL Divergence vs. Model File Size",
         fontsize=14,
     )
-    ax.legend(loc="upper right", fontsize=10)
+    ax.legend(
+        loc="center left",
+        bbox_to_anchor=(1.02, 1),
+        fontsize=9,
+        framealpha=0.95,
+    )
     ax.grid(True, alpha=0.3, linestyle="--")
     ax.set_ylim(bottom=-0.02)
     ax.set_xlim(left=2.5, right=32)
 
-    plt.subplots_adjust(left=0.08, right=0.85, top=0.94, bottom=0.08)
+    plt.tight_layout(rect=[0, 0, 0.78, 1])
     if args.output:
         plt.savefig(args.output, dpi=150, bbox_inches="tight")
         print(f"Saved to {args.output}")
