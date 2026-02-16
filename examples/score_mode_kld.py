@@ -28,6 +28,7 @@ Usage:
 """
 
 import argparse
+import gc
 import hashlib
 import json
 import math
@@ -39,6 +40,7 @@ import torch
 import torch.nn.functional as F
 from datasets import load_dataset
 from safetensors.torch import save_file, safe_open
+from transformers import AutoTokenizer
 
 from vllm import LLM, SamplingParams
 from vllm.inputs.data import TokensPrompt
@@ -109,7 +111,7 @@ def _dict_hash(x: dict) -> str:
 
 
 def calculate_kld(
-    llm: LLM,
+    model_path: str,
     texts: list[str],
     context_length: int,
     stride: int,
@@ -117,20 +119,25 @@ def calculate_kld(
     reference_model_path: str | None = None,
     llm_kwargs: dict[str, Any] | None = None,
     num_samples: int | None = None,
+    trust_remote_code: bool = False,
     debug: bool = False,
 ) -> tuple[float, int]:
     """
     Calculate KLD using EXL3-compatible sliding window approach.
 
+    Loads only one model at a time to avoid GPU OOM: Phase 1 (reference)
+    runs first and is unloaded before Phase 2 (test model) starts.
+
     Args:
-        llm: Initialized vLLM LLM instance (test model)
+        model_path: Path to test model
         texts: List of text samples to evaluate
         context_length: Maximum context length for each window
         stride: Stride between windows
         reference_logits_path: Path to safetensors file with reference logits
         reference_model_path: Path to reference model (for Phase 1)
-        llm_kwargs: Kwargs for initializing reference model
+        llm_kwargs: Kwargs for initializing LLM (reference and test)
         num_samples: Maximum number of samples to process (None = all)
+        trust_remote_code: Trust remote code when loading tokenizer
         debug: Enable debug logging
 
     Returns:
@@ -141,16 +148,25 @@ def calculate_kld(
 
     samples_to_process = texts[:num_samples] if num_samples else texts
     concatenated_text = "\n\n".join(samples_to_process)
-    tokens = llm.llm_engine.tokenizer.encode(
-        concatenated_text, add_special_tokens=False
+
+    # Tokenize with standalone tokenizer (no model load) to avoid sequence length warning
+    max_tokens_for_eval = context_length + 99 * stride
+    tokenizer_path = reference_model_path if reference_model_path else model_path
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_path, trust_remote_code=trust_remote_code
     )
+    encoded = tokenizer(
+        concatenated_text,
+        add_special_tokens=False,
+        truncation=True,
+        max_length=max_tokens_for_eval,
+    )
+    tokens = encoded["input_ids"]
+    if tokens and isinstance(tokens[0], list):
+        tokens = tokens[0]
 
     if len(tokens) < 2:
         raise ValueError("Not enough tokens after concatenation")
-
-    max_tokens_for_eval = context_length + 99 * stride
-    if len(tokens) > max_tokens_for_eval:
-        tokens = tokens[:max_tokens_for_eval]
 
     num_tokens = len(tokens)
 
@@ -197,6 +213,9 @@ def calculate_kld(
                     window_idx += 1
             save_file(ref_logits_dict, ref_logits_file)
             del ref_llm
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             print(f"Saved reference logits to {ref_logits_file}")
 
     if reference_logits_path is None:
@@ -210,6 +229,8 @@ def calculate_kld(
 
     # Phase 2: Compute KLD using test model with reference logits
     print("Phase 2: Computing KLD...")
+    print(f"Loading test model: {model_path}")
+    llm = LLM(model=model_path, **(llm_kwargs or {}))
     window_idx = 0
     for start_idx in range(0, num_tokens - context_length + stride, stride):
         end_idx = start_idx + context_length
@@ -388,9 +409,6 @@ def main():
     if args.quantization:
         llm_kwargs["quantization"] = args.quantization
 
-    print(f"Initializing LLM with model: {args.model}")
-    llm = LLM(model=args.model, **llm_kwargs)
-
     print("\nCalculating KLD...")
     print(f"  Context length: {args.context_length}")
     print(f"  Stride: {args.stride}")
@@ -398,7 +416,7 @@ def main():
 
     start_time = time.time()
     mean_kld, total_positions = calculate_kld(
-        llm,
+        args.model,
         texts,
         args.context_length,
         args.stride,
@@ -406,6 +424,7 @@ def main():
         reference_model_path=args.reference_model,
         llm_kwargs=llm_kwargs,
         num_samples=args.num_samples,
+        trust_remote_code=args.trust_remote_code,
         debug=args.debug,
     )
     elapsed_time = time.time() - start_time
