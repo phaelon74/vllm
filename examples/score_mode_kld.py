@@ -34,9 +34,6 @@ Usage:
 
 import argparse
 import gc
-import hashlib
-import json
-import math
 import os
 import time
 from typing import Any
@@ -110,11 +107,6 @@ def load_dataset_texts(
     return texts
 
 
-def _dict_hash(x: dict) -> str:
-    key = str(json.dumps(x, sort_keys=True))
-    return hashlib.sha256(key.encode()).hexdigest()
-
-
 def calculate_kld(
     model_path: str,
     texts: list[str],
@@ -182,15 +174,10 @@ def calculate_kld(
 
     # Phase 1: Generate reference logits if reference_model_path provided
     if reference_model_path is not None:
-        data_spec = {
-            "reference_model": reference_model_path,
-            "dataset": "wikitext",
-            "context_length": context_length,
-            "stride": stride,
-        }
+        model_name = os.path.basename(reference_model_path.rstrip("/\\"))
         ref_logits_file = reference_logits_path or os.path.join(
             os.getcwd(),
-            f"ref_logits_{_dict_hash(data_spec)}.safetensors",
+            f"ref_logits_{model_name}_ctx{context_length}_s{stride}.safetensors",
         )
         reference_logits_path = ref_logits_file
         if not os.path.exists(ref_logits_file):
