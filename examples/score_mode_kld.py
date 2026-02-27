@@ -183,6 +183,7 @@ def calculate_kld(
     # Phase 1: Generate reference logits if reference_model_path provided
     if reference_model_path is not None:
         data_spec = {
+            "reference_model": reference_model_path,
             "dataset": "wikitext",
             "context_length": context_length,
             "stride": stride,
