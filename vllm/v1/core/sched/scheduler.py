@@ -1093,12 +1093,8 @@ class Scheduler(SchedulerInterface):
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
-        prompt_logits_dict = getattr(
-            model_runner_output, "prompt_logits_dict", {}
-        )
-        kld_result_dict = getattr(
-            model_runner_output, "kld_result_dict", {}
-        )
+        prompt_logits_dict = model_runner_output.prompt_logits_dict
+        kld_result_dict = model_runner_output.kld_result_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits

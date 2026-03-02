@@ -4,7 +4,8 @@
 import itertools
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any
+
+import torch
 
 from vllm.logger import init_logger
 from vllm.logprobs import (
@@ -42,7 +43,7 @@ class LogprobsProcessor:
     """Target token IDs for score mode perplexity calculation.
     When provided, enables fast path processing of [N, 1] logprobs tensors."""
 
-    prompt_logits: Any = None
+    prompt_logits: torch.Tensor | None = None
     """Raw logits for prompt positions when return_prompt_logits."""
 
     kld_result: tuple[float, int] | None = None
@@ -253,9 +254,6 @@ class LogprobsProcessor:
                     decoded_tokens_list=decoded_tokens_slice,
                     tokens=[target_token_ids[pos]],
                 )
-
-            # Create logprob dict with single entry
-            logprob_dict = {target_token_ids[pos]: prompt_logprobs_list[pos]}
 
             # Update with the Logprob container for this pos
             append_logprobs_for_next_position(

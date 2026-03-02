@@ -2,38 +2,28 @@
 """
 KLD (Kullback-Leibler Divergence) calculation script using vLLM's score mode.
 
-This script implements EXL3-compatible sliding window KLD calculation,
-comparing a model under test against reference logits (e.g., from a
-full-precision model) to measure quantization quality. All KL math is
-computed on GPU when reference logits are provided.
+Compares a quantized model against reference logits from a full-precision
+model to measure quantization quality via sliding window KLD. Reference
+logits are generated once and cached to a safetensors file; KL divergence
+is computed on GPU when reference logits are provided in the prompt.
 
 Usage:
-    # Two-phase: reference model + test model (run Phase 1, then Phase 2 in same process)
-    python examples/score_mode_kld.py \
-        --model /path/to/quantized_model \
-        --reference-model /path/to/reference_model \
-        --dataset wikitext \
-        --dataset-config wikitext-2-raw-v1 \
-        --context-length 2048 \
-        --stride 512 \
-        --gpu-memory-utilization 0.35
+    # Two-phase: generate reference logits then compute KLD
+    python examples/score_mode_kld.py \\
+        --model /path/to/quantized_model \\
+        --reference-model /path/to/reference_model \\
+        --dataset wikitext --dataset-config wikitext-2-raw-v1
 
-    # IMPORTANT: gpu-memory-utilization reserves that fraction of EACH GPU.
-    # 0.7 on 95GB GPUs = 66GB/GPU reserved - excessive for 8B models (~8GB).
-    # Use 0.35 or lower to avoid OOM.
-
-    # Using pre-saved reference logits
-    python examples/score_mode_kld.py \
-        --model /path/to/quantized_model \
-        --reference-logits /path/to/reference_logits.safetensors \
-        --dataset wikitext \
-        --dataset-config wikitext-2-raw-v1 \
-        --context-length 2048 \
-        --stride 512
+    # Re-use pre-saved reference logits
+    python examples/score_mode_kld.py \\
+        --model /path/to/quantized_model \\
+        --reference-logits /path/to/reference_logits.safetensors \\
+        --dataset wikitext --dataset-config wikitext-2-raw-v1
 """
 
 import argparse
 import gc
+import logging
 import os
 import time
 from typing import Any
@@ -41,11 +31,13 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
-from safetensors.torch import save_file, safe_open
+from safetensors.torch import safe_open, save_file
 from transformers import AutoTokenizer
 
 from vllm import LLM, SamplingParams
 from vllm.inputs.data import TokensPrompt
+
+logger = logging.getLogger(__name__)
 
 
 def load_dataset_texts(
@@ -117,10 +109,9 @@ def calculate_kld(
     llm_kwargs: dict[str, Any] | None = None,
     num_samples: int | None = None,
     trust_remote_code: bool = False,
-    debug: bool = False,
 ) -> tuple[float, int]:
     """
-    Calculate KLD using EXL3-compatible sliding window approach.
+    Calculate KLD using sliding window approach.
 
     Loads only one model at a time to avoid GPU OOM: Phase 1 (reference)
     runs first and is unloaded before Phase 2 (test model) starts.
@@ -135,7 +126,6 @@ def calculate_kld(
         llm_kwargs: Kwargs for initializing LLM (reference and test)
         num_samples: Maximum number of samples to process (None = all)
         trust_remote_code: Trust remote code when loading tokenizer
-        debug: Enable debug logging
 
     Returns:
         Tuple of (mean_kld, total_positions)
@@ -146,10 +136,8 @@ def calculate_kld(
     samples_to_process = texts[:num_samples] if num_samples else texts
     concatenated_text = "\n\n".join(samples_to_process)
 
-    # Truncate text before tokenization to avoid "Token indices sequence length
-    # longer than model_max_length" warning (tokenizer may warn before truncating)
     max_tokens_for_eval = context_length + 99 * stride
-    max_chars = max_tokens_for_eval * 5  # ~5 chars/token for English
+    max_chars = max_tokens_for_eval * 5
     if len(concatenated_text) > max_chars:
         concatenated_text = concatenated_text[:max_chars]
 
@@ -302,8 +290,10 @@ def calculate_kld(
                 kld_count += kld_per_pos.numel()
 
         window_idx += 1
-        if debug and window_idx <= 3:
-            print(f"Window {window_idx}: kld_sum={kld_sum}, kld_count={kld_count}")
+        logger.debug(
+            "Window %d: kld_sum=%.6f, kld_count=%d",
+            window_idx, kld_sum, kld_count,
+        )
 
     if kld_count == 0:
         raise ValueError("No valid positions for KLD calculation")
@@ -385,12 +375,15 @@ def main():
         help="Trust remote code when loading model",
     )
     parser.add_argument(
-        "--debug",
+        "--verbose", "-v",
         action="store_true",
-        help="Enable debug logging",
+        help="Enable verbose (DEBUG) logging",
     )
 
     args = parser.parse_args()
+
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG)
 
     if args.reference_model is None and args.reference_logits is None:
         parser.error("Either --reference-model or --reference-logits is required")
@@ -425,7 +418,6 @@ def main():
         llm_kwargs=llm_kwargs,
         num_samples=args.num_samples,
         trust_remote_code=args.trust_remote_code,
-        debug=args.debug,
     )
     elapsed_time = time.time() - start_time
 

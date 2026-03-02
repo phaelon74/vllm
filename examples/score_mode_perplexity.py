@@ -2,8 +2,10 @@
 """
 Perplexity calculation script using vLLM's score mode.
 
-This script implements EXL3-compatible sliding window perplexity calculation,
-evaluating all tokens in each window (including overlaps) for accurate comparison.
+Implements sliding window perplexity calculation compatible with EXL3's
+approach: concatenate text, tokenize, then evaluate fixed-size windows
+with a configurable stride. Uses vLLM's score mode for efficient
+GPU-side logprob extraction.
 
 Usage:
     python examples/score_mode_perplexity.py \
@@ -16,6 +18,7 @@ Usage:
 """
 
 import argparse
+import logging
 import math
 import time
 from typing import Any
@@ -24,6 +27,38 @@ from datasets import load_dataset
 from vllm import LLM, SamplingParams
 from vllm.inputs.data import TokensPrompt
 
+logger = logging.getLogger(__name__)
+
+
+def _extract_logprobs_from_window(
+    output_prompt_logprobs: list,
+    window_tokens: list[int],
+) -> tuple[float, int]:
+    """Extract log-probabilities for each target position in a window.
+
+    Returns (logprob_sum, count) for the window.
+    """
+    if not output_prompt_logprobs:
+        raise ValueError("prompt_logprobs is None or empty")
+
+    if len(output_prompt_logprobs) != len(window_tokens):
+        raise ValueError(
+            f"prompt_logprobs length ({len(output_prompt_logprobs)}) "
+            f"does not match window length ({len(window_tokens)})"
+        )
+
+    window_sum = 0.0
+    window_count = 0
+    for i in range(1, len(output_prompt_logprobs)):
+        logprobs_dict = output_prompt_logprobs[i]
+        if logprobs_dict:
+            actual_token = window_tokens[i]
+            if actual_token in logprobs_dict:
+                window_sum += logprobs_dict[actual_token].logprob
+                window_count += 1
+
+    return window_sum, window_count
+
 
 def calculate_perplexity(
     llm: LLM,
@@ -31,10 +66,13 @@ def calculate_perplexity(
     context_length: int,
     stride: int,
     num_samples: int | None = None,
-    debug: bool = False,
 ) -> tuple[float, int]:
     """
-    Calculate perplexity using EXL3-compatible sliding window approach.
+    Calculate perplexity using sliding window approach.
+
+    Concatenates all texts, tokenizes as one sequence, then evaluates
+    fixed-size windows with the given stride. Compatible with EXL3's
+    evaluation methodology.
 
     Args:
         llm: Initialized vLLM LLM instance
@@ -42,267 +80,97 @@ def calculate_perplexity(
         context_length: Maximum context length for each window
         stride: Stride between windows (overlap = context_length - stride)
         num_samples: Maximum number of samples to process (None = all)
-        debug: Enable debug logging for first few windows
 
     Returns:
-        Tuple of (perplexity, logprob_count)
+        Tuple of (perplexity, total_tokens_evaluated)
     """
-    logprob_sum = 0.0  # Accumulate log probabilities (negative values)
-    logprob_count = 0  # Count of tokens evaluated
+    logprob_sum = 0.0
+    logprob_count = 0
 
     samples_to_process = texts[:num_samples] if num_samples else texts
-
-    # EXL3 approach: Join all texts with "\n\n" separator before tokenizing
-    # This matches EXL3's dataset preparation exactly
     concatenated_text = "\n\n".join(samples_to_process)
-    
-    # Tokenize the entire concatenated text as one sequence
-    # EXL3 uses tokenize_transformers which likely uses add_special_tokens=False
-    # but we should verify this matches EXL3's tokenization exactly
-    tokens = llm.llm_engine.tokenizer.encode(concatenated_text, add_special_tokens=False)
-    
-    if debug:
-        print(f"Tokenization check:")
-        print(f"  First 10 token IDs: {tokens[:10]}")
-        print(f"  Last 10 token IDs: {tokens[-10:]}")
-        print(f"  Total tokens before limiting: {len(tokens)}")
+
+    tokens = llm.llm_engine.tokenizer.encode(
+        concatenated_text, add_special_tokens=False
+    )
 
     if len(tokens) < 2:
         raise ValueError("Not enough tokens after concatenation")
-    
-    # EXL3 limits to first (context_length + 99*stride) tokens
-    # For context_length=2048, stride=512: 2048 + 99*512 = 52,736 tokens
-    # EXL3 uses windows of context_length tokens (2048 tokens)
-    # To get 100 windows, we use range(0, num_tokens - context_length + stride, stride)
-    # This allows the last window to start at 50688, giving us 100 windows total
+
+    # Limit to ~100 windows worth of tokens
     max_tokens_for_eval = context_length + 99 * stride
     if len(tokens) > max_tokens_for_eval:
         tokens = tokens[:max_tokens_for_eval]
-        if debug:
-            print(f"  Limited to first {max_tokens_for_eval} tokens (matching EXL3)")
-    
-    if debug:
-        print(f"Total tokens after concatenation (and limiting): {len(tokens)}")
-        print(f"First 20 tokens: {tokens[:20]}")
-        print(f"Last 20 tokens: {tokens[-20:]}")
 
-    # Process with sliding windows (matching EXL3's pattern exactly)
-    # EXL3: for a in range(0, num_tokens - eval_len, eval_stride):
-    #       b = a + eval_len
-    #       seqs.append(eval_tokens[:, a:b])
-    # But EXL3 actually uses windows of (eval_len + 1) tokens to evaluate eval_len tokens
-    # So windows are 2049 tokens long to evaluate 2048 tokens per window
     num_tokens = len(tokens)
+    logger.debug("Total tokens for evaluation: %d", num_tokens)
     windows_processed = 0
-    
-    # EXL3's exact pattern: range(0, num_tokens - eval_len, eval_stride)
-    # But windows are actually (eval_len + 1) tokens long
-    # If num_tokens < context_length, we can't create any full windows
-    # In that case, process the entire sequence as one window (if it has at least 2 tokens)
+
+    sampling_params = SamplingParams(
+        prompt_logprobs=1,
+        max_tokens=1,
+        score_mode=True,
+    )
+
     if num_tokens < context_length:
-        if debug:
-            print(f"Warning: Only {num_tokens} tokens, less than context_length {context_length}")
-            print("Processing entire sequence as single window")
-        
         if num_tokens >= 2:
-            # Process entire sequence as one window
-            # For short sequences, use the actual sequence length
             window_tokens = tokens
             target_token_ids = window_tokens[1:]
-            
-            if debug:
-                print(f"  Window tokens length: {len(window_tokens)}")
-                print(f"  Target tokens length: {len(target_token_ids)}")
-                print(f"  First 10 window tokens: {window_tokens[:10]}")
-                print(f"  First 10 target tokens: {target_token_ids[:10]}")
-            
+
             prompt: TokensPrompt = {
                 "prompt_token_ids": window_tokens,
                 "target_token_ids": target_token_ids,
             }
-            
-            sampling_params = SamplingParams(
-                prompt_logprobs=1,
-                max_tokens=1,
-                score_mode=True,
-            )
-            
+
             outputs = llm.generate([prompt], sampling_params=sampling_params)
-            output = outputs[0]
-            
-            if debug:
-                print(f"  prompt_logprobs is None: {output.prompt_logprobs is None}")
-                if output.prompt_logprobs:
-                    print(f"  prompt_logprobs length: {len(output.prompt_logprobs)}")
-                    print(f"  prompt_logprobs[0] is None: {output.prompt_logprobs[0] is None if len(output.prompt_logprobs) > 0 else 'N/A'}")
-                    if len(output.prompt_logprobs) > 1:
-                        print(f"  prompt_logprobs[1] type: {type(output.prompt_logprobs[1])}")
-                        print(f"  prompt_logprobs[1] value: {output.prompt_logprobs[1]}")
-            
-            if output.prompt_logprobs:
-                for i in range(1, len(output.prompt_logprobs)):
-                    logprobs_dict = output.prompt_logprobs[i]
-                    if logprobs_dict:
-                        actual_token = window_tokens[i]
-                        if actual_token in logprobs_dict:
-                            logprob = logprobs_dict[actual_token].logprob
-                            # EXL3: logprob_sum += target_log_probs.sum().item()
-                            logprob_sum += logprob
-                            logprob_count += 1
-                            if debug and i <= 5:
-                                print(f"    Position {i}: token={actual_token}, logprob={logprob:.6f}")
-                        elif debug:
-                            print(f"    Position {i}: token {actual_token} not in logprobs_dict. Keys: {list(logprobs_dict.keys())[:5]}")
-                    elif debug:
-                        print(f"    Position {i}: logprobs_dict is None or empty")
-            else:
-                error_msg = "ERROR: output.prompt_logprobs is None or empty"
-                if debug:
-                    print(f"  {error_msg}")
-                raise ValueError(error_msg)
+            window_sum, window_count = _extract_logprobs_from_window(
+                outputs[0].prompt_logprobs, window_tokens
+            )
+            logprob_sum += window_sum
+            logprob_count += window_count
     else:
-        # EXL3's exact pattern: range(0, num_tokens - eval_len, eval_stride)
-        # But to get 100 windows, we need: range(0, num_tokens - context_length + stride, stride)
-        # With num_tokens=52736, context_length=2048, stride=512:
-        # range(0, 52736 - 2048 + 512, 512) = range(0, 51200, 512)
-        # This gives windows starting at: 0, 512, ..., 50688 (100 windows)
-        # Last window at 50688: tokens 50688-52735 (2048 tokens) ✓
-        for start_idx in range(0, num_tokens - context_length + stride, stride):
-            # Create window: [start_idx : start_idx + context_length]
-            # EXL3: eval_tokens[:, a:b] where b = a + eval_len (exactly eval_len tokens)
-            # Windows are context_length tokens (2048 tokens)
+        for start_idx in range(
+            0, num_tokens - context_length + stride, stride
+        ):
             end_idx = start_idx + context_length
-            
-            # Skip if window would exceed available tokens (shouldn't happen with correct range, but safety check)
             if end_idx > num_tokens:
                 break
-                
-            window_tokens = tokens[start_idx:end_idx]
-            
-            # All windows should be exactly context_length tokens (guaranteed by range and check above)
-            assert len(window_tokens) == context_length, f"Window length mismatch: {len(window_tokens)} != {context_length}"
 
+            window_tokens = tokens[start_idx:end_idx]
             if len(window_tokens) < 2:
                 continue
-            
+
             windows_processed += 1
-
-            # EXL3 approach: target_ids = input_ids[:, 1:]
-            # Target tokens are all tokens after the first one
-            # We evaluate positions 1 through len-1 (all tokens except first)
             target_token_ids = window_tokens[1:]
-            
-            if debug and windows_processed <= 3:
-                print(f"\nWindow {windows_processed}:")
-                print(f"  Start index: {start_idx}, End index: {end_idx}")
-                print(f"  Window tokens (first 10): {window_tokens[:10]}")
-                print(f"  Target tokens (first 10): {target_token_ids[:10]}")
 
-            # Create prompt with target_token_ids for score mode
             prompt: TokensPrompt = {
                 "prompt_token_ids": window_tokens,
                 "target_token_ids": target_token_ids,
             }
 
-            # Use score_mode for efficient logprob extraction
-            # Note: max_tokens must be at least 1, but we only use prompt logprobs
-            sampling_params = SamplingParams(
-                prompt_logprobs=1,  # Request prompt logprobs
-                max_tokens=1,  # Required to be >= 1, but we only use prompt logprobs
-                score_mode=True,  # Enable score mode for GPU-side extraction
-            )
-
-            # Generate (this will only compute prompt logprobs, no generation)
             outputs = llm.generate([prompt], sampling_params=sampling_params)
+            window_sum, window_count = _extract_logprobs_from_window(
+                outputs[0].prompt_logprobs, window_tokens
+            )
+            logprob_sum += window_sum
+            logprob_count += window_count
 
-            # Extract logprobs from output
-            # EXL3 evaluates ALL tokens in the window (positions 1 through len-1)
-            output = outputs[0]
-            if debug and windows_processed <= 3:
-                print(f"  prompt_logprobs is None: {output.prompt_logprobs is None}")
-                if output.prompt_logprobs:
-                    print(f"  prompt_logprobs length: {len(output.prompt_logprobs)}, expected: {len(window_tokens)}")
-            if output.prompt_logprobs:
-                # prompt_logprobs[0] is None (position 0 has no logprobs)
-                # prompt_logprobs[1] contains logprobs for window_tokens[1] given context [window_tokens[0]]
-                # prompt_logprobs[i] contains logprobs for window_tokens[i] given context [window_tokens[0:i]]
-                # We evaluate positions 1 through len(window_tokens)-1 (matching EXL3's logits[:, :-1])
-                # EXL3 evaluates: logits[:, :-1] with target_ids[:, 1:]
-                # This means: evaluate positions 1 through len-1 (all tokens except first)
-                # Verify length matches
-                if len(output.prompt_logprobs) != len(window_tokens):
-                    raise ValueError(
-                        f"prompt_logprobs length ({len(output.prompt_logprobs)}) "
-                        f"does not match window_tokens length ({len(window_tokens)})"
-                    )
-                window_nll = 0.0
-                window_token_count = 0
-                # Evaluate positions 1 through len(window_tokens)-1 (matching EXL3)
-                # EXL3 uses logits[:, :-1] with target_ids[:, 1:]
-                # With windows of 2048 tokens, this evaluates positions 1-2047 (2047 tokens)
-                # But EXL3 evaluates 2048 tokens per window, so there's a mismatch
-                # For now, evaluate positions 1 through len-1 as per logits[:, :-1] pattern
-                # Note: len(output.prompt_logprobs) should equal len(window_tokens) = context_length
-                expected_tokens_per_window = context_length - 1  # positions 1 through len-1 (2047 tokens for 2048-token window)
-                for i in range(1, len(output.prompt_logprobs)):
-                    logprobs_dict = output.prompt_logprobs[i]
-                    if logprobs_dict:
-                        actual_token = window_tokens[i]
-                        if actual_token in logprobs_dict:
-                            logprob = logprobs_dict[actual_token].logprob
-                            # EXL3: logprob_sum += target_log_probs.sum().item()
-                            logprob_sum += logprob
-                            logprob_count += 1
-                            window_nll += -logprob  # Keep for debug output
-                            window_token_count += 1
-                            
-                            if debug and windows_processed <= 3 and i <= 5:
-                                print(f"    Position {i}: token={actual_token}, logprob={logprob:.6f}, nll={-logprob:.6f}")
-                        elif debug and windows_processed <= 3:
-                            print(f"    WARNING: Position {i}: token {actual_token} not in logprobs_dict. Keys: {list(logprobs_dict.keys())[:5]}")
-                    elif debug and windows_processed <= 3:
-                        print(f"    WARNING: Position {i}: logprobs_dict is None or empty")
-                
-                if debug and windows_processed <= 3:
-                    print(f"  Window {windows_processed} summary: {window_token_count} tokens (expected {expected_tokens_per_window}), avg_nll={window_nll/window_token_count if window_token_count > 0 else 0:.6f}")
-                    if window_token_count != expected_tokens_per_window:
-                        print(f"  WARNING: Window {windows_processed} evaluated {window_token_count} tokens, expected {expected_tokens_per_window}")
-            
-            # Progress logging
             if windows_processed % 100 == 0:
-                print(f"Processed {windows_processed} windows, {logprob_count} tokens evaluated")
-            if debug and windows_processed <= 3:
-                print(f"  Window {windows_processed}: evaluated {window_token_count} tokens, expected {expected_tokens_per_window}, start_idx={start_idx}, end_idx={end_idx}")
-            if debug and windows_processed >= 98:
-                print(f"  Window {windows_processed}: evaluated {window_token_count} tokens, expected {expected_tokens_per_window}, start_idx={start_idx}, end_idx={end_idx}")
-        
-        if debug:
-            print(f"\nWindow processing summary:")
-            print(f"  Total windows processed: {windows_processed}")
-            print(f"  Window size: {context_length} tokens (to evaluate {expected_tokens_per_window} tokens per window)")
-            print(f"  Expected tokens ({windows_processed} windows * {expected_tokens_per_window}): {windows_processed * expected_tokens_per_window}")
-            print(f"  Actual tokens evaluated: {logprob_count}")
-            if windows_processed > 0:
-                print(f"  Tokens per window (avg): {logprob_count / windows_processed:.2f}")
-                print(f"  EXL3 expects: 2048 tokens per window")
-                print(f"  Difference per window: {2048 - (logprob_count / windows_processed):.2f}")
+                print(
+                    f"Processed {windows_processed} windows, "
+                    f"{logprob_count} tokens evaluated"
+                )
 
     if logprob_count == 0:
         raise ValueError("No valid tokens found for perplexity calculation")
 
-    # EXL3: mean_log_prob = logprob_sum / logprob_count
+    logger.debug(
+        "Evaluation complete: %d windows, %d tokens",
+        windows_processed, logprob_count,
+    )
+
     mean_log_prob = logprob_sum / logprob_count
-    # EXL3: perplexity = math.exp(-mean_log_prob)
     perplexity = math.exp(-mean_log_prob)
-    
-    if debug:
-        print(f"\nPerplexity calculation summary:")
-        print(f"  Total logprob sum: {logprob_sum:.6f}")
-        print(f"  Total tokens evaluated: {logprob_count}")
-        print(f"  Mean log probability: {mean_log_prob:.6f}")
-        print(f"  Perplexity: {perplexity:.6f}")
-        print(f"  Windows processed: {windows_processed}")
-    
     return perplexity, logprob_count
 
 
@@ -311,23 +179,18 @@ def load_dataset_texts(
     dataset_config: str | None = None,
     split: str | None = None,
 ) -> list[str]:
-    """
-    Load and extract text from a HuggingFace dataset.
+    """Load and extract text from a HuggingFace dataset.
 
-    Args:
-        dataset_name: Name of the dataset (e.g., "wikitext", "neuralmagic/LLM_compression_calibration")
-        dataset_config: Optional dataset configuration
-        split: Optional split name (auto-detected if None)
-
-    Returns:
-        List of text strings
+    Supports datasets with "text" fields, chat-format "messages" fields,
+    or falls back to the first string field found.
     """
-    # Try to auto-detect split if not provided
     if split is None:
         for candidate_split in ["test", "train", "validation"]:
             try:
                 if dataset_config:
-                    dataset = load_dataset(dataset_name, dataset_config, split=candidate_split)
+                    dataset = load_dataset(
+                        dataset_name, dataset_config, split=candidate_split
+                    )
                 else:
                     dataset = load_dataset(dataset_name, split=candidate_split)
                 split = candidate_split
@@ -341,7 +204,6 @@ def load_dataset_texts(
                 "(test/train/validation)"
             )
 
-    # Load the dataset
     if dataset_config:
         dataset = load_dataset(dataset_name, dataset_config, split=split)
     else:
@@ -349,23 +211,21 @@ def load_dataset_texts(
 
     texts = []
     for example in dataset:
-        # Handle different dataset formats
         if "text" in example:
             text = example["text"]
             if text and text.strip():
                 texts.append(text)
         elif "messages" in example:
-            # Handle chat format datasets
             messages = example["messages"]
             if isinstance(messages, list):
-                # Concatenate all messages
                 text = "\n".join(
-                    msg.get("content", "") for msg in messages if isinstance(msg, dict)
+                    msg.get("content", "")
+                    for msg in messages
+                    if isinstance(msg, dict)
                 )
                 if text and text.strip():
                     texts.append(text)
         else:
-            # Try to find any string field
             for key, value in example.items():
                 if isinstance(value, str) and value.strip():
                     texts.append(value)
@@ -392,7 +252,7 @@ def main():
         "--dataset",
         type=str,
         required=True,
-        help="Dataset name (e.g., 'wikitext', 'neuralmagic/LLM_compression_calibration')",
+        help="Dataset name (e.g., 'wikitext')",
     )
     parser.add_argument(
         "--dataset-config",
@@ -436,24 +296,26 @@ def main():
         help="Trust remote code when loading model",
     )
     parser.add_argument(
-        "--debug",
+        "--verbose", "-v",
         action="store_true",
-        help="Enable debug logging to compare with EXL3",
+        help="Enable verbose (DEBUG) logging",
     )
 
     args = parser.parse_args()
+
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG)
 
     print(f"Loading dataset: {args.dataset}")
     texts = load_dataset_texts(args.dataset, args.dataset_config)
     print(f"Loaded {len(texts)} text samples")
 
-    # Initialize LLM with score mode optimizations
     llm_kwargs: dict[str, Any] = {
         "tensor_parallel_size": args.tensor_parallel_size,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "trust_remote_code": args.trust_remote_code,
-        "enable_prefix_caching": False,  # Disable prefix caching for accurate perplexity
-        "max_model_len": args.context_length * 2,  # Set reasonable max_model_len
+        "enable_prefix_caching": False,
+        "max_model_len": args.context_length * 2,
     }
 
     if args.quantization:
@@ -474,7 +336,6 @@ def main():
         args.context_length,
         args.stride,
         args.num_samples,
-        debug=args.debug,
     )
     elapsed_time = time.time() - start_time
 

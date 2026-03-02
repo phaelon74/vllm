@@ -18,7 +18,6 @@ import torch
 import torch.distributed
 import torch.nn as nn
 import torch.nn.functional as F
-from safetensors.torch import safe_open
 from tqdm import tqdm
 
 import vllm.envs as envs
@@ -922,12 +921,8 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
-                reference_logits_path=getattr(
-                    new_req_data, "reference_logits_path", None
-                ),
-                reference_logits_key=getattr(
-                    new_req_data, "reference_logits_key", None
-                ),
+                reference_logits_path=new_req_data.reference_logits_path,
+                reference_logits_key=new_req_data.reference_logits_key,
             )
             self.requests[req_id] = req_state
 
@@ -4117,8 +4112,9 @@ class GPUModelRunner(
             prompt_hidden_states = hidden_states[offset : offset + num_logits]
             logits = self.model.compute_logits(prompt_hidden_states)
 
-            # KLD mode: compute KL divergence on GPU, no logits transfer
             if is_kld_mode:
+                from safetensors.torch import safe_open
+
                 with safe_open(
                     request.reference_logits_path,
                     framework="pt",

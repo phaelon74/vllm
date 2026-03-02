@@ -67,12 +67,8 @@ class NewRequestData:
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prefill_token_ids=prefill_token_ids,
-            reference_logits_path=getattr(
-                request, "reference_logits_path", None
-            ),
-            reference_logits_key=getattr(
-                request, "reference_logits_key", None
-            ),
+            reference_logits_path=request.reference_logits_path,
+            reference_logits_key=request.reference_logits_key,
         )
 
     def __repr__(self) -> str:
