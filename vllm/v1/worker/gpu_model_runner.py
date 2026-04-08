@@ -212,7 +212,7 @@ from .utils import (
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.spec_decode.ngram_proposer import NgramProposer
-    from vllm.v1.worker.gpu.mm.encoder_cudagraph import EncoderCudaGraphManager
+    from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
 
@@ -4212,6 +4212,7 @@ class GPUModelRunner(
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
         if spec_config is not None:
+            # Decide whether to run the drafter or zero out draft tokens.
             input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
                 spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
                 <= self.effective_drafter_max_model_len
@@ -4247,10 +4248,6 @@ class GPUModelRunner(
                     self._copy_valid_sampled_token_count(
                         next_token_ids, valid_sampled_tokens_count
                     )
-                    self._draft_token_ids = torch.zeros(
-                        1, device=self.device, dtype=torch.int32
-                    ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
-                    self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
             elif (
                 spec_config.use_ngram_gpu()
                 and not spec_config.disable_padded_drafter_batch
@@ -4273,14 +4270,19 @@ class GPUModelRunner(
                     self._copy_valid_sampled_token_count(
                         next_token_ids, valid_sampled_tokens_count
                     )
-                    # Since we couldn't run the drafter,
-                    # just use zeros for the draft tokens.
-                    self._draft_token_ids = torch.zeros(
-                        1, device=self.device, dtype=torch.int32
-                    ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
-                    self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
             else:
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
+
+            if not input_fits_in_drafter:
+                # Zero out draft tokens so the scheduler doesn't schedule
+                # stale drafts from the previous step.
+                # For Nemotron-H: it is necessary to zero out the draft tokens,
+                # otherwise the stale tokens will corrupt Mamba recurrent
+                # state and logprobs for sequences near max_model_len.
+                self._draft_token_ids = torch.zeros(
+                    1, device=self.device, dtype=torch.int32
+                ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
+                self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
@@ -5940,6 +5942,13 @@ class GPUModelRunner(
                 layer.kv_cache = (
                     torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
                 )
+            # Clean up quantized KV cache scale views
+            # (int8_per_token_head, fp8_per_token_head)
+            if hasattr(layer, "impl"):
+                if hasattr(layer.impl, "_k_scale_cache"):
+                    layer.impl._k_scale_cache = None
+                if hasattr(layer.impl, "_v_scale_cache"):
+                    layer.impl._v_scale_cache = None
 
         gc.collect()
         torch.accelerator.empty_cache()
@@ -6069,7 +6078,7 @@ class GPUModelRunner(
                 SupportsEncoderCudaGraph,
                 supports_encoder_cudagraph,
             )
-            from vllm.v1.worker.gpu.mm.encoder_cudagraph import (
+            from vllm.v1.worker.encoder_cudagraph import (
                 EncoderCudaGraphManager,
             )
 
@@ -6927,7 +6936,7 @@ class GPUModelRunner(
             # group
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
 
-        if has_kv_transfer_group():
+        if has_kv_transfer_group() and not is_profiling:
             kv_transfer_group = get_kv_transfer_group()
             if self.cross_layers_kv_cache is not None:
                 assert self.cross_layers_attn_backend is not None
