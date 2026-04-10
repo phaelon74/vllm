@@ -2344,13 +2344,8 @@ class GPUModelRunner(
                 req_idx = self.input_batch.req_id_to_index[req_id]
                 req_doc_ranges[req_idx] = image_doc_ranges
 
-            if isinstance(attn_metadata, list):
-                for ub_metadata in attn_metadata:
-                    for _metadata in ub_metadata.values():
-                        _metadata.mm_prefix_range = req_doc_ranges  # type: ignore[attr-defined]
-            else:
-                for _metadata in attn_metadata.values():
-                    _metadata.mm_prefix_range = req_doc_ranges  # type: ignore[attr-defined]
+            # Set mm_prefix_range for all attention metadata
+            self._set_mm_prefix_range_for_metadata(attn_metadata, req_doc_ranges)
 
         if spec_decode_common_attn_metadata is not None and (
             num_reqs != num_reqs_padded or num_tokens != num_tokens_padded
@@ -2800,7 +2795,20 @@ class GPUModelRunner(
             )
             self.lora_manager.set_active_adapters(lora_requests, tower_mapping)
 
-            if hasattr(self.model, "get_num_mm_connector_tokens"):
+            # Only set connector mapping if the model actually has a connector.
+            # Some multimodal models inherit a stub `get_num_mm_connector_tokens`
+            # from `SupportsMultiModal`, which returns None and should not be
+            # treated as a signal that connector LoRA is supported.
+            mm_mapping = (
+                self.model.get_mm_mapping()  # type: ignore[attr-defined]
+                if hasattr(self.model, "get_mm_mapping")
+                else None
+            )
+            if (
+                mm_mapping is not None
+                and mm_mapping.connector
+                and hasattr(self.model, "get_num_mm_connector_tokens")
+            ):
                 post_op_counts = [
                     self.model.get_num_mm_connector_tokens(num_tokens)  # type: ignore[attr-defined]
                     for num_tokens in encoder_token_counts
@@ -5444,11 +5452,17 @@ class GPUModelRunner(
         attn_metadata: PerLayerAttnMetadata | None = None
 
         slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
-            num_tokens_padded=num_tokens,
+            num_tokens_padded=num_tokens_padded,
             num_reqs_padded=num_reqs_padded,
             num_tokens_unpadded=num_tokens_unpadded,
             ubatch_slices=ubatch_slices_padded,
         )
+
+        # Dummy runs have no real slot assignments — fill with -1 so
+        # concat_and_cache kernels skip the KV write.
+        if slot_mappings_by_group is not None:
+            for sm in slot_mappings_by_group.values():
+                sm.fill_(-1)
 
         # _dummy_run shares pinned CPU buffers (seq_lens, query_start_loc,
         # etc.) with execute_model.  It must participate in the same event
@@ -6569,6 +6583,46 @@ class GPUModelRunner(
             self.reorder_batch_threshold = None
             return
         self.reorder_batch_threshold = reduce(min_none_high, reorder_batch_thresholds)  # type: ignore[assignment]
+
+    def _set_mm_prefix_range_for_metadata(
+        self,
+        attn_metadata: Any,
+        req_doc_ranges: dict[int, list[tuple[int, int]]],
+    ) -> None:
+        """Set mm_prefix_range for all attention metadata objects.
+
+        This method handles both list and non-list attention metadata,
+        computing mm_prefix_range_tensor once and sharing it across all
+        metadata objects to avoid redundant host-to-device transfers.
+        """
+        from vllm.v1.attention.backends.triton_attn import (
+            TritonAttentionMetadata,
+        )
+
+        # Get all metadata objects from either list or dict structure
+        metadata_list = []
+        if isinstance(attn_metadata, list):
+            for ub_metadata in attn_metadata:
+                metadata_list.extend(ub_metadata.values())
+        else:
+            metadata_list.extend(attn_metadata.values())
+
+        # Set mm_prefix_range for all metadata and compute tensor once
+        shared_tensor = None
+        for metadata in metadata_list:
+            metadata.mm_prefix_range = req_doc_ranges  # type: ignore[attr-defined]
+
+            # Only compute tensor for TritonAttentionMetadata
+            if isinstance(metadata, TritonAttentionMetadata):
+                if shared_tensor is None:
+                    shared_tensor = (
+                        TritonAttentionMetadata.compute_mm_prefix_range_tensor(
+                            req_doc_ranges,
+                            metadata.seq_lens.shape[0],  # type: ignore[attr-defined]
+                            metadata.seq_lens.device,  # type: ignore[attr-defined]
+                        )
+                    )
+                metadata.mm_prefix_range_tensor = shared_tensor
 
     def may_reinitialize_input_batch(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
