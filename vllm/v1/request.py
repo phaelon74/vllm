@@ -20,6 +20,7 @@ from vllm.v1.engine import (
     EngineCoreRequest,
     FinishReason,
 )
+from vllm.v1.metrics.stats import PrefillStats
 from vllm.v1.structured_output.request import StructuredOutputRequest
 from vllm.v1.utils import ConstantList
 
@@ -65,6 +66,7 @@ class Request:
         client_index: int = 0,
         arrival_time: float | None = None,
         prompt_embeds: torch.Tensor | None = None,
+        prompt_is_token_ids: list[bool] | None = None,
         mm_features: list[MultiModalFeatureSpec] | None = None,
         lora_request: "LoRARequest | None" = None,
         cache_salt: str | None = None,
@@ -76,6 +78,7 @@ class Request:
         target_token_ids: list[int] | None = None,
         reference_logits_path: str | None = None,
         reference_logits_key: str | None = None,
+        reasoning_parser_kwargs: dict[str, Any] | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -88,6 +91,9 @@ class Request:
         )
         if self.structured_output_request is not None:
             self.structured_output_request.reasoning_ended = reasoning_ended
+            self.structured_output_request.reasoning_parser_kwargs = (
+                reasoning_parser_kwargs
+            )
         self.arrival_time = arrival_time if arrival_time is not None else time.time()
 
         self.status = RequestStatus.WAITING
@@ -116,6 +122,10 @@ class Request:
 
         self.prompt_token_ids = prompt_token_ids
         self.prompt_embeds = prompt_embeds
+        # Per-position mask used in mixed-mode (chat completion with
+        # prompt_embeds). `None` except when both `prompt_token_ids` and
+        # `prompt_embeds` are set and their positions are interleaved.
+        self.prompt_is_token_ids = prompt_is_token_ids
         # Cache per-block prompt-embed hashes to avoid rehashing the same
         # tensor slices when generating extra keys.
         self._prompt_embeds_per_block_hashes: dict[tuple[int, int], bytes] = {}
@@ -151,9 +161,6 @@ class Request:
         self.all_token_ids = ConstantList(self._all_token_ids)
         # trace_headers
         self.trace_headers = trace_headers
-        # State
-        # The number of tokens with prefix cache hits.
-        self.num_cached_tokens = -1
 
         # True if this request is scheduled as a non-final prefill chunk.
         self.is_prefill_chunk = False
@@ -165,8 +172,7 @@ class Request:
         # The number of times this request has been preempted by the scheduler.
         self.num_preemptions = 0
 
-        # The number of tokens that have been computed remotely.
-        self.num_external_computed_tokens = 0
+        self.prefill_stats: PrefillStats | None = PrefillStats()
 
         self.block_hashes: list[BlockHash] = []
         # Store the block hasher without binding self to avoid creating a
@@ -193,6 +199,7 @@ class Request:
             client_index=request.client_index,
             prompt_token_ids=request.prompt_token_ids,
             prompt_embeds=request.prompt_embeds,
+            prompt_is_token_ids=request.prompt_is_token_ids,
             mm_features=request.mm_features,
             sampling_params=request.sampling_params,
             pooling_params=request.pooling_params,
@@ -207,6 +214,7 @@ class Request:
             target_token_ids=request.target_token_ids,
             reference_logits_path=request.reference_logits_path,
             reference_logits_key=request.reference_logits_key,
+            reasoning_parser_kwargs=request.reasoning_parser_kwargs,
         )
 
     def append_output_token_ids(
@@ -286,6 +294,13 @@ class Request:
             return None
         events, self.events = self.events, []
         return events
+
+    def take_prefill_stats(self) -> PrefillStats | None:
+        if self.prefill_stats is None:
+            return None
+        prefill_stats = self.prefill_stats
+        self.prefill_stats = None
+        return prefill_stats
 
     def __lt__(self, other: "Request") -> bool:
         """
