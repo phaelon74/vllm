@@ -1,0 +1,369 @@
+{
+  "recipe_id": "lil-fidelity-1024x2048-v1",
+  "format_version": 1,
+  "contexts": 1024,
+  "context_length": 2048,
+  "partitions": {
+    "analysis": 768,
+    "qualification": 256
+  },
+  "sentinel_candidates": 64,
+  "dedup": {
+    "minhash_permutations": 128,
+    "shingle_tokens": 5,
+    "jaccard_threshold": 0.8
+  },
+  "upstream": {
+    "note": "Source selection, revisions, stratum labels, and allocation counts replicate the Kimi K3 distribution-fidelity reference so methodology is comparable. Token IDs are not portable across tokenizers, so the suite itself must be minted per tokenizer family.",
+    "artifact": "festr2/kimi-k3-distribution-fidelity-1024x2048-v1",
+    "reference": "https://github.com/local-inference-lab/rtx6kpro/blob/master/models/kimi-k3/distribution-fidelity-1024x2048.md"
+  },
+  "sources": [
+    {
+      "key": "wikipedia_en",
+      "dataset": "wikimedia/wikipedia",
+      "config": "20231101.en",
+      "revision": "b04c8d1ceb2f5cd4588862100d08de323dccfbaa",
+      "split": "train",
+      "scan_limit": 20000,
+      "license": "CC-BY-SA-3.0 and GFDL",
+      "extractor": "plain",
+      "text_field": "text",
+      "cluster_field": "id",
+      "title_field": "title",
+      "upstream_dataset_fingerprint": "d5e1ab9e497afff881de4878056d9c0d944d818d8134c5b7ac9f81180fd9bef7"
+    },
+    {
+      "key": "scientific_papers",
+      "dataset": "common-pile/peS2o_filtered",
+      "config": null,
+      "revision": "297747513bfb0ff1fbf61ddad3b03319d0f04597",
+      "split": "train",
+      "scan_limit": 20000,
+      "license": "per-record metadata",
+      "extractor": "plain",
+      "text_field": "text",
+      "cluster_field": "id",
+      "upstream_dataset_fingerprint": "94bedbd252e7223e06bd2229c5a99039392a35a113774af536589e1745fb96d9"
+    },
+    {
+      "key": "open_news",
+      "dataset": "common-pile/news_filtered",
+      "config": null,
+      "revision": "59aaa8f104e189e6fb8033f0ed319c5c343a03b1",
+      "split": "train",
+      "scan_limit": 20000,
+      "license": "per-record metadata",
+      "extractor": "plain",
+      "text_field": "text",
+      "cluster_field": "id",
+      "upstream_dataset_fingerprint": "1190fe718b6fb27be43d62f85736a957de3baa92cdf750e9bdcd67d4c0037fbe"
+    },
+    {
+      "key": "public_domain_review",
+      "dataset": "common-pile/public_domain_review_filtered",
+      "config": null,
+      "revision": "efc7f21259d069a27d6ca3655f74fda969f82b01",
+      "split": "train",
+      "scan_limit": 20000,
+      "license": "per-record metadata",
+      "extractor": "plain",
+      "text_field": "text",
+      "cluster_field": "id",
+      "upstream_dataset_fingerprint": "8dae3a247f0d2f134e8f69017edc3b9ade6179cc948db0fde1780e25d2aed628"
+    },
+    {
+      "key": "regulations",
+      "dataset": "common-pile/regulations_filtered",
+      "config": null,
+      "revision": "3327364490dfc7929009226ad667eceb2441d93a",
+      "split": "train",
+      "scan_limit": 20000,
+      "license": "per-record metadata",
+      "extractor": "plain",
+      "text_field": "text",
+      "cluster_field": "id",
+      "upstream_dataset_fingerprint": "ed123fe2a5d5276aea10c0ec51751a528a946693a39561a83eaa65b11c920daf"
+    },
+    {
+      "key": "public_domain_books",
+      "dataset": "common-pile/pre_1929_books_filtered",
+      "config": null,
+      "revision": "23f9d96dbb1db3324bbc9fbfe1f8299cc799c4d1",
+      "split": "train",
+      "scan_limit": 10000,
+      "license": "per-record metadata",
+      "extractor": "plain",
+      "text_field": "text",
+      "cluster_field": "id",
+      "upstream_dataset_fingerprint": "810083e0226369f14746934600aaa0fe1c583d59fd2337d5e3101f18805f87f0"
+    },
+    {
+      "key": "wildchat",
+      "dataset": "allenai/WildChat-1M",
+      "config": null,
+      "revision": "7d6490e462285cf85d91eabea0f9a954fbddcd1f",
+      "split": "train",
+      "scan_limit": 100000,
+      "license": "ODC-BY-1.0",
+      "extractor": "conversation",
+      "text_field": "conversation",
+      "cluster_field": "conversation_hash",
+      "upstream_dataset_fingerprint": "2da97cc7b81dd8c7b2d8074dc62d60848eb6554a40bc2c559da1bcccc504243f"
+    },
+    {
+      "key": "stackv2",
+      "dataset": "common-pile/stackv2_edu_filtered",
+      "config": null,
+      "revision": "c354dbe88469a1153e97c6a63ac50591849654de",
+      "split": "train",
+      "scan_limit": 250000,
+      "license": "per-record metadata",
+      "extractor": "plain",
+      "text_field": "text",
+      "cluster_field": "id",
+      "upstream_dataset_fingerprint": "17d0fa5bf48c67d6df705f1303ca740c14688e24f916708fe4227091e70acb64"
+    },
+    {
+      "key": "github_code",
+      "dataset": "codeparrot/github-code",
+      "config": null,
+      "revision": "b5661e6b17396364b2bcf8e68977b0d28e1ebd19",
+      "split": "train",
+      "scan_limit": 200000,
+      "license": "per-record open-source license",
+      "extractor": "plain",
+      "text_field": "code",
+      "cluster_field": "repo_name",
+      "path_field": "path",
+      "upstream_dataset_fingerprint": "4606a8b294eec8476bbeee4833a6bfa70e396d588fdb039bcc11852f03f3f6de"
+    },
+    {
+      "key": "libretexts",
+      "dataset": "common-pile/libretexts_filtered",
+      "config": null,
+      "revision": "70388bca52b4a93515e14b1d56618fd7944988fd",
+      "split": "train",
+      "scan_limit": 50000,
+      "license": "per-record metadata",
+      "extractor": "plain",
+      "text_field": "text",
+      "cluster_field": "id",
+      "upstream_dataset_fingerprint": "d511f4f5263025e8ba40330646e8f81f4e8a6fdf01ce6d48242dcf56fc73266d"
+    },
+    {
+      "key": "wikipedia_zh",
+      "dataset": "wikimedia/wikipedia",
+      "config": "20231101.zh",
+      "revision": "b04c8d1ceb2f5cd4588862100d08de323dccfbaa",
+      "split": "train",
+      "scan_limit": 20000,
+      "license": "CC-BY-SA-3.0 and GFDL",
+      "extractor": "plain",
+      "text_field": "text",
+      "cluster_field": "id",
+      "title_field": "title",
+      "min_chars": 2500,
+      "upstream_dataset_fingerprint": "3fad26fbb7bb76bc20355d56653a5303b5c82454fb5fbc8a436ca5fa29c4f192"
+    },
+    {
+      "key": "wikisource_zh",
+      "dataset": "erhwenkuo/zhwikisource-zhtw",
+      "config": null,
+      "revision": "1fdebaa66ef58a9517c87e73f813f5923490b5c2",
+      "split": "train",
+      "scan_limit": 20000,
+      "license": "CC-BY-SA-3.0",
+      "extractor": "plain",
+      "text_field": "text",
+      "cluster_field": "id",
+      "min_chars": 2500,
+      "upstream_dataset_fingerprint": "818883853e0af31636e29aaf451ea8903c0debbc6c08a0d31cce0f7dcd8e937c"
+    },
+    {
+      "key": "wikipedia_cs",
+      "dataset": "wikimedia/wikipedia",
+      "config": "20231101.cs",
+      "revision": "b04c8d1ceb2f5cd4588862100d08de323dccfbaa",
+      "split": "train",
+      "scan_limit": 20000,
+      "license": "CC-BY-SA-3.0 and GFDL",
+      "extractor": "plain",
+      "text_field": "text",
+      "cluster_field": "id",
+      "title_field": "title",
+      "upstream_dataset_fingerprint": "209f39f9734a8a08598d25777af1d8ca0c9e6a0d6a8c2e3fcf0bfecfccbacba1"
+    },
+    {
+      "key": "wikipedia_de",
+      "dataset": "wikimedia/wikipedia",
+      "config": "20231101.de",
+      "revision": "b04c8d1ceb2f5cd4588862100d08de323dccfbaa",
+      "split": "train",
+      "scan_limit": 20000,
+      "license": "CC-BY-SA-3.0 and GFDL",
+      "extractor": "plain",
+      "text_field": "text",
+      "cluster_field": "id",
+      "title_field": "title",
+      "upstream_dataset_fingerprint": "13b0767a367e25e1ce2baf2445ed888980c5f126173ffb56b190b02aaf36c114"
+    },
+    {
+      "key": "wikipedia_es",
+      "dataset": "wikimedia/wikipedia",
+      "config": "20231101.es",
+      "revision": "b04c8d1ceb2f5cd4588862100d08de323dccfbaa",
+      "split": "train",
+      "scan_limit": 20000,
+      "license": "CC-BY-SA-3.0 and GFDL",
+      "extractor": "plain",
+      "text_field": "text",
+      "cluster_field": "id",
+      "title_field": "title",
+      "upstream_dataset_fingerprint": "8625b3ae81064d9238614766f1ac29064a0ca0303bf70c70d7db0baf299ad85a"
+    },
+    {
+      "key": "wikipedia_fr",
+      "dataset": "wikimedia/wikipedia",
+      "config": "20231101.fr",
+      "revision": "b04c8d1ceb2f5cd4588862100d08de323dccfbaa",
+      "split": "train",
+      "scan_limit": 20000,
+      "license": "CC-BY-SA-3.0 and GFDL",
+      "extractor": "plain",
+      "text_field": "text",
+      "cluster_field": "id",
+      "title_field": "title",
+      "upstream_dataset_fingerprint": "98adcc90774f2861bec8875605e1aa271a071b388b4e193f56168ac472695776"
+    },
+    {
+      "key": "wikipedia_ja",
+      "dataset": "wikimedia/wikipedia",
+      "config": "20231101.ja",
+      "revision": "b04c8d1ceb2f5cd4588862100d08de323dccfbaa",
+      "split": "train",
+      "scan_limit": 20000,
+      "license": "CC-BY-SA-3.0 and GFDL",
+      "extractor": "plain",
+      "text_field": "text",
+      "cluster_field": "id",
+      "title_field": "title",
+      "min_chars": 2500,
+      "upstream_dataset_fingerprint": "9ac02400e24256e040a8f7770b581a5d74c8e36042740d199eb0464adc2f70b5"
+    },
+    {
+      "key": "wikipedia_ru",
+      "dataset": "wikimedia/wikipedia",
+      "config": "20231101.ru",
+      "revision": "b04c8d1ceb2f5cd4588862100d08de323dccfbaa",
+      "split": "train",
+      "scan_limit": 20000,
+      "license": "CC-BY-SA-3.0 and GFDL",
+      "extractor": "plain",
+      "text_field": "text",
+      "cluster_field": "id",
+      "title_field": "title",
+      "upstream_dataset_fingerprint": "0687d8bc92d5a4b13e5485189f2ff68f3b5015889520caa952366f8225b28846"
+    }
+  ],
+  "strata": [
+    {
+      "key": "encyclopedic_reference",
+      "label": "Encyclopedic and factual reference",
+      "contexts": 128,
+      "sources": ["wikipedia_en"]
+    },
+    {
+      "key": "scientific_technical",
+      "label": "Scientific and technical exposition",
+      "contexts": 128,
+      "sources": ["scientific_papers"]
+    },
+    {
+      "key": "news_history_legal_essays",
+      "label": "News, history, economics, legal analysis, and essays",
+      "contexts": 96,
+      "sources": ["open_news", "regulations", "public_domain_review"]
+    },
+    {
+      "key": "literary_narrative",
+      "label": "Literary, narrative, and creative writing",
+      "contexts": 96,
+      "sources": ["public_domain_books"]
+    },
+    {
+      "key": "dialogue_instruction",
+      "label": "Natural dialogue, instruction following, and assistance",
+      "contexts": 128,
+      "sources": ["wildchat"]
+    },
+    {
+      "key": "code_docs_issues",
+      "label": "Source code, tests, technical documentation, and issue discussions",
+      "contexts": 128,
+      "sources": ["stackv2", "github_code"]
+    },
+    {
+      "key": "worked_math_reasoning",
+      "label": "Worked mathematics, science, and formal reasoning",
+      "contexts": 128,
+      "sources": ["libretexts"],
+      "require_any": ["\\frac", "\\begin{equation}", "\\sum", "\\int", "$$", "\\("]
+    },
+    {
+      "key": "chinese",
+      "label": "Chinese across several content types",
+      "contexts": 96,
+      "sources": ["wikipedia_zh", "wikisource_zh"]
+    },
+    {
+      "key": "other_multilingual",
+      "label": "Other multilingual content",
+      "contexts": 48,
+      "sources": [
+        "wikipedia_cs",
+        "wikipedia_de",
+        "wikipedia_es",
+        "wikipedia_fr",
+        "wikipedia_ja",
+        "wikipedia_ru"
+      ]
+    },
+    {
+      "key": "structured_data_tools",
+      "label": "Structured data, tool calls, APIs, JSON, and tables",
+      "contexts": 48,
+      "sources": ["github_code"],
+      "path_suffix_any": [".json", ".yaml", ".yml", ".toml", ".csv", ".xml"]
+    }
+  ],
+  "benchmarks": [
+    {
+      "name": "humaneval",
+      "dataset": "openai/openai_humaneval",
+      "config": null,
+      "revision": "7dce6050a7d6d172f3cc5c32aa97f52fa1a2e544",
+      "split": "test",
+      "match": "any",
+      "fields": ["prompt"]
+    },
+    {
+      "name": "mmlu-test",
+      "dataset": "cais/mmlu",
+      "config": "all",
+      "revision": "c30699e8356da336a370243923dbaf21066bb9fe",
+      "split": "test",
+      "match": "all",
+      "fields": ["question", "choices"]
+    },
+    {
+      "name": "gpqa-diamond",
+      "dataset": "Idavidrein/gpqa",
+      "config": "gpqa_diamond",
+      "revision": "acc659161e28d4416c0ed44e3fc85c9383add471",
+      "split": "train",
+      "match": "any",
+      "fields": ["Question"]
+    }
+  ]
+}

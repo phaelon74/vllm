@@ -256,6 +256,123 @@ def _phase(timings: dict[str, float], name: str):
         timings[name] = timings.get(name, 0.0) + time.perf_counter() - start
 
 
+def load_token_suite(
+    suite_dir: str, partition: str, tokenizer: Any, limit: int | None = None
+) -> tuple[list[list[int]], dict[str, Any]]:
+    """Load a frozen token suite as evaluation rows.
+
+    The stored IDs are the evaluation input (Law 3); nothing is retokenized here.
+    Every context's recorded hash is re-derived from the file it was read from, so
+    a corrupted or edited suite fails before a model loads.
+
+    Raises:
+        ValueError: if the suite is inconsistent, or was minted for a tokenizer
+            whose vocabulary differs from this model's.
+    """
+    from vllm.v1.sample.kld import sha256_tokens
+
+    manifest_path = os.path.join(suite_dir, "suite-manifest.json")
+    if not os.path.isfile(manifest_path):
+        raise ValueError(f"no suite-manifest.json in {suite_dir}")
+    with open(manifest_path, encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    suite_vocab = (manifest.get("tokenizer") or {}).get("unpadded_vocab_size")
+    live_vocab = tokenizer_vocab_size(tokenizer)
+    if suite_vocab and int(suite_vocab) != int(live_vocab):
+        raise ValueError(
+            f"suite {manifest.get('suite_id')} was minted for a tokenizer with "
+            f"{suite_vocab} tokens but this model's tokenizer has {live_vocab}. "
+            f"Token IDs are not portable across tokenizers; mint a suite for "
+            f"this tokenizer family."
+        )
+
+    selected = [entry["context_id"] for entry in manifest["contexts"]]
+    if partition != "all":
+        partitions_path = os.path.join(suite_dir, "partitions.json")
+        if not os.path.isfile(partitions_path):
+            raise ValueError(f"no partitions.json in {suite_dir}")
+        with open(partitions_path, encoding="utf-8") as f:
+            partitions = json.load(f)
+        if partition not in partitions:
+            raise ValueError(
+                f"partition {partition!r} is not in {partitions_path}"
+            )
+        selected = sorted(partitions[partition])
+
+    # A bounded prefix is for the zero baseline, where the only acceptable answer
+    # is exact zero and one context proves it. A limited run cannot match the
+    # suite's published partition hash, so Law 3 will reject it as a candidate
+    # measurement; that is intended.
+    if limit is not None and limit > 0:
+        selected = selected[:limit]
+
+    by_id = {entry["context_id"]: entry for entry in manifest["contexts"]}
+    windows: list[list[int]] = []
+    for context_id in selected:
+        entry = by_id.get(context_id)
+        if entry is None:
+            raise ValueError(f"context {context_id} is not in the suite manifest")
+        path = os.path.join(suite_dir, entry["file"].replace("/", os.sep))
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+        tokens = [int(t) for t in payload["tokens"]]
+        if sha256_tokens(tokens) != entry["token_sha256"]:
+            raise ValueError(f"{entry['file']}: token hash does not match the suite")
+        windows.append(tokens)
+
+    lengths = {len(w) for w in windows}
+    if len(lengths) != 1:
+        raise ValueError(f"suite rows have differing lengths: {sorted(lengths)}")
+    expected = manifest.get("partition_token_sha256", {}).get(partition)
+    actual = sha256_tokens([t for w in windows for t in w])
+    if limit:
+        expected = None
+    if expected and expected != actual:
+        raise ValueError(
+            f"{partition} partition hashes to {actual} but the suite records "
+            f"{expected}"
+        )
+
+    identity = {
+        "suite_id": manifest.get("suite_id"),
+        "recipe_id": manifest.get("recipe_id"),
+        "partition": partition,
+        "limit": limit or None,
+        "context_length": lengths.pop(),
+        "contexts": len(windows),
+        "suite_token_sha256": manifest.get("token_sha256"),
+        "partition_token_sha256": actual,
+        "tokenizer": manifest.get("tokenizer"),
+    }
+    print(
+        f"Token suite {identity['suite_id']} [{partition}]: "
+        f"{identity['contexts']} contexts x {identity['context_length']} tokens"
+    )
+    return windows, identity
+
+
+def _declared_vocab_size(model_path: str) -> int | None:
+    """Read the checkpoint's declared output width, padding included.
+
+    Recorded so an artifact can show how many alignment-padding rows were
+    excluded from scoring rather than asserting it.
+    """
+    config_path = os.path.join(model_path, "config.json")
+    if not os.path.isfile(config_path):
+        return None
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            config = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    for section in (config, config.get("text_config") or {}):
+        size = section.get("vocab_size")
+        if isinstance(size, int):
+            return size
+    return None
+
+
 def _prune_fallback_logits(ref_dir: str, num_windows: int) -> None:
     """Drop per-row teacher logits that `--storage auto` kept as a fallback.
 
@@ -307,6 +424,9 @@ def calculate_kld(
     probe_replay: bool = False,
     run_gate: bool = True,
     decompose_head: bool = False,
+    token_suite: str | None = None,
+    suite_partition: str = "all",
+    suite_limit: int | None = None,
 ) -> dict[str, Any]:
     """Two-phase KLD: capture teacher references, then score the student."""
     from vllm.v1.sample.kld import (
@@ -332,18 +452,26 @@ def calculate_kld(
             f"{context_length}-token row, got {score_from}"
         )
 
-    samples_to_process = texts[:num_samples] if num_samples else texts
-    concatenated_text = "\n\n".join(samples_to_process)
-
     tokenizer_path = reference_model_path if reference_model_path else model_path
     tokenizer = AutoTokenizer.from_pretrained(
         tokenizer_path, trust_remote_code=trust_remote_code
     )
-    encoded = tokenizer(concatenated_text, add_special_tokens=False)
-    tokens = encoded["input_ids"]
-    if tokens and isinstance(tokens[0], list):
-        tokens = tokens[0]
-    windows = iter_eval_rows(tokens, context_length, stride, rows)
+    suite_identity: dict[str, Any] | None = None
+    if token_suite:
+        windows, suite_identity = load_token_suite(
+            token_suite, suite_partition, tokenizer, suite_limit
+        )
+        context_length = suite_identity["context_length"]
+        stride = context_length
+        rows = len(windows)
+    else:
+        samples_to_process = texts[:num_samples] if num_samples else texts
+        concatenated_text = "\n\n".join(samples_to_process)
+        encoded = tokenizer(concatenated_text, add_special_tokens=False)
+        tokens = encoded["input_ids"]
+        if tokens and isinstance(tokens[0], list):
+            tokens = tokens[0]
+        windows = iter_eval_rows(tokens, context_length, stride, rows)
     if not windows:
         raise ValueError("Not enough tokens for any evaluation row")
     if any(len(window) - 1 <= score_from for window in windows):
@@ -508,6 +636,12 @@ def calculate_kld(
                     "tensor_parallel_size", 1
                 ),
                 "enforce_eager": bool((llm_kwargs or {}).get("enforce_eager")),
+                "enable_prefix_caching": bool(
+                    (llm_kwargs or {}).get("enable_prefix_caching")
+                ),
+                "max_num_seqs": (llm_kwargs or {}).get("max_num_seqs"),
+                "declared_vocab_size": _declared_vocab_size(reference_model_path),
+                "token_suite": suite_identity,
                 "reference_model": os.path.abspath(reference_model_path),
                 "reference_config_sha256": (
                     sha256_file(reference_config)
@@ -1086,8 +1220,32 @@ def main():
     parser.add_argument(
         "--dataset",
         type=str,
-        required=True,
-        help="Hub dataset id or a local dataset directory",
+        default=None,
+        help="Hub dataset id or a local dataset directory. Ignored, and not "
+        "required, when --token-suite is given",
+    )
+    parser.add_argument(
+        "--token-suite",
+        type=str,
+        default=None,
+        help="Directory of a frozen token suite built by fidelity/suite.py. "
+        "Its stored token IDs become the evaluation input, and --rows, "
+        "--context-length, and --stride are taken from the suite",
+    )
+    parser.add_argument(
+        "--suite-partition",
+        type=str,
+        default="all",
+        choices=("all", "analysis", "qualification"),
+        help="Which suite partition to score. Freeze parameters on 'analysis' "
+        "before reading 'qualification'",
+    )
+    parser.add_argument(
+        "--suite-limit",
+        type=int,
+        default=None,
+        help="Score only the first N contexts of the partition. For the zero "
+        "baseline only; a limited run cannot match the suite's partition hash",
     )
     parser.add_argument(
         "--dataset-config",
@@ -1242,11 +1400,26 @@ def main():
             "use --storage logits with --compiled"
         )
 
+    if not args.token_suite and not args.dataset:
+        parser.error("one of --token-suite or --dataset is required")
+
     allow_apply_model_rpc()
 
-    print(f"Loading dataset: {args.dataset}")
-    texts = load_dataset_texts(args.dataset, args.dataset_config)
-    print(f"Loaded {len(texts)} text samples")
+    texts: list[str] = []
+    if args.token_suite:
+        print(f"Token suite: {args.token_suite} [{args.suite_partition}]")
+        # The suite's geometry, not the flag default, has to reach the engine:
+        # max_model_len is sized from context length before scoring begins.
+        suite_manifest = os.path.join(args.token_suite, "suite-manifest.json")
+        if not os.path.isfile(suite_manifest):
+            parser.error(f"no suite-manifest.json in {args.token_suite}")
+        with open(suite_manifest, encoding="utf-8") as f:
+            args.context_length = int(json.load(f)["context_length"])
+        print(f"Suite context length: {args.context_length}")
+    else:
+        print(f"Loading dataset: {args.dataset}")
+        texts = load_dataset_texts(args.dataset, args.dataset_config)
+        print(f"Loaded {len(texts)} text samples")
 
     llm_kwargs: dict[str, Any] = {
         "tensor_parallel_size": args.tensor_parallel_size,
@@ -1290,12 +1463,15 @@ def main():
             "Omit it for non-overlapping rows (EXL3/Turbo)."
         )
     print("\nCalculating KLD...")
-    print(f"  Context length: {args.context_length}")
-    print(f"  Stride: {stride}")
-    print(f"  Rows: {args.rows}")
+    if args.token_suite:
+        print(f"  Rows, context length, and stride: from {args.suite_partition}")
+    else:
+        print(f"  Context length: {args.context_length}")
+        print(f"  Stride: {stride}")
+        print(f"  Rows: {args.rows}")
+        print(f"  Samples: {args.num_samples or len(texts)}")
     print(f"  Score-from: {args.score_from}")
     print(f"  Storage: {args.storage}")
-    print(f"  Samples: {args.num_samples or len(texts)}")
 
     start_time = time.time()
     report = calculate_kld(
@@ -1315,6 +1491,9 @@ def main():
         probe_replay=args.probe_replay,
         run_gate=True,
         decompose_head=args.decompose_head,
+        token_suite=args.token_suite,
+        suite_partition=args.suite_partition,
+        suite_limit=args.suite_limit,
     )
     elapsed_time = time.time() - start_time
 

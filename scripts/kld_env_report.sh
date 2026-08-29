@@ -84,6 +84,12 @@ log_cmd repo-git-describe git -C "$REPO_ROOT" describe --always --dirty --tags
 log_cmd pip-freeze "$PY" -m pip freeze
 
 # Torch / vLLM runtime, including the exact fields the capture manifest binds.
+# The commit goes in as an environment variable so it lands in runtime.json in
+# machine-readable form; a number cannot be reproduced from prose alone.
+KLD_REPO_COMMIT=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null)
+KLD_REPO_DIRTY=0
+[[ -n $(git -C "$REPO_ROOT" status --porcelain 2>/dev/null) ]] && KLD_REPO_DIRTY=1
+export KLD_REPO_COMMIT KLD_REPO_DIRTY
 "$PY" - >"$OUT_DIR/runtime.json" 2>"$OUT_DIR/runtime.err" <<'PYEOF'
 import json
 import os
@@ -100,6 +106,8 @@ info = {
     "executable": sys.executable,
     "platform": platform.platform(),
     "hostname": platform.node(),
+    "vllm_commit": os.environ.get("KLD_REPO_COMMIT") or None,
+    "vllm_tree_dirty": os.environ.get("KLD_REPO_DIRTY") == "1",
     "env": {k: v for k, v in sorted(os.environ.items()) if k.startswith(PREFIXES)},
 }
 

@@ -21,6 +21,13 @@ The `Phase A`..`Phase 9` sections are the per-behavior regression checklist; a
 non-zero self-KLD in Step 1 invalidates every number they produce, so do not
 start them until Step 1 is clean.
 
+This runbook verifies the measurement. Turning a verified measurement into a
+publishable artifact is a separate program with its own enforced rules; see
+[`fidelity/README.md`](../../fidelity/README.md) and
+[`fidelity/LAWS.md`](../../fidelity/LAWS.md). Step 0 here is Law 6 there, and
+Step 1 is Law 1. Once this runbook is clean, `fidelity/campaign.py` automates
+the same sequence and refuses to publish a result that breaks a law.
+
 ## Step 0 — enshrine the environment
 
 A KLD value is only meaningful next to the stack that produced it. Capture the
