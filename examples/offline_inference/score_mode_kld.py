@@ -85,6 +85,28 @@ def apply_eager_llm_kwargs(llm_kwargs: dict[str, Any]) -> None:
     llm_kwargs["enforce_eager"] = True
 
 
+def allow_apply_model_rpc() -> None:
+    """Permit ``LLM.apply_model`` to reach an out-of-process engine core.
+
+    LM-head inspection, hidden-capture verification, and the replay probe send
+    local functions over the engine-core RPC, which msgspec cannot encode. Any
+    configuration that moves the engine core into its own process (tensor
+    parallelism, for one) therefore needs the pickle fallback. The pickled
+    payloads are this script's own functions.
+
+    Must run before the first ``LLM`` is constructed: the engine-core process
+    inherits the environment at spawn time, and vLLM caches env lookups once
+    initialization completes.
+    """
+    if os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1") != "1":
+        print(
+            "VLLM_ALLOW_INSECURE_SERIALIZATION is set to "
+            f"{os.environ['VLLM_ALLOW_INSECURE_SERIALIZATION']!r}; LM-head "
+            "inspection and the replay probe will fail unless the engine core "
+            "runs in this process."
+        )
+
+
 def _load_local_parquet_split(
     dataset_dir: str,
     dataset_config: str | None,
@@ -1149,6 +1171,8 @@ def main():
             "Hidden-state LM-head replay requires eager mode; "
             "use --storage logits with --compiled"
         )
+
+    allow_apply_model_rpc()
 
     print(f"Loading dataset: {args.dataset}")
     texts = load_dataset_texts(args.dataset, args.dataset_config)

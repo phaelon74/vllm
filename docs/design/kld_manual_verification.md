@@ -106,7 +106,16 @@ self_kld /media/fmodels/Qwen/Qwen3.6-35B-A3B  moe-35b-a3b 1
 
 The script pins `max_model_len` to twice `--context-length` (4096 here) and
 disables prefix caching, and eager execution is the default, so no extra flags
-are needed for determinism. `--max-num-seqs 1` keeps the hybrid state
+are needed for determinism.
+
+LM-head inspection, hidden-capture verification, and the replay probe all use
+`LLM.apply_model`, which sends a local function to the workers. Once tensor
+parallelism moves the engine core into its own process, msgspec cannot encode
+that function, so the script sets `VLLM_ALLOW_INSECURE_SERIALIZATION=1` before
+constructing any `LLM` — the pickled payloads are its own functions. Export
+`VLLM_ALLOW_INSECURE_SERIALIZATION=0` to opt out; head inspection then fails
+with `TypeError: Object of type <class 'function'> is not serializable` at
+`_runtime_lm_head_info`. `--max-num-seqs 1` keeps the hybrid state
 allocation small and removes batch composition as a variable.
 
 **Expected:** each run prints the requested runner, `Mean KLD (ref ||

@@ -155,9 +155,29 @@ run_kld () {
   local rc=${PIPESTATUS[0]}
   if [[ $rc -ne 0 ]]; then
     printf '%s\tEXIT_%d\t\t\t%s\n' "$tag" "$rc" "$log" >>"$RESULTS"
+    quarantine_capture "$capture"
     return 1
   fi
   read_report "$tag" "$report" "$require_zero"
+}
+
+# A capture directory without manifest.json is incomplete. Scoring against it
+# fails closed later, but with a misleading error, because Phase 1 skips any
+# directory that already holds window files. Move it aside so a rerun starts
+# clean while the partial output stays available for inspection.
+quarantine_capture () {
+  local capture=$1
+  [[ -d $capture ]] || return 0
+  if [[ -f "$capture/manifest.json" ]]; then
+    return 0
+  fi
+  if [[ -z $(ls -A "$capture" 2>/dev/null) ]]; then
+    rmdir "$capture" 2>/dev/null
+    return 0
+  fi
+  local aside="$capture.incomplete-$(date +%H%M%S)"
+  mv "$capture" "$aside" && echo "quarantined incomplete capture: $aside" >&2
+  return 0
 }
 
 guard () {
