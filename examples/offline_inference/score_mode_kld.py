@@ -29,6 +29,7 @@ Usage:
 
 import argparse
 import gc
+import glob
 import logging
 import os
 import time
@@ -98,36 +99,100 @@ def apply_eager_llm_kwargs(llm_kwargs: dict[str, Any]) -> None:
     llm_kwargs["enforce_eager"] = True
 
 
+def _load_local_parquet_split(
+    dataset_dir: str,
+    dataset_config: str | None,
+    split: str,
+):
+    """Load a split from parquet files under a local Hub snapshot."""
+    parquet_dir = (
+        os.path.join(dataset_dir, dataset_config) if dataset_config else dataset_dir
+    )
+    files = sorted(glob.glob(os.path.join(parquet_dir, f"{split}-*.parquet")))
+    if not files:
+        return None
+    return load_dataset("parquet", data_files={split: files}, split=split)
+
+
 def load_dataset_texts(
     dataset_name: str,
     dataset_config: str | None = None,
     split: str | None = None,
 ) -> list[str]:
-    """Load and extract text from a HuggingFace dataset."""
-    if split is None:
-        for candidate_split in ["test", "train", "validation"]:
-            try:
-                if dataset_config:
-                    dataset = load_dataset(
-                        dataset_name, dataset_config, split=candidate_split
-                    )
-                else:
-                    dataset = load_dataset(dataset_name, split=candidate_split)
-                split = candidate_split
-                break
-            except Exception:
-                continue
+    """Load and extract text from a HuggingFace dataset or local snapshot."""
+    if os.path.isdir(dataset_name):
+        dataset_name = os.path.abspath(dataset_name)
+        dataset_names = [dataset_name]
+    else:
+        # Hub moved script-based `wikitext` to `Salesforce/wikitext`.
+        dataset_names = [dataset_name]
+        if dataset_name == "wikitext":
+            dataset_names.append("Salesforce/wikitext")
 
-        if split is None:
+    load_kwargs: dict[str, Any] = {}
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if token:
+        load_kwargs["token"] = token
+
+    loaded = None
+    last_error: Exception | None = None
+    if split is None:
+        for name in dataset_names:
+            for candidate_split in ["test", "train", "validation"]:
+                try:
+                    if os.path.isdir(name):
+                        loaded = _load_local_parquet_split(
+                            name, dataset_config, candidate_split
+                        )
+                        if loaded is None:
+                            if dataset_config:
+                                loaded = load_dataset(
+                                    name,
+                                    dataset_config,
+                                    split=candidate_split,
+                                    **load_kwargs,
+                                )
+                            else:
+                                loaded = load_dataset(
+                                    name, split=candidate_split, **load_kwargs
+                                )
+                    elif dataset_config:
+                        loaded = load_dataset(
+                            name, dataset_config, split=candidate_split, **load_kwargs
+                        )
+                    else:
+                        loaded = load_dataset(
+                            name, split=candidate_split, **load_kwargs
+                        )
+                    dataset_name = name
+                    split = candidate_split
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    continue
+            if loaded is not None:
+                break
+
+        if loaded is None or split is None:
             raise ValueError(
                 f"Could not load dataset {dataset_name} with any split "
                 "(test/train/validation)"
+                + (f": {last_error}" if last_error is not None else "")
             )
-
-    if dataset_config:
-        dataset = load_dataset(dataset_name, dataset_config, split=split)
+        dataset = loaded
+    elif os.path.isdir(dataset_name):
+        dataset = _load_local_parquet_split(dataset_name, dataset_config, split)
+        if dataset is None:
+            if dataset_config:
+                dataset = load_dataset(
+                    dataset_name, dataset_config, split=split, **load_kwargs
+                )
+            else:
+                dataset = load_dataset(dataset_name, split=split, **load_kwargs)
+    elif dataset_config:
+        dataset = load_dataset(dataset_name, dataset_config, split=split, **load_kwargs)
     else:
-        dataset = load_dataset(dataset_name, split=split)
+        dataset = load_dataset(dataset_name, split=split, **load_kwargs)
 
     texts = []
     for example in dataset:
@@ -165,6 +230,7 @@ def calculate_kld(
     llm_kwargs: dict[str, Any] | None = None,
     num_samples: int | None = None,
     trust_remote_code: bool = False,
+    capture_only: bool = False,
 ) -> tuple[float, int]:
     """
     Calculate KLD using sliding window approach.
@@ -182,6 +248,7 @@ def calculate_kld(
         llm_kwargs: Kwargs for initializing LLM (reference and test)
         num_samples: Maximum number of samples to process (None = all)
         trust_remote_code: Trust remote code when loading tokenizer
+        capture_only: If True, stop after Phase 1 (no KLD, no second load)
 
     Returns:
         Tuple of (mean_kld, total_positions)
@@ -224,7 +291,10 @@ def calculate_kld(
             f"ref_logits_{model_name}_ctx{context_length}_s{stride}",
         )
         reference_logits_path = ref_logits_dir
-        if not os.path.exists(ref_logits_dir):
+        existing_windows = sorted(
+            glob.glob(os.path.join(ref_logits_dir, "logits_*.safetensors"))
+        )
+        if not existing_windows:
             os.makedirs(ref_logits_dir, exist_ok=True)
             print(f"Phase 1: Generating reference logits from {reference_model_path}")
             ref_llm = LLM(model=reference_model_path, **(llm_kwargs or {}))
@@ -258,6 +328,15 @@ def calculate_kld(
             gc.collect()
             torch.accelerator.empty_cache()
             print(f"Saved {window_idx} reference logits to {ref_logits_dir}/")
+        else:
+            print(
+                f"Phase 1 skipped: {len(existing_windows)} windows already in "
+                f"{ref_logits_dir}"
+            )
+
+    if capture_only:
+        print(f"Capture-only: skipping Phase 2. Logits at {reference_logits_path}")
+        return 0.0, 0
 
     if reference_logits_path is None:
         raise ValueError(
@@ -299,8 +378,11 @@ def calculate_kld(
             "reference_logits_key": ref_key,
         }
 
+        # target_token_ids selects the score-mode fast path, which accepts a
+        # single logprob column; prompt_logprobs=1 returns two and trips its
+        # assertion. KLD itself is computed on GPU from the full logits.
         sampling_params = SamplingParams(
-            prompt_logprobs=1,
+            prompt_logprobs=0,
             max_tokens=1,
             kld_mode=True,
         )
@@ -330,7 +412,6 @@ def calculate_kld(
             )
             prompt_fallback: TokensPrompt = {
                 "prompt_token_ids": window_tokens,
-                "target_token_ids": target_token_ids,
             }
             outputs = llm.generate(
                 [prompt_fallback], sampling_params=sampling_params_fallback
@@ -401,7 +482,7 @@ def main():
         "--dataset",
         type=str,
         required=True,
-        help="Dataset name (e.g., 'wikitext')",
+        help="Hub dataset id or a local dataset directory",
     )
     parser.add_argument(
         "--dataset-config",
@@ -461,6 +542,19 @@ def main():
         "to save GPU memory",
     )
     parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=None,
+        help="Cap the dummy profile / max batch tokens. On B200 the default "
+        "is 16384; for one-window KLD capture use 4096 (or context-length).",
+    )
+    parser.add_argument(
+        "--capture-only",
+        action="store_true",
+        help="Run Phase 1 only: write reference logits and exit. Does not "
+        "load --model for KLD. Requires --reference-model.",
+    )
+    parser.add_argument(
         "--compiled",
         action="store_true",
         help="Use torch.compile with best-effort determinism settings. "
@@ -481,6 +575,8 @@ def main():
 
     if args.reference_model is None and args.reference_logits is None:
         parser.error("Either --reference-model or --reference-logits is required")
+    if args.capture_only and args.reference_model is None:
+        parser.error("--capture-only requires --reference-model")
 
     print(f"Loading dataset: {args.dataset}")
     texts = load_dataset_texts(args.dataset, args.dataset_config)
@@ -498,6 +594,8 @@ def main():
         llm_kwargs["quantization"] = args.quantization
     if args.language_model_only:
         llm_kwargs["language_model_only"] = True
+    if args.max_num_batched_tokens is not None:
+        llm_kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
     if args.compiled:
         apply_compiled_llm_kwargs(llm_kwargs)
         print(
@@ -507,6 +605,11 @@ def main():
     else:
         apply_eager_llm_kwargs(llm_kwargs)
         print("Deterministic (eager) mode: bit-reproducible scoring")
+
+    moe_backend = os.environ.get("VLLM_MOE_BACKEND")
+    if moe_backend:
+        llm_kwargs["moe_backend"] = moe_backend
+        print(f"MoE backend override (VLLM_MOE_BACKEND): {moe_backend}")
 
     print("\nCalculating KLD...")
     print(f"  Context length: {args.context_length}")
@@ -524,8 +627,14 @@ def main():
         llm_kwargs=llm_kwargs,
         num_samples=args.num_samples,
         trust_remote_code=args.trust_remote_code,
+        capture_only=args.capture_only,
     )
     elapsed_time = time.time() - start_time
+
+    if args.capture_only:
+        print("\nCapture complete (Phase 1 only).")
+        print(f"  Time elapsed: {elapsed_time:.2f} seconds")
+        return
 
     print("\nResults:")
     print(f"  Mean KLD: {mean_kld:.6f}")
