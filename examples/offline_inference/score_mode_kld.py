@@ -17,6 +17,7 @@ Usage:
 """
 
 import argparse
+import contextlib
 import gc
 import glob
 import json
@@ -239,6 +240,39 @@ def _window_filename(kind: str, idx: int) -> str:
     return f"{prefix}_{idx}.safetensors"
 
 
+@contextlib.contextmanager
+def _phase(timings: dict[str, float], name: str):
+    """Accumulate wall time per run phase.
+
+    Total run time is dominated by loading weights twice — once for the teacher
+    capture, once for the student — which is a fixed cost that does not grow
+    with row count. Reporting it separately keeps the per-position rate from
+    being read as scoring throughput.
+    """
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        timings[name] = timings.get(name, 0.0) + time.perf_counter() - start
+
+
+def _prune_fallback_logits(ref_dir: str, num_windows: int) -> None:
+    """Drop per-row teacher logits that `--storage auto` kept as a fallback.
+
+    Hidden-state scoring reads only `hidden_*` and `lm_head`. Row 0's logits
+    stay so the capture can be re-probed. At roughly 2 GiB per row on a
+    wide-vocabulary model these files otherwise dominate the capture size.
+    """
+    freed = 0
+    for idx in range(1, num_windows):
+        path = os.path.join(ref_dir, _window_filename("logits", idx))
+        if os.path.isfile(path):
+            freed += os.path.getsize(path)
+            os.remove(path)
+    if freed:
+        print(f"  Pruned {freed / 1024**3:.1f} GiB of fallback teacher logits")
+
+
 def _runtime_lm_head_info(llm: LLM) -> dict[str, Any]:
     from vllm.v1.sample.kld import inspect_model_lm_heads
 
@@ -328,6 +362,7 @@ def calculate_kld(
     tok_id = tokenizer_identity(tokenizer)
     token_hash = sha256_tokens([t for w in windows for t in w])
 
+    timings: dict[str, float] = {}
     capture_kind = "logits"
     if storage in {"hidden", "auto"}:
         capture_kind = "hidden"
@@ -358,7 +393,8 @@ def calculate_kld(
             print(f"Phase 1: capturing reference from {reference_model_path}")
             teacher_head_static = detect_lm_head_quantization(reference_model_path)
             print(f"  Teacher LM head (static): {teacher_head_static['state']}")
-            ref_llm = LLM(model=reference_model_path, **(llm_kwargs or {}))
+            with _phase(timings, "teacher_load"):
+                ref_llm = LLM(model=reference_model_path, **(llm_kwargs or {}))
             teacher_head_runtime = _runtime_lm_head_info(ref_llm)
             print(f"  Teacher LM head (runtime): {teacher_head_runtime['state']}")
             if teacher_head_runtime["state"] != "unquantized":
@@ -380,23 +416,31 @@ def calculate_kld(
                 capture_kind == "logits" or probe_replay or storage == "auto"
             )
             for idx, window_tokens in enumerate(windows):
+                # Only row 0 feeds the replay probe, so an explicit hidden
+                # capture does not need a full-vocabulary logits file per row.
+                # `auto` keeps them all until the probe decides, then prunes.
+                write_logits = want_logits and (storage != "hidden" or idx == 0)
                 sampling_params = SamplingParams(
                     max_tokens=1,
-                    return_prompt_logits=want_logits,
+                    return_prompt_logits=write_logits,
                     return_prompt_hidden_states=want_hidden,
                 )
                 prompt: TokensPrompt = {"prompt_token_ids": window_tokens}
-                out = ref_llm.generate([prompt], sampling_params=sampling_params)[0]
-                if want_logits:
+                with _phase(timings, "capture_forward"):
+                    out = ref_llm.generate(
+                        [prompt], sampling_params=sampling_params
+                    )[0]
+                if write_logits:
                     if out.prompt_logits is None:
                         raise RuntimeError(
                             "prompt_logits is None; return_prompt_logits plumbing "
                             "is broken in this build"
                         )
-                    save_file(
-                        {"logits": out.prompt_logits.cpu()},
-                        os.path.join(ref_dir, _window_filename("logits", idx)),
-                    )
+                    with _phase(timings, "capture_write"):
+                        save_file(
+                            {"logits": out.prompt_logits.cpu()},
+                            os.path.join(ref_dir, _window_filename("logits", idx)),
+                        )
                 if want_hidden:
                     hidden = getattr(out, "prompt_hidden_states", None)
                     if hidden is None:
@@ -404,26 +448,29 @@ def calculate_kld(
                             "prompt_hidden_states is None; "
                             "return_prompt_hidden_states plumbing is broken"
                         )
-                    save_file(
-                        {"hidden_states": hidden.cpu()},
-                        os.path.join(ref_dir, _window_filename("hidden", idx)),
-                    )
+                    with _phase(timings, "capture_write"):
+                        save_file(
+                            {"hidden_states": hidden.cpu()},
+                            os.path.join(ref_dir, _window_filename("hidden", idx)),
+                        )
             head_path = os.path.join(ref_dir, "lm_head.safetensors")
             if want_hidden:
                 copy_lm_head_from_checkpoint(reference_model_path, head_path)
             probe_report = None
             if probe_replay or storage == "auto":
-                probe_report = _probe_first_window(
-                    ref_llm,
-                    ref_dir,
-                    kld_vocab,
-                    probe_replay_exactness_in_model,
-                )
+                with _phase(timings, "replay_probe"):
+                    probe_report = _probe_first_window(
+                        ref_llm,
+                        ref_dir,
+                        kld_vocab,
+                        probe_replay_exactness_in_model,
+                    )
                 print(f"  Replay probe: {probe_report}")
                 if storage == "auto":
                     if probe_report.get("identical"):
                         capture_kind = "hidden"
                         print("  Storage: hidden (replay is bitwise exact)")
+                        _prune_fallback_logits(ref_dir, len(windows))
                     else:
                         capture_kind = "logits"
                         print(
@@ -621,13 +668,19 @@ def calculate_kld(
 
     if capture_only:
         print(f"Capture-only: skipping Phase 2. References at {reference_logits_path}")
-        return {"mean_kld": 0.0, "num_positions": 0, "capture_only": True}
+        return {
+            "mean_kld": 0.0,
+            "num_positions": 0,
+            "capture_only": True,
+            "timings": timings,
+        }
 
     student_head_static = detect_lm_head_quantization(model_path)
     print(f"Student LM head (static): {student_head_static['state']}")
     print("Phase 2: Computing KLD...")
     print(f"Loading test model: {model_path}")
-    llm = LLM(model=model_path, **(llm_kwargs or {}))
+    with _phase(timings, "student_load"):
+        llm = LLM(model=model_path, **(llm_kwargs or {}))
     student_uses_v2 = bool(
         llm.llm_engine.vllm_config.use_v2_model_runner
     )
@@ -704,7 +757,8 @@ def calculate_kld(
             max_tokens=1,
             kld_mode=True,
         )
-        out = llm.generate([prompt], sampling_params=sampling_params)[0]
+        with _phase(timings, "score_forward"):
+            out = llm.generate([prompt], sampling_params=sampling_params)[0]
         if out.kld_result is None:
             raise RuntimeError("kld_result is None; KLD plumbing is broken")
         chunks.append(out.kld_result)
@@ -712,6 +766,7 @@ def calculate_kld(
     report = summarize_kld_rows(
         chunks, score_from=score_from, context_length=context_length
     )
+    report["timings"] = timings
     report["unique_tokens"] = unique_tokens
     report["num_rows"] = len(windows)
     report["kld_vocab_size"] = kld_vocab
@@ -1277,9 +1332,31 @@ def main():
 
     _print_kld_report(report)
     print(f"  Time elapsed: {elapsed_time:.2f} seconds")
+    timings = report.get("timings") or {}
+    if timings:
+        print("  Phase breakdown (seconds):")
+        for name in (
+            "teacher_load",
+            "capture_forward",
+            "capture_write",
+            "replay_probe",
+            "student_load",
+            "score_forward",
+        ):
+            if name in timings:
+                print(f"    {name}: {timings[name]:.2f}")
+        fixed = timings.get("teacher_load", 0.0) + timings.get("student_load", 0.0)
+        per_row = (
+            timings.get("capture_forward", 0.0)
+            + timings.get("capture_write", 0.0)
+            + timings.get("score_forward", 0.0)
+        ) / max(report["num_rows"], 1)
+        print(f"    weight loading (fixed, independent of rows): {fixed:.2f}")
+        print(f"    marginal cost per row: {per_row:.2f}")
     npos = report["num_positions"]
-    if elapsed_time > 0:
-        print(f"  Positions/second: {npos / elapsed_time:.2f}")
+    score_forward = timings.get("score_forward")
+    if score_forward:
+        print(f"  Scoring throughput: {npos / score_forward:.0f} positions/second")
 
 
 if __name__ == "__main__":

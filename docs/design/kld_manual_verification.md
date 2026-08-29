@@ -182,6 +182,12 @@ its own capture directory automatically.
 report `mean_kld` of exactly `0.0`, and both FP8 pairs produce a finite
 non-zero mean. **Fail:** any `EXIT_*`, `MISSING*`, or `NONZERO_SELF_KLD` row.
 
+Read the printed phase breakdown, not the elapsed time, when judging cost. Each
+run loads weights twice — once for the teacher capture, once for the student —
+and that fixed cost dominates a one-row run while staying constant as rows grow.
+Row count only buys `marginal cost per row`, which is a forward pass plus the
+capture write. Do not extrapolate a one-row wall time by multiplying.
+
 ## Phase A — GLM-5.3 work is on the branch
 
 ```bash
@@ -482,3 +488,11 @@ Repeat with the MoE paths. To reproduce the deep-context-only view, use
 For Qwen3.6's 248,320-wide padded output, full FP32 logits are roughly 2.0 GB
 per 2048-token row (about 203 GB for 100 rows). Hidden storage is therefore the
 practical 100-row mode, but only after the exact replay probe passes.
+
+Capture writes logits only where they are needed. `--storage hidden` writes them
+for row 0 alone, which is the only row the replay probe reads. `--storage auto`
+writes every row, because it may still have to fall back to logits scoring, and
+prunes rows 1..n once the probe proves hidden storage is exact — so peak disk
+during a 100-row `auto` capture is still around 200 GB even though the surviving
+capture is a few GB. If disk is tight, prove exactness with a one-row `auto`
+run, then capture the full sweep with `--storage hidden`.
