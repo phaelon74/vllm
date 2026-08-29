@@ -10,6 +10,138 @@ Use the repo venv. Never use system `python3` or bare `pip`.
 source .venv/bin/activate
 ```
 
+Execution order: Step 0 and Step 1 below come first and gate everything else.
+The `Phase A`..`Phase 9` sections are the per-behavior regression checklist; a
+non-zero self-KLD in Step 1 invalidates every number they produce, so do not
+start them until Step 1 is clean.
+
+## Step 0 — enshrine the environment
+
+A KLD value is only meaningful next to the stack that produced it. Capture the
+host, driver, toolchain, package set, repo commit, and checkpoint fingerprints
+into one directory before the first run, and re-capture after any driver,
+torch, vLLM, or checkpoint change.
+
+```bash
+export KLD_RUN="$HOME/kld-artifacts/$(date +%Y%m%d)-$(hostname -s)"
+mkdir -p "$KLD_RUN"
+
+bash scripts/kld_env_report.sh "$KLD_RUN/env" \
+  /media/fmodels/Qwen/Qwen3.6-27B \
+  /media/fmodels/Qwen/Qwen3.6-27B-FP8 \
+  /media/fmodels/Qwen/Qwen3.6-35B-A3B \
+  /media/fmodels/Qwen/Qwen3.6-35B-A3B-FP8
+
+cat "$KLD_RUN/env/summary.md"
+```
+
+`summary.md` is the front page; the rest of the directory holds the raw
+probes. `gpu-smi-query.txt` matters more than it looks: ECC mode, persistence
+mode, clock caps, and throttle reasons all sit in there, and a change in any of
+them is a legitimate explanation for a bitwise result that stopped reproducing.
+`runtime.json` includes the exact `capture_runtime_manifest()` fields the
+capture directories bind themselves to, plus the TF32 and deterministic-algorithm
+torch flags. Model directories are fingerprinted by listing hash, byte total,
+and `config.json` / tokenizer hashes; set `KLD_HASH_WEIGHTS=1` to sha256 every
+safetensors shard instead, which is worth doing once per checkpoint but is slow
+over a network mount.
+
+**Pass:** `summary.md` names four GPUs, a driver version, a torch version, a
+vLLM version, and the `feature/glm53-kld-determinism` commit, and each model
+file lists a `config.json` whose `architectures` you recognize. **Fail:**
+missing driver or GPU lines (the report ran without GPU visibility), or
+`runtime.json` contains `torch_error` / `vllm_error` / a
+`capture_runtime_manifest_error`.
+
+## Step 1 — self-KLD must be exactly zero
+
+Score each BF16 checkpoint against a capture of itself. This is the only check
+that separates "the KLD pipeline is correct" from "the student is close to the
+teacher", because the sole correct answer is zero. Run it per model and per
+runner, since a capture manifest refuses to be replayed under a different
+runner.
+
+Both Qwen3.6 checkpoints are hybrid architectures, so the default runner
+selection lands on V1; V2 requires the explicit env override and is not the
+default path for them. Treat V1 as authoritative and V2 as an additional
+check — if V2 aborts with a config error, record the message in the artifact
+directory and move on rather than forcing it.
+
+```bash
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+
+self_kld () {
+  model="$1"; label="$2"; runner="$3"
+  VLLM_USE_V2_MODEL_RUNNER="$runner" \
+  .venv/bin/python examples/offline_inference/score_mode_kld.py \
+    --model "$model" \
+    --reference-model "$model" \
+    --reference-logits "$KLD_RUN/${label}-v${runner}-self" \
+    --dataset Salesforce/wikitext \
+    --dataset-config wikitext-2-raw-v1 \
+    --rows 1 \
+    --context-length 2048 \
+    --score-from 0 \
+    --storage auto \
+    --probe-replay \
+    --language-model-only \
+    --max-num-seqs 1 \
+    --report-json "$KLD_RUN/${label}-v${runner}-self.json" \
+    --tensor-parallel-size 4 \
+    --gpu-memory-utilization 0.90 \
+    2>&1 | tee "$KLD_RUN/${label}-v${runner}-self.log"
+}
+
+self_kld /media/fmodels/Qwen/Qwen3.6-27B      dense-27b   0
+self_kld /media/fmodels/Qwen/Qwen3.6-35B-A3B  moe-35b-a3b 0
+self_kld /media/fmodels/Qwen/Qwen3.6-27B      dense-27b   1
+self_kld /media/fmodels/Qwen/Qwen3.6-35B-A3B  moe-35b-a3b 1
+```
+
+The script pins `max_model_len` to twice `--context-length` (4096 here) and
+disables prefix caching, and eager execution is the default, so no extra flags
+are needed for determinism. `--max-num-seqs 1` keeps the hybrid state
+allocation small and removes batch composition as a variable.
+
+**Expected:** each run prints the requested runner, `Mean KLD (ref ||
+student): 0.00000000`, 2047 scored positions, and — for hidden storage —
+`'identical': True` from the replay probe.
+
+**Pass:** exact zero on both models under V1, and under V2 for whichever
+model V2 accepts. **Fail:** any non-zero mean KLD, or a replay probe that is
+not bitwise identical. On a non-zero self-KLD, stop; on a failed replay probe
+only, rerun that model with `--storage logits` rather than trusting hidden
+storage.
+
+Only after this passes do the FP8 checkpoints become meaningful: they are the
+real student/teacher pairs on this host, BF16 as `--reference-model` and FP8 as
+`--model`, each pair needing its own capture directory.
+
+## Step 2 — the BF16 vs FP8 matrix
+
+`scripts/kld_run_matrix.sh` runs the Step 1 baselines and the FP8 comparisons
+with per-run capture directories, logs, and report JSONs named after the runner,
+row count, context length, and `score_from`, and appends one row per run to
+`$KLD_RUN/matrix-results.tsv`. It re-asserts the zero invariant from the report
+JSON rather than from console text, and aborts on the first failure unless
+`KEEP_GOING=1`.
+
+```bash
+bash scripts/kld_run_matrix.sh selfkld          # Step 1, gates the rest
+bash scripts/kld_run_matrix.sh pairs            # BF16 teacher vs FP8 student
+RUNNER=1 bash scripts/kld_run_matrix.sh all     # repeat under V2, if accepted
+```
+
+Knobs are environment variables: `MODEL_ROOT`, `RUNNER`, `ROWS`,
+`CONTEXT_LENGTH`, `SCORE_FROM`, `TP_SIZE`, `GPU_UTIL`, `STORAGE`,
+`MAX_NUM_SEQS`, `SELF_KLD_FP8`, `KEEP_GOING`. `SCORE_FROM=1024` gives the
+deep-context-only view and, because `score_from` is manifest-bound, lands in
+its own capture directory automatically.
+
+**Pass:** every row in `matrix-results.tsv` reads `OK`, the two `*-self` rows
+report `mean_kld` of exactly `0.0`, and both FP8 pairs produce a finite
+non-zero mean. **Fail:** any `EXIT_*`, `MISSING*`, or `NONZERO_SELF_KLD` row.
+
 ## Phase A — GLM-5.3 work is on the branch
 
 ```bash
@@ -269,65 +401,25 @@ uv pip install -r requirements/test/cuda.in
 uv pip install datasets huggingface_hub
 pre-commit install
 
-mkdir -p "$HOME/models" "$HOME/kld-captures"
-hf download Qwen/Qwen3.6-27B \
-  --local-dir "$HOME/models/Qwen3.6-27B"
+hf download Qwen/Qwen3.6-27B --local-dir /media/fmodels/Qwen/Qwen3.6-27B
 hf download Qwen/Qwen3.6-35B-A3B \
-  --local-dir "$HOME/models/Qwen3.6-35B-A3B"
+  --local-dir /media/fmodels/Qwen/Qwen3.6-35B-A3B
 ```
 
-Start with a one-row self-KLD on each runner. Captures are deliberately
-runner-specific because the manifest refuses a V1 capture under V2 and vice
-versa.
+Then run Step 0 and Step 1 above; they are the entry point on a host whose
+checkpoints are already in place.
+
+For a 100-row candidate comparison, use a new capture directory and point
+`--model` at the quantized student while keeping `--reference-model` on the
+BF16 checkpoint. Set `VLLM_USE_V2_MODEL_RUNNER` to whichever runner passed
+Step 1 for that model:
 
 ```bash
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-
-run_self_kld () {
-  model="$1"
-  label="$2"
-  runner="$3"
-  capture="$HOME/kld-captures/${label}-v${runner}-smoke"
-  VLLM_USE_V2_MODEL_RUNNER="$runner" \
-  .venv/bin/python examples/offline_inference/score_mode_kld.py \
-    --model "$model" \
-    --reference-model "$model" \
-    --reference-logits "$capture" \
-    --dataset Salesforce/wikitext \
-    --dataset-config wikitext-2-raw-v1 \
-    --rows 1 \
-    --context-length 2048 \
-    --score-from 0 \
-    --storage auto \
-    --probe-replay \
-    --language-model-only \
-    --report-json "$HOME/kld-captures/${label}-v${runner}-smoke.json" \
-    --tensor-parallel-size 4 \
-    --gpu-memory-utilization 0.90
-}
-
-run_self_kld "$HOME/models/Qwen3.6-27B" dense-27b 0
-run_self_kld "$HOME/models/Qwen3.6-27B" dense-27b 1
-run_self_kld "$HOME/models/Qwen3.6-35B-A3B" moe-35b-a3b 0
-run_self_kld "$HOME/models/Qwen3.6-35B-A3B" moe-35b-a3b 1
-```
-
-Each run must print the requested runner, `Mean KLD (ref || student):
-0.00000000`, and 2047 positions. For hidden storage, the replay probe must
-also print `'identical': True`. Stop if self-KLD is non-zero. If replay alone
-is not bitwise exact, rerun with `--storage logits`; do not force hidden
-storage.
-
-For a 100-row candidate comparison, use a new capture directory and replace
-`--model` with the matching quantized student checkpoint while keeping
-`--reference-model` on the BF16 checkpoint:
-
-```bash
-VLLM_USE_V2_MODEL_RUNNER=1 \
+VLLM_USE_V2_MODEL_RUNNER=0 \
 .venv/bin/python examples/offline_inference/score_mode_kld.py \
-  --model /path/to/Qwen3.6-27B-STUDENT \
-  --reference-model "$HOME/models/Qwen3.6-27B" \
-  --reference-logits "$HOME/kld-captures/dense-27b-v2-rows100" \
+  --model /media/fmodels/Qwen/Qwen3.6-27B-FP8 \
+  --reference-model /media/fmodels/Qwen/Qwen3.6-27B \
+  --reference-logits "$KLD_RUN/dense-27b-fp8-rows100" \
   --dataset Salesforce/wikitext \
   --dataset-config wikitext-2-raw-v1 \
   --rows 100 \
@@ -337,7 +429,7 @@ VLLM_USE_V2_MODEL_RUNNER=1 \
   --probe-replay \
   --decompose-head \
   --language-model-only \
-  --report-json "$HOME/kld-captures/dense-27b-v2-rows100.json" \
+  --report-json "$KLD_RUN/dense-27b-fp8-rows100.json" \
   --tensor-parallel-size 4 \
   --gpu-memory-utilization 0.90
 ```
