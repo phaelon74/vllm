@@ -52,6 +52,7 @@ class NewRequestData:
     target_token_ids: list[int] | None = None
     reference_logits_path: str | None = None
     reference_logits_key: str | None = None
+    kld_vocab_size: int | None = None
 
     @classmethod
     def from_request(
@@ -82,6 +83,7 @@ class NewRequestData:
             target_token_ids=request.target_token_ids,
             reference_logits_path=request.reference_logits_path,
             reference_logits_key=request.reference_logits_key,
+            kld_vocab_size=request.kld_vocab_size,
         )
 
     @property

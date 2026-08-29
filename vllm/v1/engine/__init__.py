@@ -22,6 +22,7 @@ from vllm.v1.metrics.stats import (
     SchedulerStats,
 )
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplingMaskLists
+from vllm.v1.sample.kld import KLDResult
 from vllm.v1.serial_utils import UtilityResult
 
 # Type for pause_generation mode parameter.
@@ -130,6 +131,9 @@ class EngineCoreRequest(
     reference_logits_key: str | None = None
     """Key for loading reference logits from safetensors in KLD mode."""
 
+    kld_vocab_size: int | None = None
+    """Unpadded tokenizer vocab size; KLD softmax truncates to this."""
+
     # Per-position mask for mixed-mode inputs (e.g chat completion with
     # prompt_embeds content parts). `True` means the position is a real
     # token ID; `False` means the position uses a pre-computed entry from
@@ -214,7 +218,8 @@ class EngineCoreOutput(
     new_logprobs: LogprobsLists | None = None
     new_prompt_logprobs_tensors: LogprobsTensors | None = None
     new_prompt_logits: torch.Tensor | None = None
-    kld_result: tuple[float, int] | None = None
+    new_prompt_hidden: torch.Tensor | None = None
+    kld_result: KLDResult | None = None
 
     pooling_output: torch.Tensor | None = None
 

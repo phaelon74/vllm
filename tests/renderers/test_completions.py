@@ -601,6 +601,7 @@ class TestScoreKldMetadata:
         "target_token_ids",
         "reference_logits_path",
         "reference_logits_key",
+        "kld_vocab_size",
     )
 
     def _score_kld_prompt(self, *, target_token_ids: list[int] | None = None):
@@ -608,6 +609,7 @@ class TestScoreKldMetadata:
             "prompt_token_ids": [10, 20, 30, 40],
             "reference_logits_path": "/tmp/ref.safetensors",
             "reference_logits_key": "logits",
+            "kld_vocab_size": 32000,
         }
         if target_token_ids is not None:
             prompt["target_token_ids"] = target_token_ids
@@ -627,6 +629,7 @@ class TestScoreKldMetadata:
         assert results[0]["target_token_ids"] == [20, 30, 40]
         assert results[0]["reference_logits_path"] == "/tmp/ref.safetensors"
         assert results[0]["reference_logits_key"] == "logits"
+        assert results[0]["kld_vocab_size"] == 32000
 
     @pytest.mark.asyncio
     async def test_render_cmpl_async_preserves_score_kld_fields(self):
@@ -643,6 +646,7 @@ class TestScoreKldMetadata:
         assert results[0]["target_token_ids"] == [20, 30, 40]
         assert results[0]["reference_logits_path"] == "/tmp/ref.safetensors"
         assert results[0]["reference_logits_key"] == "logits"
+        assert results[0]["kld_vocab_size"] == 32000
 
     def test_render_cmpl_preserves_empty_target_token_ids(self):
         renderer = _build_renderer(MockModelConfig())
@@ -657,6 +661,7 @@ class TestScoreKldMetadata:
         assert results[0]["target_token_ids"] == []
         assert results[0]["reference_logits_path"] == "/tmp/ref.safetensors"
         assert results[0]["reference_logits_key"] == "logits"
+        assert results[0]["kld_vocab_size"] == 32000
 
     def test_render_cmpl_does_not_inject_absent_fields(self):
         renderer = _build_renderer(MockModelConfig())

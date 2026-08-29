@@ -65,8 +65,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", required=True)
     p.add_argument(
         "--dataset-dir",
-        required=True,
+        default=None,
         help="Directory holding <dataset-config>/test-*.parquet.",
+    )
+    p.add_argument(
+        "--token-ids-file",
+        default=None,
+        help="JSON list of token IDs. Preferred for an embedded capture gate.",
     )
     p.add_argument("--dataset-config", default="wikitext-2-raw-v1")
     p.add_argument("--out-dir", default="determinism_probe")
@@ -74,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stride", type=int, default=512)
     p.add_argument("--tp", type=int, default=4)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.92)
-    p.add_argument("--moe-backend", default="triton")
+    p.add_argument("--moe-backend", default=None)
     p.add_argument(
         "--max-num-batched-tokens",
         type=int,
@@ -158,6 +163,21 @@ def math_self_kl() -> float:
 
 
 def build_tokens(args: argparse.Namespace) -> list[int]:
+    if args.token_ids_file:
+        with open(args.token_ids_file, encoding="utf-8") as f:
+            tokens = json.load(f)
+        if not isinstance(tokens, list) or not all(
+            isinstance(token, int) for token in tokens
+        ):
+            raise SystemExit("--token-ids-file must contain a JSON integer list")
+        if len(tokens) < args.ctx:
+            raise SystemExit(
+                f"token file has {len(tokens)} tokens, need {args.ctx}"
+            )
+        return tokens
+    if not args.dataset_dir:
+        raise SystemExit("one of --dataset-dir or --token-ids-file is required")
+
     from datasets import load_dataset
     from transformers import AutoTokenizer
 
@@ -193,8 +213,9 @@ def build_llm(args: argparse.Namespace):
         max_num_seqs=1,
         enforce_eager=args.enforce_eager,
         language_model_only=True,
-        moe_backend=args.moe_backend,
     )
+    if args.moe_backend:
+        kwargs["moe_backend"] = args.moe_backend
     if args.max_num_batched_tokens is not None:
         kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
     if args.disable_flashinfer_autotune:
@@ -212,7 +233,7 @@ def capture(llm, token_ids: list[int]) -> torch.Tensor:
         # want the full logits, not per-target logprobs.
         [{"prompt_token_ids": token_ids}],
         sampling_params=SamplingParams(
-            prompt_logprobs=1, max_tokens=1, return_prompt_logits=True
+            max_tokens=1, return_prompt_logits=True
         ),
     )[0]
     if out.prompt_logits is None:
@@ -227,21 +248,24 @@ def score_kld(
     llm, token_ids: list[int], ref_path: str, ref_key: str
 ) -> tuple[float, int]:
     from vllm import SamplingParams
+    from vllm.v1.sample.kld import tokenizer_unpadded_vocab_size
+
+    tokenizer = llm.llm_engine.tokenizer
 
     out = llm.generate(
         [
             {
                 "prompt_token_ids": token_ids,
-                "target_token_ids": token_ids[1:],
                 "reference_logits_path": ref_path,
                 "reference_logits_key": ref_key,
+                "kld_vocab_size": tokenizer_unpadded_vocab_size(tokenizer),
             }
         ],
-        sampling_params=SamplingParams(prompt_logprobs=0, max_tokens=1, kld_mode=True),
+        sampling_params=SamplingParams(max_tokens=1, kld_mode=True),
     )[0]
     if out.kld_result is None:
         raise SystemExit("kld_result is None; KLD plumbing is broken in this build")
-    kld_sum, count = out.kld_result
+    kld_sum, count = out.kld_result.kld_sum, out.kld_result.kld_count
     return float(kld_sum), int(count)
 
 

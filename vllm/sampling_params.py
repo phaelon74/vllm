@@ -391,6 +391,11 @@ class SamplingParams(
     """When True, enables KLD (Kullback-Leibler divergence) computation.
     Requires reference_logits_path in the prompt. All KL math is done on GPU."""
 
+    return_prompt_hidden_states: bool = False
+    """When True, returns hidden states after final RMSNorm (before the LM
+    head) for prompt positions. Combinable with return_prompt_logits so a
+    capture can probe replay exactness."""
+
     @staticmethod
     def from_optional(
         n: int | None = 1,
@@ -666,6 +671,10 @@ class SamplingParams(
         if self.return_prompt_logits and self.kld_mode:
             raise ValueError(
                 "return_prompt_logits and kld_mode are mutually exclusive."
+            )
+        if self.return_prompt_hidden_states and self.kld_mode:
+            raise ValueError(
+                "return_prompt_hidden_states and kld_mode are mutually exclusive."
             )
         assert isinstance(self.bad_words, list)
         if any(not bad_word for bad_word in self.bad_words):

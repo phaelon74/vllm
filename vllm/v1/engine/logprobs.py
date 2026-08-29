@@ -22,6 +22,7 @@ from vllm.tokenizers.detokenizer_utils import (
 )
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
+from vllm.v1.sample.kld import KLDResult
 
 logger = init_logger(__name__)
 
@@ -47,8 +48,11 @@ class LogprobsProcessor:
     prompt_logits: torch.Tensor | None = None
     """Raw logits for prompt positions when return_prompt_logits."""
 
-    kld_result: tuple[float, int] | None = None
-    """(kld_sum, kld_count) when kld_mode."""
+    prompt_hidden_states: torch.Tensor | None = None
+    """Hidden states after final RMSNorm when return_prompt_hidden_states."""
+
+    kld_result: KLDResult | None = None
+    """Per-position KLDResult when kld_mode."""
 
     @classmethod
     def from_new_request(
@@ -448,5 +452,7 @@ class LogprobsProcessor:
                 self._update_prompt_logprobs(output.new_prompt_logprobs_tensors)
         if output.new_prompt_logits is not None:
             self.prompt_logits = output.new_prompt_logits
+        if output.new_prompt_hidden is not None:
+            self.prompt_hidden_states = output.new_prompt_hidden
         if output.kld_result is not None:
             self.kld_result = output.kld_result

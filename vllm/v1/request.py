@@ -79,6 +79,7 @@ class Request:
         target_token_ids: list[int] | None = None,
         reference_logits_path: str | None = None,
         reference_logits_key: str | None = None,
+        kld_vocab_size: int | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
     ) -> None:
@@ -187,6 +188,7 @@ class Request:
         self.target_token_ids: list[int] | None = target_token_ids
         self.reference_logits_path: str | None = reference_logits_path
         self.reference_logits_key: str | None = reference_logits_key
+        self.kld_vocab_size: int | None = kld_vocab_size
 
         # Multi-modal related
         self.mm_features = mm_features or []
@@ -267,6 +269,7 @@ class Request:
             target_token_ids=request.target_token_ids,
             reference_logits_path=request.reference_logits_path,
             reference_logits_key=request.reference_logits_key,
+            kld_vocab_size=request.kld_vocab_size,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
         )

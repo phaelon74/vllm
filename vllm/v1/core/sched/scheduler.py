@@ -1378,6 +1378,18 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        sampling_params = request.sampling_params
+        if (
+            sampling_params is not None
+            and sampling_params.kld_mode
+            and request.num_computed_tokens < request.num_prompt_tokens
+        ):
+            raise RuntimeError(
+                "KLD requests cannot be preempted during prompt processing "
+                "because reference-position accumulation must remain "
+                "contiguous. Reduce concurrent work or KV-cache pressure "
+                "and retry."
+            )
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
@@ -1768,6 +1780,7 @@ class Scheduler(SchedulerInterface):
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         prompt_logits_dict = model_runner_output.prompt_logits_dict
+        prompt_hidden_dict = model_runner_output.prompt_hidden_dict
         kld_result_dict = model_runner_output.kld_result_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
@@ -2003,8 +2016,18 @@ class Scheduler(SchedulerInterface):
                         # Normal decode / re-prefill: token(s) at the END.
                         routed_experts = routing_data[end - len(new_token_ids) : end]
 
+            prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
+            new_prompt_logits = prompt_logits_dict.get(req_id)
+            new_prompt_hidden = prompt_hidden_dict.get(req_id)
+            kld_result = kld_result_dict.get(req_id)
             should_emit_output = bool(
-                new_token_ids or pooler_output is not None or stopped
+                new_token_ids
+                or pooler_output is not None
+                or stopped
+                or prompt_logprobs_tensors is not None
+                or new_prompt_logits is not None
+                or new_prompt_hidden is not None
+                or kld_result is not None
             )
             if should_emit_output:
                 prefill_stats = request.take_prefill_stats()
@@ -2045,10 +2068,6 @@ class Scheduler(SchedulerInterface):
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
 
-            # Get prompt logprobs/logits/KLD for this request.
-            prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            new_prompt_logits = prompt_logits_dict.get(req_id)
-            kld_result = kld_result_dict.get(req_id)
             if should_emit_output:
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
@@ -2060,6 +2079,7 @@ class Scheduler(SchedulerInterface):
                         new_sampling_mask=new_sampling_mask,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
                         new_prompt_logits=new_prompt_logits,
+                        new_prompt_hidden=new_prompt_hidden,
                         kld_result=kld_result,
                         pooling_output=pooler_output,
                         stop_reason=request.stop_reason,
@@ -2080,6 +2100,9 @@ class Scheduler(SchedulerInterface):
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
+                assert new_prompt_logits is None
+                assert new_prompt_hidden is None
+                assert kld_result is None
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:

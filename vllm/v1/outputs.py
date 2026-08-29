@@ -12,6 +12,7 @@ import torch
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.sample.kld import KLDResult
 
 if TYPE_CHECKING:
     from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorWorkerMetadata
@@ -352,8 +353,11 @@ class ModelRunnerOutput:
     # req_id -> logits tensor [num_positions, vocab_size] when return_prompt_logits
     prompt_logits_dict: dict[str, torch.Tensor | None] = field(default_factory=dict)
 
-    # req_id -> (kld_sum, kld_count) when kld_mode
-    kld_result_dict: dict[str, tuple[float, int] | None] = field(default_factory=dict)
+    # req_id -> hidden states [num_positions, hidden] when return_prompt_hidden_states
+    prompt_hidden_dict: dict[str, torch.Tensor | None] = field(default_factory=dict)
+
+    # req_id -> KLDResult when kld_mode
+    kld_result_dict: dict[str, KLDResult | None] = field(default_factory=dict)
 
     # [num_reqs, hidden_size]
     pooler_output: list[torch.Tensor | None] | None = None

@@ -139,6 +139,12 @@ class TokensPrompt(_PromptOptions):
     Used with reference_logits_path for KLD mode.
     """
 
+    kld_vocab_size: NotRequired[int]
+    """
+    Unpadded tokenizer vocabulary size used to truncate logits before softmax.
+    Padding rows must not contribute to KLD.
+    """
+
 
 class EmbedsPrompt(_PromptOptions):
     """Schema for a prompt provided via token embeddings."""

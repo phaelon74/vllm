@@ -2,21 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-Perplexity calculation script using vLLM's score mode.
+Perplexity using vLLM score mode.
 
-Implements sliding window perplexity calculation compatible with EXL3's
-approach: concatenate text, tokenize, then evaluate fixed-size windows
-with a configurable stride. Uses vLLM's score mode for efficient
-GPU-side logprob extraction.
+Concatenates corpus text, tokenizes, then scores non-overlapping rows of
+``--context-length`` tokens (Turbo/EXL3 windowing). ``--stride`` smaller
+than context length reproduces historical overlapping windows and is not
+the EXL3 default.
 
 Usage:
-    python examples/score_mode_perplexity.py \
-        --model /path/to/model \
-        --dataset wikitext \
-        --dataset-config wikitext-2-raw-v1 \
-        --num-samples 100 \
-        --context-length 2048 \
-        --stride 512
+    python examples/offline_inference/score_mode_perplexity.py \\
+        --model /path/to/model \\
+        --dataset wikitext --dataset-config wikitext-2-raw-v1
 """
 
 import argparse
@@ -32,11 +28,6 @@ from vllm import LLM, SamplingParams
 from vllm.inputs import TokensPrompt
 
 logger = logging.getLogger(__name__)
-
-# Score mode is implemented only in the V1 model runner, so pin it. The V2
-# runner's PromptLogprobsWorker ignores score_mode and would silently return
-# ordinary prompt logprobs.
-os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
 
 # Best-effort compiled determinism config (--compiled only). See
 # score_mode_kld.py and docs/features/score_mode.md.
@@ -113,25 +104,16 @@ def calculate_perplexity(
     texts: list[str],
     context_length: int,
     stride: int,
+    rows: int,
     num_samples: int | None = None,
 ) -> tuple[float, int]:
+    """Score non-overlapping (or strided) rows and return perplexity.
+
+    Concatenates texts, tokenizes once, then evaluates ``rows`` windows of
+    ``context_length``. Default stride equals context_length (no overlap).
     """
-    Calculate perplexity using sliding window approach.
+    from vllm.v1.sample.kld import iter_eval_rows
 
-    Concatenates all texts, tokenizes as one sequence, then evaluates
-    fixed-size windows with the given stride. Compatible with EXL3's
-    evaluation methodology.
-
-    Args:
-        llm: Initialized vLLM LLM instance
-        texts: List of text samples to evaluate
-        context_length: Maximum context length for each window
-        stride: Stride between windows (overlap = context_length - stride)
-        num_samples: Maximum number of samples to process (None = all)
-
-    Returns:
-        Tuple of (perplexity, total_tokens_evaluated)
-    """
     logprob_sum = 0.0
     logprob_count = 0
 
@@ -141,71 +123,32 @@ def calculate_perplexity(
     tokens = llm.llm_engine.tokenizer.encode(
         concatenated_text, add_special_tokens=False
     )
-
-    if len(tokens) < 2:
-        raise ValueError("Not enough tokens after concatenation")
-
-    # Limit to ~100 windows worth of tokens
-    max_tokens_for_eval = context_length + 99 * stride
-    if len(tokens) > max_tokens_for_eval:
-        tokens = tokens[:max_tokens_for_eval]
-
-    num_tokens = len(tokens)
-    logger.debug("Total tokens for evaluation: %d", num_tokens)
-    windows_processed = 0
-
+    windows = iter_eval_rows(tokens, context_length, stride, rows)
     sampling_params = SamplingParams(
         prompt_logprobs=1,
         max_tokens=1,
         score_mode=True,
     )
-
-    if num_tokens < context_length:
-        if num_tokens >= 2:
-            window_tokens = tokens
-            target_token_ids = window_tokens[1:]
-
-            prompt: TokensPrompt = {
-                "prompt_token_ids": window_tokens,
-                "target_token_ids": target_token_ids,
-            }
-
-            outputs = llm.generate([prompt], sampling_params=sampling_params)
-            window_sum, window_count = _extract_logprobs_from_window(
-                outputs[0].prompt_logprobs, window_tokens
+    windows_processed = 0
+    for window_tokens in windows:
+        if len(window_tokens) < 2:
+            continue
+        windows_processed += 1
+        prompt: TokensPrompt = {
+            "prompt_token_ids": window_tokens,
+            "target_token_ids": window_tokens[1:],
+        }
+        outputs = llm.generate([prompt], sampling_params=sampling_params)
+        window_sum, window_count = _extract_logprobs_from_window(
+            outputs[0].prompt_logprobs, window_tokens
+        )
+        logprob_sum += window_sum
+        logprob_count += window_count
+        if windows_processed % 100 == 0:
+            print(
+                f"Processed {windows_processed} windows, "
+                f"{logprob_count} tokens evaluated"
             )
-            logprob_sum += window_sum
-            logprob_count += window_count
-    else:
-        for start_idx in range(0, num_tokens - context_length + stride, stride):
-            end_idx = start_idx + context_length
-            if end_idx > num_tokens:
-                break
-
-            window_tokens = tokens[start_idx:end_idx]
-            if len(window_tokens) < 2:
-                continue
-
-            windows_processed += 1
-            target_token_ids = window_tokens[1:]
-
-            prompt: TokensPrompt = {
-                "prompt_token_ids": window_tokens,
-                "target_token_ids": target_token_ids,
-            }
-
-            outputs = llm.generate([prompt], sampling_params=sampling_params)
-            window_sum, window_count = _extract_logprobs_from_window(
-                outputs[0].prompt_logprobs, window_tokens
-            )
-            logprob_sum += window_sum
-            logprob_count += window_count
-
-            if windows_processed % 100 == 0:
-                print(
-                    f"Processed {windows_processed} windows, "
-                    f"{logprob_count} tokens evaluated"
-                )
 
     if logprob_count == 0:
         raise ValueError("No valid tokens found for perplexity calculation")
@@ -215,7 +158,6 @@ def calculate_perplexity(
         windows_processed,
         logprob_count,
     )
-
     mean_log_prob = logprob_sum / logprob_count
     perplexity = math.exp(-mean_log_prob)
     return perplexity, logprob_count
@@ -309,19 +251,25 @@ def main():
         "--num-samples",
         type=int,
         default=None,
-        help="Number of samples to process (default: all)",
+        help="Number of dataset rows to concatenate (default: all)",
+    )
+    parser.add_argument(
+        "--rows",
+        type=int,
+        default=100,
+        help="Number of evaluation rows (default: 100)",
     )
     parser.add_argument(
         "--context-length",
         type=int,
         default=2048,
-        help="Context length for each window (default: 2048)",
+        help="Tokens per row (default: 2048)",
     )
     parser.add_argument(
         "--stride",
         type=int,
-        default=512,
-        help="Stride between windows (default: 512)",
+        default=None,
+        help="DEPRECATED overlapping stride. Default is context-length.",
     )
     parser.add_argument(
         "--tensor-parallel-size",
@@ -387,9 +335,19 @@ def main():
     print(f"Initializing LLM with model: {args.model}")
     llm = LLM(model=args.model, **llm_kwargs)
 
+    if args.stride is None:
+        stride = args.context_length
+    else:
+        stride = args.stride
+        print(
+            "WARNING: --stride is deprecated overlapping windowing. "
+            "Omit it for non-overlapping rows (EXL3/Turbo)."
+        )
+
     print("\nCalculating perplexity...")
     print(f"  Context length: {args.context_length}")
-    print(f"  Stride: {args.stride}")
+    print(f"  Stride: {stride}")
+    print(f"  Rows: {args.rows}")
     print(f"  Samples: {args.num_samples or len(texts)}")
 
     start_time = time.time()
@@ -397,7 +355,8 @@ def main():
         llm,
         texts,
         args.context_length,
-        args.stride,
+        stride,
+        args.rows,
         args.num_samples,
     )
     elapsed_time = time.time() - start_time

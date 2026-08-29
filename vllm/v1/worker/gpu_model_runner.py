@@ -727,6 +727,9 @@ class GPUModelRunner(
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
+        self._kld_lm_head_cache: dict[
+            str, tuple[torch.nn.Module, torch.nn.Module]
+        ] = {}
 
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
@@ -1361,6 +1364,7 @@ class GPUModelRunner(
                 target_token_ids=new_req_data.target_token_ids,
                 reference_logits_path=new_req_data.reference_logits_path,
                 reference_logits_key=new_req_data.reference_logits_key,
+                kld_vocab_size=new_req_data.kld_vocab_size,
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -1368,6 +1372,7 @@ class GPUModelRunner(
             needs_prompt_output = sampling_params and (
                 sampling_params.prompt_logprobs is not None
                 or sampling_params.return_prompt_logits
+                or sampling_params.return_prompt_hidden_states
                 or sampling_params.kld_mode
             )
             if needs_prompt_output:
@@ -3810,7 +3815,8 @@ class GPUModelRunner(
         list[list[int]],
         dict[str, LogprobsTensors | None],
         dict[str, torch.Tensor | None],
-        dict[str, tuple[float, int] | None],
+        dict[str, torch.Tensor | None],
+        dict[str, "KLDResult | None"],
         list[str],
         dict[str, int],
         list[int],
@@ -3936,6 +3942,7 @@ class GPUModelRunner(
         (
             prompt_logprobs_dict,
             prompt_logits_dict,
+            prompt_hidden_dict,
             kld_result_dict,
         ) = self._get_prompt_logprobs_dict(
             hidden_states[:num_scheduled_tokens],
@@ -3949,6 +3956,7 @@ class GPUModelRunner(
             valid_sampled_token_ids,
             prompt_logprobs_dict,
             prompt_logits_dict,
+            prompt_hidden_dict,
             kld_result_dict,
             req_ids_output_copy,
             req_id_to_index_output_copy,
@@ -4852,6 +4860,7 @@ class GPUModelRunner(
                 valid_sampled_token_ids,
                 prompt_logprobs_dict,
                 prompt_logits_dict,
+                prompt_hidden_dict,
                 kld_result_dict,
                 req_ids_output_copy,
                 req_id_to_index_output_copy,
@@ -4905,6 +4914,7 @@ class GPUModelRunner(
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,
                 prompt_logits_dict=prompt_logits_dict,
+                prompt_hidden_dict=prompt_hidden_dict,
                 kld_result_dict=kld_result_dict,
                 kv_connector_output=kv_connector_output,
                 ec_connector_output=ec_connector_output
@@ -5753,13 +5763,15 @@ class GPUModelRunner(
     ) -> tuple[
         dict[str, LogprobsTensors | None],
         dict[str, torch.Tensor | None],
-        dict[str, tuple[float, int] | None],
+        dict[str, torch.Tensor | None],
+        dict[str, "KLDResult | None"],
     ]:
         num_prompt_logprobs_dict = self.num_prompt_logprobs
         prompt_logits_dict: dict[str, torch.Tensor | None] = {}
-        kld_result_dict: dict[str, tuple[float, int] | None] = {}
+        prompt_hidden_dict: dict[str, torch.Tensor | None] = {}
+        kld_result_dict: dict[str, "KLDResult | None"] = {}
         if not num_prompt_logprobs_dict:
-            return {}, prompt_logits_dict, kld_result_dict
+            return {}, prompt_logits_dict, prompt_hidden_dict, kld_result_dict
 
         prompt_logprobs_dict: dict[str, LogprobsTensors | None] = {}
 
@@ -5788,6 +5800,10 @@ class GPUModelRunner(
             is_return_prompt_logits = (
                 sampling_params is not None and sampling_params.return_prompt_logits
             )
+            is_return_prompt_hidden = (
+                sampling_params is not None
+                and sampling_params.return_prompt_hidden_states
+            )
             is_kld_mode = (
                 sampling_params is not None
                 and sampling_params.kld_mode
@@ -5808,17 +5824,23 @@ class GPUModelRunner(
             if num_logits <= 0:
                 if req_id in completed_prefill_reqs:
                     if is_kld_mode:
-                        kld_result_dict[req_id] = (
-                            request.in_progress_kld_sum,
-                            request.in_progress_kld_count,
-                        )
-                        request.in_progress_kld_sum = 0.0
-                        request.in_progress_kld_count = 0
-                    elif is_return_prompt_logits:
+                        chunks = request.in_progress_kld_chunks or []
+                        if chunks:
+                            from vllm.v1.sample.kld import concat_kld_results
+
+                            kld_result_dict[req_id] = concat_kld_results(chunks)
+                        request.in_progress_kld_chunks = None
+                    if is_return_prompt_hidden:
+                        h_chunks = request.in_progress_prompt_hidden
+                        if h_chunks:
+                            prompt_hidden_dict[req_id] = torch.cat(h_chunks, dim=0)
+                        request.in_progress_prompt_hidden = None
+                    if is_return_prompt_logits:
                         chunks = request.in_progress_prompt_logits
                         if chunks:
                             prompt_logits_dict[req_id] = torch.cat(chunks, dim=0)
-                    else:
+                        request.in_progress_prompt_logits = None
+                    elif not is_kld_mode and not is_return_prompt_hidden:
                         prompt_logprobs_dict[req_id] = (
                             request.in_progress_prompt_logprobs_cpu
                         )
@@ -5830,59 +5852,49 @@ class GPUModelRunner(
             logits = self.model.compute_logits(prompt_hidden_states)
 
             if is_kld_mode:
-                from safetensors.torch import safe_open
+                from vllm.v1.sample.kld import (
+                    concat_kld_results,
+                    compute_kld_from_reference,
+                )
 
                 reference_logits_path = request.reference_logits_path
                 reference_logits_key = request.reference_logits_key
                 assert reference_logits_path is not None
                 assert reference_logits_key is not None
-                with safe_open(
+                assert request.kld_vocab_size is not None
+                chunk = compute_kld_from_reference(
+                    self.model,
+                    logits,
                     reference_logits_path,
-                    framework="pt",
-                    device="cpu",
-                ) as f:
-                    ref_logits_slice = f.get_slice(reference_logits_key)
-                    ref_shape = ref_logits_slice.get_shape()
-                    end_idx = start_idx + num_logits
-                    if len(ref_shape) != 2 or ref_shape[0] < end_idx:
-                        raise ValueError(
-                            f"Reference logits {reference_logits_key!r} have shape "
-                            f"{ref_shape}, but at least {end_idx} positions are needed."
-                        )
-                    if ref_shape[1] != logits.shape[-1]:
-                        raise ValueError(
-                            "Reference and model logits must have identical "
-                            f"vocabulary sizes; got {ref_shape[1]} and "
-                            f"{logits.shape[-1]}."
-                        )
-                    ref_logits_cpu = ref_logits_slice[start_idx:end_idx]
-                if not torch.is_floating_point(ref_logits_cpu):
-                    raise ValueError(
-                        f"Reference logits must be floating point, got "
-                        f"{ref_logits_cpu.dtype}."
-                    )
-                ref_logits = ref_logits_cpu.to(self.device)
-                log_probs_model = F.log_softmax(logits.float(), dim=-1)
-                log_probs_ref = F.log_softmax(ref_logits.float(), dim=-1)
-                kld_per_pos = F.kl_div(
-                    log_probs_model,
-                    log_probs_ref,
-                    reduction="none",
-                    log_target=True,
-                ).sum(dim=-1)
-                with gpu_sync_allowed():
-                    kld_sum = kld_per_pos.sum().item()
-                kld_count = kld_per_pos.numel()
-                request.in_progress_kld_sum += kld_sum
-                request.in_progress_kld_count += kld_count
+                    reference_logits_key,
+                    start_idx,
+                    request.kld_vocab_size,
+                    self._kld_lm_head_cache,
+                )
+                if request.in_progress_kld_chunks is None:
+                    request.in_progress_kld_chunks = []
+                request.in_progress_kld_chunks.append(chunk)
                 if req_id in completed_prefill_reqs:
-                    kld_result_dict[req_id] = (
-                        request.in_progress_kld_sum,
-                        request.in_progress_kld_count,
+                    kld_result_dict[req_id] = concat_kld_results(
+                        request.in_progress_kld_chunks
                     )
-                    request.in_progress_kld_sum = 0.0
-                    request.in_progress_kld_count = 0
+                    request.in_progress_kld_chunks = None
                 continue
+
+            # return_prompt_hidden_states: pre-LM-head hidden (positions 0..N-2)
+            if is_return_prompt_hidden:
+                with gpu_sync_allowed():
+                    hidden_cpu = prompt_hidden_states.cpu()
+                if request.in_progress_prompt_hidden is None:
+                    request.in_progress_prompt_hidden = []
+                request.in_progress_prompt_hidden.append(hidden_cpu)
+                if req_id in completed_prefill_reqs:
+                    prompt_hidden_dict[req_id] = torch.cat(
+                        request.in_progress_prompt_hidden, dim=0
+                    )
+                    request.in_progress_prompt_hidden = None
+                if not is_return_prompt_logits:
+                    continue
 
             # return_prompt_logits: return raw logits (positions 0..N-2 predict 1..N-1)
             if is_return_prompt_logits:
@@ -5949,11 +5961,23 @@ class GPUModelRunner(
             del num_prompt_logprobs_dict[req_id]
             self.requests[req_id].in_progress_prompt_logprobs_cpu = None
             self.requests[req_id].in_progress_prompt_logits = None
+            self.requests[req_id].in_progress_prompt_hidden = None
+            self.requests[req_id].in_progress_kld_chunks = None
 
-        if prompt_logprobs_dict or prompt_logits_dict or kld_result_dict:
+        if (
+            prompt_logprobs_dict
+            or prompt_logits_dict
+            or prompt_hidden_dict
+            or kld_result_dict
+        ):
             self._sync_device()
 
-        return prompt_logprobs_dict, prompt_logits_dict, kld_result_dict
+        return (
+            prompt_logprobs_dict,
+            prompt_logits_dict,
+            prompt_hidden_dict,
+            kld_result_dict,
+        )
 
     def _get_nans_in_logits(self, logits: torch.Tensor | None) -> dict[str, int]:
         """Count NaNs per request, reading the result back to the host.

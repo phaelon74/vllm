@@ -36,6 +36,9 @@ class _InputOptions(TypedDict):
     reference_logits_key: NotRequired[str]
     """Safetensors key for KLD mode; copied from TokensPrompt."""
 
+    kld_vocab_size: NotRequired[int]
+    """Unpadded vocab size for KLD softmax truncation."""
+
 
 class TokensInput(_InputOptions):
     """Represents token-based input to the engine."""

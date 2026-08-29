@@ -53,13 +53,15 @@ class CachedRequestState:
     # To accumulate prompt logprobs tensor chunks across prefill steps.
     in_progress_prompt_logprobs_cpu: LogprobsTensors | None = None
 
-    # To accumulate raw prompt logits chunks across prefill steps when
-    # `SamplingParams.return_prompt_logits` is enabled.
-    in_progress_prompt_logits: list[torch.Tensor] | None = None
+    # To accumulate raw prompt-logit chunks when return_prompt_logits.
+    in_progress_prompt_logits: list | None = None
+
+    # To accumulate raw prompt hidden-state chunks (pre-LM-head) when
+    # `SamplingParams.return_prompt_hidden_states` is enabled.
+    in_progress_prompt_hidden: list | None = None
 
     # To accumulate KLD across chunked prefill steps.
-    in_progress_kld_sum: float = 0.0
-    in_progress_kld_count: int = 0
+    in_progress_kld_chunks: list | None = None
 
     # Per-position mask for mixed-mode inputs (e.g chat completion with
     # prompt_embeds content parts). See `Request.prompt_is_token_ids`.
@@ -76,6 +78,7 @@ class CachedRequestState:
     target_token_ids: list[int] | None = None
     reference_logits_path: str | None = None
     reference_logits_key: str | None = None
+    kld_vocab_size: int | None = None
 
     def __post_init__(self):
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(

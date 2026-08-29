@@ -419,6 +419,7 @@ class InputProcessor:
         target_token_ids = decoder_input.get("target_token_ids")
         reference_logits_path = decoder_input.get("reference_logits_path")
         reference_logits_key = decoder_input.get("reference_logits_key")
+        kld_vocab_size = decoder_input.get("kld_vocab_size")
 
         if sampling_params is not None and sampling_params.score_mode:
             if target_token_ids is None:
@@ -441,6 +442,17 @@ class InputProcessor:
                 "kld_mode requires reference_logits_path and "
                 "reference_logits_key in TokensPrompt."
             )
+        if sampling_params is not None and sampling_params.kld_mode:
+            if prompt_token_ids is None:
+                raise VLLMValidationError(
+                    "kld_mode requires prompt_token_ids; prompt embeddings "
+                    "cannot be aligned to reference positions."
+                )
+            if kld_vocab_size is None or kld_vocab_size < 1:
+                raise VLLMValidationError(
+                    "kld_mode requires a positive kld_vocab_size in "
+                    "TokensPrompt so padded vocabulary rows are excluded."
+                )
 
         return EngineCoreRequest(
             request_id=request_id,
@@ -461,6 +473,7 @@ class InputProcessor:
             target_token_ids=target_token_ids,
             reference_logits_path=reference_logits_path,
             reference_logits_key=reference_logits_key,
+            kld_vocab_size=kld_vocab_size,
         )
 
     def _validate_prompt_len(

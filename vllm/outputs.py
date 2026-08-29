@@ -14,6 +14,7 @@ from vllm.logger import init_logger
 from vllm.logprobs import PromptLogprobs, SampleLogprobs
 from vllm.lora.request import LoRARequest
 from vllm.v1.metrics.stats import RequestSpecDecodeMetrics, RequestStateStats
+from vllm.v1.sample.kld import KLDResult
 
 logger = init_logger(__name__)
 
@@ -116,7 +117,9 @@ class RequestOutput:
                           decoder input prompt token ids.
         prompt_logprobs: The log probabilities to return per prompt token.
         prompt_logits: Raw logits for prompt positions when return_prompt_logits.
-        kld_result: (kld_sum, kld_count) when kld_mode.
+        prompt_hidden_states: Hidden states after final RMSNorm when
+            return_prompt_hidden_states.
+        kld_result: Per-position KLDResult when kld_mode.
         outputs: The output sequences of the request.
         finished: Whether the whole request is finished.
         metrics: Metrics associated with the request.
@@ -141,7 +144,8 @@ class RequestOutput:
         outputs: list[CompletionOutput],
         finished: bool,
         prompt_logits: "torch.Tensor | None" = None,
-        kld_result: tuple[float, int] | None = None,
+        prompt_hidden_states: "torch.Tensor | None" = None,
+        kld_result: KLDResult | None = None,
         metrics: RequestStateStats | None = None,
         lora_request: LoRARequest | None = None,
         encoder_prompt: str | None = None,
@@ -164,6 +168,7 @@ class RequestOutput:
         self.prompt_token_ids = prompt_token_ids
         self.prompt_logprobs = prompt_logprobs
         self.prompt_logits = prompt_logits
+        self.prompt_hidden_states = prompt_hidden_states
         self.kld_result = kld_result
         self.outputs = outputs
         self.finished = finished

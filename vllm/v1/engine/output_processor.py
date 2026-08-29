@@ -386,6 +386,7 @@ class RequestState:
             outputs=cast(list[CompletionOutput], outputs),
             finished=finished,
             prompt_logits=self.logprobs_processor.prompt_logits,
+            prompt_hidden_states=self.logprobs_processor.prompt_hidden_states,
             kld_result=self.logprobs_processor.kld_result,
             kv_transfer_params=kv_transfer_params,
             ec_transfer_params=ec_transfer_params,

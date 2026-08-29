@@ -775,6 +775,8 @@ class BaseRenderer(ABC, Generic[_T]):
             engine_input["reference_logits_path"] = reference_logits_path
         if (reference_logits_key := prompt.get("reference_logits_key")) is not None:
             engine_input["reference_logits_key"] = reference_logits_key
+        if (kld_vocab_size := prompt.get("kld_vocab_size")) is not None:
+            engine_input["kld_vocab_size"] = kld_vocab_size
 
     def _process_tokens(
         self,

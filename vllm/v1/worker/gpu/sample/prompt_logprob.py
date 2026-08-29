@@ -26,10 +26,15 @@ class PromptLogprobsWorker:
         # Raw prompt logits and KLD are computed from the same logits as prompt
         # logprobs but bypass the top-k reduction, so they are tracked here too.
         self.uses_prompt_logits = np.zeros(self.max_num_reqs, dtype=bool)
+        self.uses_prompt_hidden = np.zeros(self.max_num_reqs, dtype=bool)
         self.uses_kld = np.zeros(self.max_num_reqs, dtype=bool)
         self.in_progress_prompt_logits: dict[str, list[torch.Tensor]] = {}
-        self.in_progress_kld: dict[str, tuple[float, int]] = {}
-        self.reference_logits: dict[str, tuple[str, str]] = {}
+        self.in_progress_prompt_hidden: dict[str, list[torch.Tensor]] = {}
+        self.in_progress_kld: dict[str, list] = {}
+        self.reference_logits: dict[str, tuple[str, str, int | None]] = {}
+        self.lm_head_cache: dict[
+            str, tuple[torch.nn.Module, torch.nn.Module]
+        ] = {}
 
     def add_request(
         self,
@@ -38,6 +43,7 @@ class PromptLogprobsWorker:
         sampling_params: SamplingParams,
         reference_logits_path: str | None = None,
         reference_logits_key: str | None = None,
+        kld_vocab_size: int | None = None,
     ):
         uses_prompt_logprobs = sampling_params.prompt_logprobs is not None
         self.uses_prompt_logprobs[req_idx] = uses_prompt_logprobs
@@ -51,21 +57,26 @@ class PromptLogprobsWorker:
             and reference_logits_key is not None
         )
         self.uses_prompt_logits[req_idx] = sampling_params.return_prompt_logits
+        self.uses_prompt_hidden[req_idx] = sampling_params.return_prompt_hidden_states
         self.uses_kld[req_idx] = uses_kld
         if sampling_params.return_prompt_logits:
             self.in_progress_prompt_logits[req_id] = []
+        if sampling_params.return_prompt_hidden_states:
+            self.in_progress_prompt_hidden[req_id] = []
         if uses_kld:
             assert reference_logits_path is not None
             assert reference_logits_key is not None
-            self.in_progress_kld[req_id] = (0.0, 0)
+            self.in_progress_kld[req_id] = []
             self.reference_logits[req_id] = (
                 reference_logits_path,
                 reference_logits_key,
+                kld_vocab_size,
             )
 
     def remove_request(self, req_id: str) -> None:
         self.in_progress_prompt_logprobs.pop(req_id, None)
         self.in_progress_prompt_logits.pop(req_id, None)
+        self.in_progress_prompt_hidden.pop(req_id, None)
         self.in_progress_kld.pop(req_id, None)
         self.reference_logits.pop(req_id, None)
 
@@ -179,38 +190,47 @@ class PromptLogprobsWorker:
 
     def compute_prompt_logits(
         self,
+        model: torch.nn.Module,
         logits_fn: Callable[[torch.Tensor], torch.Tensor],
         hidden_states: torch.Tensor,
         input_batch: InputBatch,
         # [max_num_reqs]
         prompt_lens: np.ndarray,
-    ) -> tuple[dict[str, torch.Tensor], dict[str, tuple[float, int]]]:
-        """Raw prompt logits and GPU-side KLD against reference logits.
+    ) -> tuple[
+        dict[str, torch.Tensor],
+        dict[str, torch.Tensor],
+        dict[str, "KLDResult"],
+    ]:
+        """Raw prompt logits, hidden states, and GPU-side KLD.
 
         Position p of the returned logits predicts prompt token p + 1, matching
-        the prompt logprobs convention. Both results accumulate across prefill
+        the prompt logprobs convention. Results accumulate across prefill
         chunks and are emitted only once the prompt is fully processed.
         """
+        from vllm.v1.sample.kld import KLDResult, concat_kld_results
+
         idx_mapping_np = input_batch.idx_mapping_np
         uses_logits = self.uses_prompt_logits[idx_mapping_np]
+        uses_hidden = self.uses_prompt_hidden[idx_mapping_np]
         uses_kld = self.uses_kld[idx_mapping_np]
-        needs_logits = uses_logits | uses_kld
+        needs_logits = uses_logits | uses_hidden | uses_kld
         if not np.any(needs_logits):
-            return {}, {}
+            return {}, {}, {}
 
         prompt_lens = prompt_lens[idx_mapping_np]
         computed_prefill = input_batch.num_computed_prefill_tokens_np
         resumed_after_prompt = prompt_lens < input_batch.prefill_len_np
         needs_logits &= (computed_prefill < prompt_lens) & ~resumed_after_prompt
         if not np.any(needs_logits):
-            return {}, {}
+            return {}, {}, {}
 
         pos_after_step = computed_prefill + input_batch.num_scheduled_tokens
         is_prompt_chunked = pos_after_step < prompt_lens
         query_start_loc_np = input_batch.query_start_loc_np
 
         prompt_logits_dict: dict[str, torch.Tensor] = {}
-        kld_result_dict: dict[str, tuple[float, int]] = {}
+        prompt_hidden_dict: dict[str, torch.Tensor] = {}
+        kld_result_dict: dict[str, KLDResult] = {}
         for i, req_id in enumerate(input_batch.req_ids):
             if not needs_logits[i]:
                 continue
@@ -218,18 +238,54 @@ class PromptLogprobsWorker:
             start_idx = query_start_loc_np[i]
             end_idx = query_start_loc_np[i + 1]
             if not is_prompt_chunked[i]:
-                # The final prompt position predicts the first output token,
-                # which is not part of the prompt.
                 end_idx -= 1
             if start_idx >= end_idx:
+                if not is_prompt_chunked[i]:
+                    if uses_hidden[i]:
+                        chunks_h = self.in_progress_prompt_hidden[req_id]
+                        if chunks_h:
+                            prompt_hidden_dict[req_id] = torch.cat(
+                                chunks_h, dim=0
+                            )
+                        chunks_h.clear()
+                    if uses_kld[i]:
+                        chunks_kld = self.in_progress_kld[req_id]
+                        if chunks_kld:
+                            kld_result_dict[req_id] = concat_kld_results(
+                                chunks_kld
+                            )
+                        chunks_kld.clear()
+                    elif uses_logits[i]:
+                        chunks_logits = self.in_progress_prompt_logits[req_id]
+                        if chunks_logits:
+                            prompt_logits_dict[req_id] = torch.cat(
+                                chunks_logits, dim=0
+                            )
+                        chunks_logits.clear()
                 continue
 
-            logits = logits_fn(hidden_states[start_idx:end_idx])
-            if uses_kld[i]:
-                self._accumulate_kld(req_id, logits, int(computed_prefill[i]))
+            h = hidden_states[start_idx:end_idx]
+            if uses_hidden[i]:
+                chunks_h = self.in_progress_prompt_hidden[req_id]
+                chunks_h.append(h.cpu())
                 if not is_prompt_chunked[i]:
-                    kld_result_dict[req_id] = self.in_progress_kld[req_id]
-                    self.in_progress_kld[req_id] = (0.0, 0)
+                    prompt_hidden_dict[req_id] = torch.cat(chunks_h, dim=0)
+                    chunks_h.clear()
+
+            if uses_kld[i] or uses_logits[i]:
+                logits = logits_fn(h)
+            else:
+                continue
+
+            if uses_kld[i]:
+                self._accumulate_kld(
+                    model, req_id, logits, int(computed_prefill[i])
+                )
+                if not is_prompt_chunked[i]:
+                    kld_result_dict[req_id] = concat_kld_results(
+                        self.in_progress_kld[req_id]
+                    )
+                    self.in_progress_kld[req_id] = []
                 continue
 
             chunks = self.in_progress_prompt_logits[req_id]
@@ -237,45 +293,29 @@ class PromptLogprobsWorker:
             if not is_prompt_chunked[i]:
                 prompt_logits_dict[req_id] = torch.cat(chunks, dim=0)
                 chunks.clear()
-        return prompt_logits_dict, kld_result_dict
+        return prompt_logits_dict, prompt_hidden_dict, kld_result_dict
 
     def _accumulate_kld(
-        self, req_id: str, logits: torch.Tensor, start_pos: int
+        self,
+        model: torch.nn.Module,
+        req_id: str,
+        logits: torch.Tensor,
+        start_pos: int,
     ) -> None:
-        from safetensors.torch import safe_open
+        from vllm.v1.sample.kld import compute_kld_from_reference
 
-        path, key = self.reference_logits[req_id]
-        end_pos = start_pos + logits.shape[0]
-        with safe_open(path, framework="pt", device="cpu") as f:
-            ref_slice = f.get_slice(key)
-            ref_shape = ref_slice.get_shape()
-            if len(ref_shape) != 2 or ref_shape[0] < end_pos:
-                raise ValueError(
-                    f"Reference logits {key!r} have shape {ref_shape}, but at "
-                    f"least {end_pos} positions are needed."
-                )
-            if ref_shape[1] != logits.shape[-1]:
-                raise ValueError(
-                    "Reference and model logits must have identical vocabulary "
-                    f"sizes; got {ref_shape[1]} and {logits.shape[-1]}."
-                )
-            ref_logits_cpu = ref_slice[start_pos:end_pos]
-        if not torch.is_floating_point(ref_logits_cpu):
-            raise ValueError(
-                f"Reference logits must be floating point, got {ref_logits_cpu.dtype}."
-            )
-        ref_logits = ref_logits_cpu.to(logits.device)
-        kld_per_pos = torch.nn.functional.kl_div(
-            torch.log_softmax(logits.float(), dim=-1),
-            torch.log_softmax(ref_logits.float(), dim=-1),
-            reduction="none",
-            log_target=True,
-        ).sum(dim=-1)
-        kld_sum, kld_count = self.in_progress_kld[req_id]
-        self.in_progress_kld[req_id] = (
-            kld_sum + kld_per_pos.sum().item(),
-            kld_count + kld_per_pos.numel(),
+        path, key, kld_vocab_size = self.reference_logits[req_id]
+        assert kld_vocab_size is not None
+        chunk = compute_kld_from_reference(
+            model,
+            logits,
+            path,
+            key,
+            start_pos,
+            kld_vocab_size,
+            self.lm_head_cache,
         )
+        self.in_progress_kld[req_id].append(chunk)
 
 
 @triton.jit

@@ -251,3 +251,30 @@ but that should be demonstrated on an eval rather than argued.
 Without the sort, treat any GLM-5.3-Flash KLD number above roughly 0.007 nats as
 containing an unknown contribution from measurement error, and any number at or
 below it as unmeasured.
+
+## Windowing (correction)
+
+The earlier score-mode example used `--stride 512` with `--context-length 2048`
+and described that as EXL3-compatible. That was wrong. Turbo's
+`exllamav3/eval/model_diff.py` calls `get_test_tokens(..., eval_len, eval_len)`,
+so stride equals length and rows never overlap. Shallow-context removal is a
+prefix discard (`first = n_ctx // 2`) on the llama.cpp-parity PPL path, not a
+sliding window.
+
+The KLD script now defaults to non-overlapping rows (`--rows 100`,
+`--context-length 2048`, stride = length) and `--score-from 0`. Depth buckets
+are always printed. `--stride` remains only to regenerate historical overlapping
+numbers.
+
+## Hidden-state replay (measurement pending)
+
+Teacher hidden states replayed through the teacher LM head are a candidate
+replacement for full-logit storage. The capture path can write both tensors and
+run the replay probe through a reconstructed TP-aware `ParallelLMHead` and the
+loaded model's `compute_logits` / logits-processor path. It requires **bitwise**
+equality with live teacher logits.
+
+That probe has not yet been measured on this stack. Their published replay error
+of ~1.23e-6 fails the zero doctrine if reproduced here. Until the probe prints
+`identical: True`, keep `--storage logits` and treat hidden-state scoring as
+disabled. Do not enable `--storage hidden` or `auto` on a failed probe.
