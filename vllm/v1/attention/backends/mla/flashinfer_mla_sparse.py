@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """FlashInfer sparse MLA attention backend."""
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
@@ -281,6 +282,20 @@ class FlashInferMLASparseTRTLLMMetadataBuilder(FlashInferMLASparseMetadataBuilde
 # Global workspace buffer (lazily initialized)
 _fi_sparse_workspace: torch.Tensor | None = None
 
+# The indexer does not guarantee a stable order for the selected tokens, and
+# when the sequence is shorter than top-k every token is selected, so the row
+# contents are identical run to run while their order is not. Attention does
+# not depend on that order but the kernel accumulates in it, so an unstable
+# order costs a ULP per layer, which compounds into visible logit differences.
+_SORT_TOPK_INDICES = os.environ.get("VLLM_SPARSE_MLA_SORT_TOPK", "0") == "1"
+
+
+def _sort_indices_padding_last(indices: torch.Tensor) -> torch.Tensor:
+    """Sort each row ascending, keeping -1 padding at the end."""
+    sentinel = torch.iinfo(indices.dtype).max
+    ordered = torch.where(indices < 0, sentinel, indices).sort(dim=-1).values
+    return torch.where(ordered == sentinel, -1, ordered)
+
 
 def _get_workspace_buffer(device: torch.device) -> torch.Tensor:
     global _fi_sparse_workspace
@@ -398,6 +413,9 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 NUM_TOPK_TOKENS=topk_indices.shape[1],
                 return_valid_counts=True,
             )
+
+        if _SORT_TOPK_INDICES:
+            topk_indices_physical = _sort_indices_padding_last(topk_indices_physical)
 
         if self._workspace_buffer is None:
             self._workspace_buffer = _get_workspace_buffer(q.device)
