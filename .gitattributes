@@ -1,0 +1,3 @@
+# Shellcheck fails on CRLF; keep shell files LF on Windows checkouts.
+*.sh text eol=lf
+.shellcheckrc text eol=lf
