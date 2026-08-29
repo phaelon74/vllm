@@ -592,3 +592,82 @@ class TestRenderEmbedPrompt:
         assert len(results[0]["prompt_token_ids"]) == len(text_input)
         # Second should be embed prompt
         assert torch.equal(results[1]["prompt_embeds"], tensor_input)
+
+
+class TestScoreKldMetadata:
+    """Rendered EngineInput must keep TokensPrompt score/KLD fields."""
+
+    _SCORE_KLD_FIELDS = (
+        "target_token_ids",
+        "reference_logits_path",
+        "reference_logits_key",
+    )
+
+    def _score_kld_prompt(self, *, target_token_ids: list[int] | None = None):
+        prompt: dict[str, object] = {
+            "prompt_token_ids": [10, 20, 30, 40],
+            "reference_logits_path": "/tmp/ref.safetensors",
+            "reference_logits_key": "logits",
+        }
+        if target_token_ids is not None:
+            prompt["target_token_ids"] = target_token_ids
+        return prompt
+
+    def test_render_cmpl_preserves_score_kld_fields(self):
+        renderer = _build_renderer(MockModelConfig())
+        prompt = self._score_kld_prompt(target_token_ids=[20, 30, 40])
+
+        results = renderer.render_cmpl(
+            _preprocess_prompt(renderer.model_config, prompt),
+            TokenizeParams(max_total_tokens=100),
+        )
+
+        assert len(results) == 1
+        assert results[0]["prompt_token_ids"] == [10, 20, 30, 40]
+        assert results[0]["target_token_ids"] == [20, 30, 40]
+        assert results[0]["reference_logits_path"] == "/tmp/ref.safetensors"
+        assert results[0]["reference_logits_key"] == "logits"
+
+    @pytest.mark.asyncio
+    async def test_render_cmpl_async_preserves_score_kld_fields(self):
+        renderer = _build_renderer(MockModelConfig())
+        prompt = self._score_kld_prompt(target_token_ids=[20, 30, 40])
+
+        results = await renderer.render_cmpl_async(
+            _preprocess_prompt(renderer.model_config, prompt),
+            TokenizeParams(max_total_tokens=100),
+        )
+
+        assert len(results) == 1
+        assert results[0]["prompt_token_ids"] == [10, 20, 30, 40]
+        assert results[0]["target_token_ids"] == [20, 30, 40]
+        assert results[0]["reference_logits_path"] == "/tmp/ref.safetensors"
+        assert results[0]["reference_logits_key"] == "logits"
+
+    def test_render_cmpl_preserves_empty_target_token_ids(self):
+        renderer = _build_renderer(MockModelConfig())
+        prompt = self._score_kld_prompt(target_token_ids=[])
+
+        results = renderer.render_cmpl(
+            _preprocess_prompt(renderer.model_config, prompt),
+            TokenizeParams(max_total_tokens=100),
+        )
+
+        assert len(results) == 1
+        assert results[0]["target_token_ids"] == []
+        assert results[0]["reference_logits_path"] == "/tmp/ref.safetensors"
+        assert results[0]["reference_logits_key"] == "logits"
+
+    def test_render_cmpl_does_not_inject_absent_fields(self):
+        renderer = _build_renderer(MockModelConfig())
+
+        results = renderer.render_cmpl(
+            _preprocess_prompt(
+                renderer.model_config, {"prompt_token_ids": [10, 20, 30]}
+            ),
+            TokenizeParams(max_total_tokens=100),
+        )
+
+        assert len(results) == 1
+        for key in self._SCORE_KLD_FIELDS:
+            assert key not in results[0]

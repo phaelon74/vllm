@@ -1039,7 +1039,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
                 assert self.prompt_logprobs_worker is not None
                 self.prompt_logprobs_worker.add_request(
-                    req_id, req_index, new_req_data.sampling_params
+                    req_id,
+                    req_index,
+                    new_req_data.sampling_params,
+                    new_req_data.reference_logits_path,
+                    new_req_data.reference_logits_key,
                 )
 
         if scheduler_output.scheduled_new_reqs:
@@ -1853,6 +1857,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.num_computed_tokens.gpu,
             self.req_states.prompt_len.np,
         )
+        prompt_logits_dict, kld_result_dict = (
+            self.prompt_logprobs_worker.compute_prompt_logits(
+                self.model.compute_logits,
+                hidden_states,
+                input_batch,
+                self.req_states.prompt_len.np,
+            )
+        )
 
         # Prepare the model runner output.
         model_runner_output = ModelRunnerOutput(
@@ -1862,6 +1874,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
+            prompt_logits_dict=prompt_logits_dict,  # type: ignore[arg-type]
+            kld_result_dict=kld_result_dict,  # type: ignore[arg-type]
         )
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(

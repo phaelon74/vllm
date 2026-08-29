@@ -27,6 +27,15 @@ class _InputOptions(TypedDict):
     cache_salt: NotRequired[str]
     """Optional cache salt to be used for prefix caching."""
 
+    target_token_ids: NotRequired[list[int]]
+    """Target token IDs for score mode; copied from TokensPrompt."""
+
+    reference_logits_path: NotRequired[str]
+    """Safetensors path for KLD mode; copied from TokensPrompt."""
+
+    reference_logits_key: NotRequired[str]
+    """Safetensors key for KLD mode; copied from TokensPrompt."""
+
 
 class TokensInput(_InputOptions):
     """Represents token-based input to the engine."""

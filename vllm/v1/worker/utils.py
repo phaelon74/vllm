@@ -113,6 +113,7 @@ class KVBlockZeroer:
         attn_groups_iter: Iterable["AttentionGroup"],
         kernel_block_sizes: list[int],
         static_forward_context: dict[str, Any],
+        num_blocks: int | None = None,
         runner_only_attn_layers: set[str] | None = None,
     ) -> None:
         """Precompute the absolute-address table for the Triton zeroing kernel.
@@ -140,6 +141,8 @@ class KVBlockZeroer:
 
         if runner_only_attn_layers is None:
             runner_only_attn_layers = set()
+        # Optional for KLD; PR #53906 overlay KVBlockZeroer requires it.
+        _ = num_blocks
         # Overlaid layers (packed layouts) share a base address but may have
         # different page sizes; keep the widest span per address so newly
         # allocated blocks are fully zeroed for every overlaying group.

@@ -763,6 +763,19 @@ class BaseRenderer(ABC, Generic[_T]):
 
         return mm_inputs
 
+    @staticmethod
+    def _copy_score_kld_fields(
+        prompt: TokensPrompt,
+        engine_input: TokensInput | MultiModalInput,
+    ) -> None:
+        """Keep score/KLD TokensPrompt fields on the rendered EngineInput."""
+        if (target_token_ids := prompt.get("target_token_ids")) is not None:
+            engine_input["target_token_ids"] = target_token_ids
+        if (reference_logits_path := prompt.get("reference_logits_path")) is not None:
+            engine_input["reference_logits_path"] = reference_logits_path
+        if (reference_logits_key := prompt.get("reference_logits_key")) is not None:
+            engine_input["reference_logits_key"] = reference_logits_key
+
     def _process_tokens(
         self,
         prompt: TokensPrompt,
@@ -790,6 +803,7 @@ class BaseRenderer(ABC, Generic[_T]):
             engine_input["prompt"] = prompt_text
         if cache_salt := prompt.get("cache_salt"):
             engine_input["cache_salt"] = cache_salt
+        self._copy_score_kld_fields(prompt, engine_input)
         # Narrow the union — `prompt_token_offsets` is only on TokensInput.
         if engine_input["type"] == "token" and (
             (offsets := prompt.get("prompt_token_offsets")) is not None
@@ -852,6 +866,7 @@ class BaseRenderer(ABC, Generic[_T]):
             engine_input["prompt"] = prompt_text
         if cache_salt := prompt.get("cache_salt"):
             engine_input["cache_salt"] = cache_salt
+        self._copy_score_kld_fields(prompt, engine_input)
         # Narrow the union — `prompt_token_offsets` is only on TokensInput.
         if engine_input["type"] == "token" and (
             (offsets := prompt.get("prompt_token_offsets")) is not None

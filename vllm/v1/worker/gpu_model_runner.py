@@ -1201,6 +1201,7 @@ class GPUModelRunner(
             kernel_block_sizes=self._kernel_block_sizes,
             runner_only_attn_layers=self.runner_only_attn_layers,
             static_forward_context=self.compilation_config.static_forward_context,
+            num_blocks=self.kv_cache_config.num_blocks,
         )
 
     def _zero_block_ids(self, block_ids: list[int]) -> None:
@@ -5916,9 +5917,7 @@ class GPUModelRunner(
                 target_token_ids = async_tensor_h2d(
                     request.target_token_ids, device=self.device
                 )
-                tgt_token_ids = target_token_ids[
-                    start_idx : start_idx + num_logits
-                ]
+                tgt_token_ids = target_token_ids[start_idx : start_idx + num_logits]
                 logprobs = self.sampler.compute_logprobs(logits)
                 tgt_token_ids_int64 = tgt_token_ids.to(torch.int64)
                 token_ids, logprobs, ranks, *_ = self.sampler.gather_target_logprobs(

@@ -415,15 +415,10 @@ class InputProcessor:
                     )
                 )
 
-        # Extract target_token_ids from TokensPrompt if present
-        target_token_ids: list[int] | None = None
-        reference_logits_path: str | None = None
-        reference_logits_key: str | None = None
-        if isinstance(prompt, dict) and "prompt_token_ids" in prompt:
-            prompt_dict = prompt
-            target_token_ids = prompt_dict.get("target_token_ids")
-            reference_logits_path = prompt_dict.get("reference_logits_path")
-            reference_logits_key = prompt_dict.get("reference_logits_key")
+        # Score/KLD metadata lives on the rendered decoder EngineInput.
+        target_token_ids = decoder_input.get("target_token_ids")
+        reference_logits_path = decoder_input.get("reference_logits_path")
+        reference_logits_key = decoder_input.get("reference_logits_key")
 
         if sampling_params is not None and sampling_params.score_mode:
             if target_token_ids is None:
@@ -437,12 +432,15 @@ class InputProcessor:
                     f"got {len(target_token_ids)} targets for "
                     f"{len(prompt_token_ids or ())} prompt tokens."
                 )
-        if sampling_params is not None and sampling_params.kld_mode:
-            if not reference_logits_path or not reference_logits_key:
-                raise VLLMValidationError(
-                    "kld_mode requires reference_logits_path and "
-                    "reference_logits_key in TokensPrompt."
-                )
+        if (
+            sampling_params is not None
+            and sampling_params.kld_mode
+            and (not reference_logits_path or not reference_logits_key)
+        ):
+            raise VLLMValidationError(
+                "kld_mode requires reference_logits_path and "
+                "reference_logits_key in TokensPrompt."
+            )
 
         return EngineCoreRequest(
             request_id=request_id,

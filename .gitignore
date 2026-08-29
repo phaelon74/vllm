@@ -254,3 +254,8 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
+
+# Local GLM-5.3 investigation artifacts (regenerable; patches duplicate tree diffs)
+glm53-diag.tar.gz
+sparse_mla_sort_topk.patch
+v2_prompt_logits.patch
