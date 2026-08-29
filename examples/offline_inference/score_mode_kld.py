@@ -780,16 +780,17 @@ def calculate_kld(
         )
     report["storage"] = capture_kind
     if decompose_head:
-        extra = _decompose_head_kld(
-            llm,
-            windows,
-            reference_logits_path,
-            kld_vocab,
-            score_from,
-            context_length,
-            capture_kind,
-            ref_is_directory,
-        )
+        with _phase(timings, "decompose_head"):
+            extra = _decompose_head_kld(
+                llm,
+                windows,
+                reference_logits_path,
+                kld_vocab,
+                score_from,
+                context_length,
+                capture_kind,
+                ref_is_directory,
+            )
         extra["deployed_mean_kld"] = report["mean_kld"]
         extra["head_delta_kld"] = (
             report["mean_kld"] - extra["trunk_mean_kld"]
@@ -1342,6 +1343,7 @@ def main():
             "replay_probe",
             "student_load",
             "score_forward",
+            "decompose_head",
         ):
             if name in timings:
                 print(f"    {name}: {timings[name]:.2f}")
