@@ -93,8 +93,9 @@ self_kld () {
     --language-model-only \
     --max-num-seqs 1 \
     --report-json "$KLD_RUN/${label}-v${runner}-self.json" \
-    --tensor-parallel-size 4 \
-    --gpu-memory-utilization 0.90 \
+    --tensor-parallel-size 1 \
+    --gpu-memory-utilization 0.76 \
+    --kv-cache-memory-gib 8 \
     2>&1 | tee "$KLD_RUN/${label}-v${runner}-self.log"
 }
 
@@ -107,6 +108,19 @@ self_kld /media/fmodels/Qwen/Qwen3.6-35B-A3B  moe-35b-a3b 1
 The script pins `max_model_len` to twice `--context-length` (4096 here) and
 disables prefix caching, and eager execution is the default, so no extra flags
 are needed for determinism.
+
+Size the GPUs to the checkpoint rather than reflexively using every card. The
+commands above assume the 52 GiB BF16 dense checkpoint on one 95 GiB card;
+raise `--tensor-parallel-size` only when the weights do not fit. More
+importantly, do not let vLLM size the KV cache from spare memory. Scoring needs
+only `max_model_len * max_num_seqs` of KV — a few hundred MiB — but it also
+needs a full padded-vocabulary logits row per scored position, which for
+Qwen3.6 is about 1.9 GiB per 2048-token row in FP32 and is invisible to vLLM's
+memory profiler. Left to itself at a high utilization, vLLM claims the card for
+KV cache and the capture then dies with `CUDA out of memory. Tried to allocate
+1.89 GiB`. `--kv-cache-memory-gib 8` pins KV and overrides
+`--gpu-memory-utilization` for that sizing, leaving the rest of the card for
+logits and activations.
 
 LM-head inspection, hidden-capture verification, and the replay probe all use
 `LLM.apply_model`, which sends a local function to the workers. Once tensor
@@ -147,9 +161,19 @@ bash scripts/kld_run_matrix.sh pairs            # BF16 teacher vs FP8 student
 RUNNER=1 bash scripts/kld_run_matrix.sh all     # repeat under V2, if accepted
 ```
 
+`TP_SIZE` and `GPU_UTIL` default to `auto`: the driver reads the checkpoint's
+weight bytes and the visible GPUs' actual capacity, picks the smallest
+tensor-parallel size in 1/2/4/8 whose per-GPU weight share stays under
+`WEIGHT_FRACTION` (0.60) of a card, and sets utilization to cover weights plus
+the pinned KV cache plus `HEADROOM_GIB` (12). On four 95 GiB cards that gives
+TP=1 at 0.76 for the 52 GiB dense BF16 checkpoint and TP=2 at 0.56 for the
+67 GiB MoE. It prints the plan before each run; set `TP_SIZE` or `GPU_UTIL`
+explicitly to override either half.
+
 Knobs are environment variables: `MODEL_ROOT`, `RUNNER`, `ROWS`,
-`CONTEXT_LENGTH`, `SCORE_FROM`, `TP_SIZE`, `GPU_UTIL`, `STORAGE`,
-`MAX_NUM_SEQS`, `SELF_KLD_FP8`, `KEEP_GOING`. `SCORE_FROM=1024` gives the
+`CONTEXT_LENGTH`, `SCORE_FROM`, `TP_SIZE`, `GPU_UTIL`, `KV_CACHE_GIB`,
+`WEIGHT_FRACTION`, `HEADROOM_GIB`, `STORAGE`, `MAX_NUM_SEQS`, `SELF_KLD_FP8`,
+`KEEP_GOING`. `SCORE_FROM=1024` gives the
 deep-context-only view and, because `score_from` is manifest-bound, lands in
 its own capture directory automatically.
 
@@ -445,8 +469,9 @@ VLLM_USE_V2_MODEL_RUNNER=0 \
   --decompose-head \
   --language-model-only \
   --report-json "$KLD_RUN/dense-27b-fp8-rows100.json" \
-  --tensor-parallel-size 4 \
-  --gpu-memory-utilization 0.90
+  --tensor-parallel-size 1 \
+  --gpu-memory-utilization 0.76 \
+  --kv-cache-memory-gib 8
 ```
 
 Repeat with the MoE paths. To reproduce the deep-context-only view, use

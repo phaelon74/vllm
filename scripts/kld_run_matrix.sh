@@ -30,8 +30,11 @@ RUNNER=${RUNNER:-0}
 ROWS=${ROWS:-100}
 CONTEXT_LENGTH=${CONTEXT_LENGTH:-2048}
 SCORE_FROM=${SCORE_FROM:-0}
-TP_SIZE=${TP_SIZE:-4}
-GPU_UTIL=${GPU_UTIL:-0.90}
+TP_SIZE=${TP_SIZE:-auto}
+GPU_UTIL=${GPU_UTIL:-auto}
+KV_CACHE_GIB=${KV_CACHE_GIB:-8}
+WEIGHT_FRACTION=${WEIGHT_FRACTION:-0.60}
+HEADROOM_GIB=${HEADROOM_GIB:-12}
 STORAGE=${STORAGE:-auto}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-1}
 SELF_KLD_FP8=${SELF_KLD_FP8:-0}
@@ -78,6 +81,74 @@ DENSE_BF16="$MODEL_ROOT/Qwen3.6-27B"
 DENSE_FP8="$MODEL_ROOT/Qwen3.6-27B-FP8"
 MOE_BF16="$MODEL_ROOT/Qwen3.6-35B-A3B"
 MOE_FP8="$MODEL_ROOT/Qwen3.6-35B-A3B-FP8"
+
+visible_gpu_count () {
+  if [[ -n ${CUDA_VISIBLE_DEVICES:-} ]]; then
+    awk -F, '{print NF}' <<<"$CUDA_VISIBLE_DEVICES"
+    return 0
+  fi
+  nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l
+}
+
+gpu_total_gib () {
+  local mib
+  mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits \
+    2>/dev/null | head -n1)
+  [[ -n $mib ]] || return 1
+  awk -v m="$mib" 'BEGIN { printf "%.2f", m / 1024 }'
+}
+
+checkpoint_gib () {
+  local path=$1 bytes
+  bytes=$(find "$path" -type f \( -name '*.safetensors' -o -name '*.bin' \) \
+    -printf '%s\n' 2>/dev/null | awk '{s += $1} END {print s + 0}')
+  if [[ ${bytes:-0} -le 0 ]]; then
+    bytes=$(du -sb "$path" 2>/dev/null | cut -f1)
+  fi
+  awk -v b="${bytes:-0}" 'BEGIN { printf "%.2f", b / 1073741824 }'
+}
+
+# Pick the smallest tensor-parallel size whose per-GPU weight share leaves room
+# for activations, then size utilization to weights + pinned KV + headroom.
+# Scoring is memory-hungry in a way vLLM's profiler does not see: every scored
+# position needs a full padded-vocabulary logits row, several GiB per request
+# on these checkpoints, so the KV cache must not be allowed to claim the card.
+plan_gpus () {
+  local weights=0 candidate total ngpu
+  for candidate in "$@"; do
+    weights=$(checkpoint_gib "$candidate" | awk -v a="$weights" \
+      '{print ($1 > a) ? $1 : a}')
+  done
+  if ! total=$(gpu_total_gib); then
+    echo "cannot query GPU memory via nvidia-smi; set TP_SIZE and GPU_UTIL" >&2
+    return 1
+  fi
+  ngpu=$(visible_gpu_count)
+  [[ ${ngpu:-0} -ge 1 ]] || ngpu=1
+
+  read -r PLAN_TP PLAN_UTIL < <(awk \
+    -v w="$weights" -v total="$total" -v ngpu="$ngpu" \
+    -v wf="$WEIGHT_FRACTION" -v kv="$KV_CACHE_GIB" -v head="$HEADROOM_GIB" '
+    BEGIN {
+      budget = total * wf
+      n = split("1 2 4 8", cand, " ")
+      tp = 0
+      for (i = 1; i <= n; i++) {
+        if (cand[i] > ngpu) continue
+        if (w / cand[i] <= budget) { tp = cand[i]; break }
+      }
+      if (tp == 0) tp = ngpu
+      util = (w / tp + kv + head) / total
+      if (util > 0.95) util = 0.95
+      if (util < 0.15) util = 0.15
+      printf "%d %.2f\n", tp, util
+    }')
+
+  PLAN_WEIGHTS=$weights
+  PLAN_TOTAL=$total
+  echo "plan: weights ${weights} GiB, ${ngpu} x ${total} GiB visible" \
+    "-> TP=$PLAN_TP util=$PLAN_UTIL kv=${KV_CACHE_GIB} GiB"
+}
 
 RESULTS="$KLD_RUN/matrix-results.tsv"
 [[ -f $RESULTS ]] || printf 'label\tstatus\tmean_kld\tpositions\treport\n' >"$RESULTS"
@@ -132,7 +203,14 @@ run_kld () {
     fi
   done
 
-  echo "=== $tag"
+  local tp=$TP_SIZE util=$GPU_UTIL
+  if [[ $tp == auto || $util == auto ]]; then
+    plan_gpus "$student" "$teacher" || return 1
+    [[ $tp == auto ]] && tp=$PLAN_TP
+    [[ $util == auto ]] && util=$PLAN_UTIL
+  fi
+
+  echo "=== $tag (TP=$tp util=$util kv=${KV_CACHE_GIB}GiB)"
   VLLM_USE_V2_MODEL_RUNNER="$RUNNER" \
     "$PY" examples/offline_inference/score_mode_kld.py \
     --model "$student" \
@@ -148,8 +226,9 @@ run_kld () {
     --language-model-only \
     --max-num-seqs "$MAX_NUM_SEQS" \
     --report-json "$report" \
-    --tensor-parallel-size "$TP_SIZE" \
-    --gpu-memory-utilization "$GPU_UTIL" \
+    --tensor-parallel-size "$tp" \
+    --gpu-memory-utilization "$util" \
+    --kv-cache-memory-gib "$KV_CACHE_GIB" \
     "$@" 2>&1 | tee "$log"
 
   local rc=${PIPESTATUS[0]}

@@ -1104,6 +1104,16 @@ def main():
         "is excessive for 8B models (~8GB). Use 0.35 or lower.",
     )
     parser.add_argument(
+        "--kv-cache-memory-gib",
+        type=float,
+        default=None,
+        help="Pin KV cache size per GPU in GiB, overriding the "
+        "--gpu-memory-utilization sizing. Scoring needs only "
+        "max_model_len * max_num_seqs of KV but a large per-position logits "
+        "buffer, so letting vLLM claim every spare byte for KV cache is what "
+        "causes OOM on wide-vocabulary models.",
+    )
+    parser.add_argument(
         "--trust-remote-code",
         action="store_true",
         help="Trust remote code when loading model",
@@ -1186,6 +1196,10 @@ def main():
         "max_model_len": args.context_length * 2,
         "max_num_seqs": args.max_num_seqs,
     }
+    if args.kv_cache_memory_gib is not None:
+        llm_kwargs["kv_cache_memory_bytes"] = int(
+            args.kv_cache_memory_gib * 1024**3
+        )
     if args.quantization:
         llm_kwargs["quantization"] = args.quantization
     if args.language_model_only:
