@@ -10,6 +10,12 @@ Use the repo venv. Never use system `python3` or bare `pip`.
 source .venv/bin/activate
 ```
 
+The venv does not have to be repo-local. Both helper scripts resolve the
+interpreter from `KLD_PYTHON`, then `$VIRTUAL_ENV/bin/python`, then
+`./.venv/bin/python`, and print which one they picked; the manual commands
+below assume the venv is active, so substitute `$VIRTUAL_ENV/bin/python` for
+`.venv/bin/python` if yours lives elsewhere.
+
 Execution order: Step 0 and Step 1 below come first and gate everything else.
 The `Phase A`..`Phase 9` sections are the per-behavior regression checklist; a
 non-zero self-KLD in Step 1 invalidates every number they produce, so do not

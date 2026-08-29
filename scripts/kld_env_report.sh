@@ -22,8 +22,25 @@ shift
 mkdir -p "$OUT_DIR/models" || exit 1
 
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-PY="$REPO_ROOT/.venv/bin/python"
-[[ -x $PY ]] || PY=$(command -v python)
+
+# Prefer an explicit override, then the activated venv (which need not live in
+# the repo), then a repo-local .venv, and only then whatever python is on PATH.
+PY=""
+for candidate in \
+  "${KLD_PYTHON:-}" \
+  "${VIRTUAL_ENV:+$VIRTUAL_ENV/bin/python}" \
+  "$REPO_ROOT/.venv/bin/python"; do
+  if [[ -n $candidate && -x $candidate ]]; then
+    PY=$candidate
+    break
+  fi
+done
+[[ -n $PY ]] || PY=$(command -v python)
+if [[ -z $PY ]]; then
+  echo "no python interpreter found; set KLD_PYTHON=/path/to/venv/bin/python" >&2
+  exit 2
+fi
+echo "interpreter: $PY"
 
 log_cmd () {
   local name=$1

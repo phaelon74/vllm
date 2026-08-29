@@ -44,11 +44,35 @@ fi
 mkdir -p "$KLD_RUN" || exit 1
 
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-PY="$REPO_ROOT/.venv/bin/python"
-if [[ ! -x $PY ]]; then
-  echo "no venv interpreter at $PY; activate the repo venv first" >&2
+
+# Resolve a virtualenv interpreter: an explicit override, then the activated
+# venv (which need not live in the repo), then a repo-local .venv. Never fall
+# through to a system interpreter.
+resolve_python () {
+  local candidate
+  for candidate in \
+    "${KLD_PYTHON:-}" \
+    "${VIRTUAL_ENV:+$VIRTUAL_ENV/bin/python}" \
+    "$REPO_ROOT/.venv/bin/python"; do
+    if [[ -n $candidate && -x $candidate ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if ! PY=$(resolve_python); then
+  echo "no virtualenv interpreter found. Activate the venv you installed vLLM" \
+    "into, or set KLD_PYTHON=/path/to/venv/bin/python." >&2
   exit 2
 fi
+
+if ! "$PY" -c 'import vllm' 2>/dev/null; then
+  echo "$PY cannot import vllm; this is not the venv vLLM is installed into" >&2
+  exit 2
+fi
+echo "interpreter: $PY"
 
 DENSE_BF16="$MODEL_ROOT/Qwen3.6-27B"
 DENSE_FP8="$MODEL_ROOT/Qwen3.6-27B-FP8"
