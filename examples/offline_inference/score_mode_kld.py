@@ -492,8 +492,12 @@ def calculate_kld(
             write_json(os.path.join(ref_dir, "manifest.json"), manifest)
             print(f"Saved {len(windows)} reference windows to {ref_dir}/")
         else:
-            print(f"Phase 1 skipped: {len(existing)} windows already in {ref_dir}")
             man_path = os.path.join(ref_dir, "manifest.json")
+            print(
+                f"Phase 1 skipped: reusing {len(existing)} existing capture "
+                f"files in {ref_dir} "
+                f"(manifest.json {'present' if os.path.isfile(man_path) else 'MISSING'})"
+            )
             if os.path.isfile(man_path):
                 capture_kind = read_json(man_path).get("storage", capture_kind)
 

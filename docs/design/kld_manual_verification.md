@@ -150,7 +150,8 @@ real student/teacher pairs on this host, BF16 as `--reference-model` and FP8 as
 
 `scripts/kld_run_matrix.sh` runs the Step 1 baselines and the FP8 comparisons
 with per-run capture directories, logs, and report JSONs named after the runner,
-row count, context length, and `score_from`, and appends one row per run to
+tensor-parallel size, row count, context length, and `score_from` — every knob
+the capture manifest binds itself to — and appends one row per run to
 `$KLD_RUN/matrix-results.tsv`. It re-asserts the zero invariant from the report
 JSON rather than from console text, and aborts on the first failure unless
 `KEEP_GOING=1`.

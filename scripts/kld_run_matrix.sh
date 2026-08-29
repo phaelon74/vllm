@@ -190,15 +190,11 @@ PYEOF
 run_kld () {
   local label=$1 student=$2 teacher=$3 rows=$4 require_zero=$5
   shift 5
-  local tag="${label}-v${RUNNER}-r${rows}-c${CONTEXT_LENGTH}-s${SCORE_FROM}"
-  local capture="$KLD_RUN/$tag"
-  local report="$KLD_RUN/$tag.json"
-  local log="$KLD_RUN/$tag.log"
 
   for path in "$student" "$teacher"; do
     if [[ ! -d $path ]]; then
-      printf '%s\tMISSING_MODEL\t\t\t%s\n' "$tag" "$path" >>"$RESULTS"
-      echo "skipping $tag: no checkpoint at $path" >&2
+      printf '%s\tMISSING_MODEL\t\t\t%s\n' "$label" "$path" >>"$RESULTS"
+      echo "skipping $label: no checkpoint at $path" >&2
       return 1
     fi
   done
@@ -209,6 +205,15 @@ run_kld () {
     [[ $tp == auto ]] && tp=$PLAN_TP
     [[ $util == auto ]] && util=$PLAN_UTIL
   fi
+
+  # Every knob the capture manifest binds itself to belongs in the directory
+  # name, tensor parallelism included: a capture taken at TP=4 is refused by a
+  # TP=1 scoring run, and silently reusing the directory turns that into a
+  # confusing abort instead of a fresh capture.
+  local tag="${label}-v${RUNNER}-tp${tp}-r${rows}-c${CONTEXT_LENGTH}-s${SCORE_FROM}"
+  local capture="$KLD_RUN/$tag"
+  local report="$KLD_RUN/$tag.json"
+  local log="$KLD_RUN/$tag.log"
 
   echo "=== $tag (TP=$tp util=$util kv=${KV_CACHE_GIB}GiB)"
   VLLM_USE_V2_MODEL_RUNNER="$RUNNER" \
@@ -234,28 +239,36 @@ run_kld () {
   local rc=${PIPESTATUS[0]}
   if [[ $rc -ne 0 ]]; then
     printf '%s\tEXIT_%d\t\t\t%s\n' "$tag" "$rc" "$log" >>"$RESULTS"
-    quarantine_capture "$capture"
+    quarantine_capture "$capture" "$log"
     return 1
   fi
   read_report "$tag" "$report" "$require_zero"
 }
 
-# A capture directory without manifest.json is incomplete. Scoring against it
-# fails closed later, but with a misleading error, because Phase 1 skips any
-# directory that already holds window files. Move it aside so a rerun starts
-# clean while the partial output stays available for inspection.
+# Move a capture directory aside so the next run recaptures instead of tripping
+# over it. Two cases need this: an interrupted capture, which has window files
+# but no manifest.json and would make Phase 1 skip and then fail closed with a
+# misleading error; and a complete capture the scoring run rejected, which is
+# manifest-bound to conditions this host no longer reproduces.
 quarantine_capture () {
-  local capture=$1
+  local capture=$1 log=${2:-}
   [[ -d $capture ]] || return 0
-  if [[ -f "$capture/manifest.json" ]]; then
+
+  local reason=""
+  if [[ -n $log && -f $log ]] &&
+    grep -q "Capture manifest does not match" "$log"; then
+    reason="rejected"
+  elif [[ -f "$capture/manifest.json" ]]; then
     return 0
-  fi
-  if [[ -z $(ls -A "$capture" 2>/dev/null) ]]; then
+  elif [[ -z $(ls -A "$capture" 2>/dev/null) ]]; then
     rmdir "$capture" 2>/dev/null
     return 0
+  else
+    reason="incomplete"
   fi
-  local aside="$capture.incomplete-$(date +%H%M%S)"
-  mv "$capture" "$aside" && echo "quarantined incomplete capture: $aside" >&2
+
+  local aside="$capture.$reason-$(date +%H%M%S)"
+  mv "$capture" "$aside" && echo "quarantined $reason capture: $aside" >&2
   return 0
 }
 
