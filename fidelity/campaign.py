@@ -430,11 +430,12 @@ def cmd_assemble(config: Config, python: str) -> int:
 
         env_src = os.path.join(config.work, "environment")
         env_dst = os.path.join(model_root, "environment")
+        # The source is scrubbed first, so a credential captured before the
+        # redaction policy existed stops propagating into later model roots
+        # instead of being cleaned up once per copy.
+        _scrub_environment(env_src)
         if os.path.isdir(env_src) and not os.path.isdir(env_dst):
             shutil.copytree(env_src, env_dst)
-        # Every assemble, not only the first: an artifact assembled from an
-        # environment report captured before the redaction policy existed must
-        # still be safe to publish.
         _scrub_environment(env_dst)
         # Law 12 reads the artifact directory, and each model root is published as
         # a self-contained repo, so the laws ship inside it as well as at the

@@ -152,7 +152,8 @@ a published credential cannot be unpublished.
 **Check.** The artifact contains an environment report whose GPU, driver, torch,
 vLLM, and commit fields are populated, and whose recorded checkpoint hashes match
 those referenced by the reports. Publication additionally scans every text file in
-the artifact for credential shapes and refuses on any hit; that refusal cannot be
+the artifact, refusing on a recognizable credential shape or on a
+credential-named field that still carries a value, and that refusal cannot be
 overridden or skipped.
 
 **Override.** Not permitted.

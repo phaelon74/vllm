@@ -256,12 +256,15 @@ no candidate carries a receipt, or if any candidate is not law-compliant.
 ones in the index. A refusal is reflected in the exit status even when other
 models publish, so automation cannot mistake a partial publish for a clean one.
 
-Every text file in the artifact is also scanned for credential shapes — Hugging
-Face, GitHub, and OpenAI-style tokens, AWS keys, private key blocks — and any hit
-refuses the model and the upload. That refusal is not skippable, because a
-published credential cannot be unpublished. Assembly redacts credential values
-out of `environment/runtime.json` on every run, so an artifact captured before
-this policy existed becomes safe the next time it is assembled.
+Every text file in the artifact is also scanned two ways: for recognizable
+credential shapes — Hugging Face, GitHub, and OpenAI-style tokens, AWS keys,
+private key blocks — and, in JSON, for any field whose *name* looks like a
+credential and still carries a value, which catches a secret that resembles
+nothing in particular. Either kind of hit refuses the model and the upload, and
+that refusal is not skippable, because a published credential cannot be
+unpublished. Assembly redacts credential values out of `environment/runtime.json`
+on every run — in the work directory as well as the library copy — so an artifact
+captured before this policy existed becomes safe the next time it is assembled.
 
 ## Overriding a law
 

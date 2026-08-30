@@ -15,6 +15,7 @@ drift apart and leave a gap between them. The module is not named ``secrets`` so
 it cannot shadow the standard library module of that name.
 """
 
+import json
 import os
 import re
 from typing import Any
@@ -81,6 +82,27 @@ def find_secret_values(text: str) -> list[str]:
     return sorted({label for label, rx in SECRET_VALUE_PATTERNS if rx.search(text)})
 
 
+def find_secret_fields(data: Any, path: str = "") -> list[str]:
+    """Paths of credential-named JSON fields still carrying a value.
+
+    Shape matching only catches credentials that look like the issuers we know.
+    A field named like a secret holding anything other than the redaction marker
+    is reported whatever its value looks like.
+    """
+    found: list[str] = []
+    if isinstance(data, dict):
+        for key, value in data.items():
+            here = f"{path}.{key}" if path else str(key)
+            named = isinstance(key, str) and is_secret_name(key)
+            if named and isinstance(value, str) and value and value != REDACTED:
+                found.append(here)
+            found += find_secret_fields(value, here)
+    elif isinstance(data, list):
+        for index, value in enumerate(data):
+            found += find_secret_fields(value, f"{path}[{index}]")
+    return found
+
+
 def scan_tree(root: str, max_bytes: int = 8 << 20) -> list[tuple[str, str]]:
     """Every ``(relative path, credential kind)`` found in a tree's text files.
 
@@ -103,4 +125,13 @@ def scan_tree(root: str, max_bytes: int = 8 << 20) -> list[tuple[str, str]]:
                 continue
             rel = os.path.relpath(full, root).replace(os.sep, "/")
             findings += [(rel, kind) for kind in find_secret_values(text)]
+            if name.lower().endswith(".json"):
+                try:
+                    data = json.loads(text)
+                except ValueError:
+                    continue
+                findings += [
+                    (rel, f"credential-named field {field}")
+                    for field in find_secret_fields(data)
+                ]
     return findings
