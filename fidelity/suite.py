@@ -164,14 +164,32 @@ def _field(record: Any, dotted: str | None) -> Any:
     return value
 
 
-def _text_field(record: dict[str, Any], dotted: str | None) -> str | None:
-    value = _field(record, dotted)
+def _field_any(record: Any, spec: str | list[str] | None) -> Any:
+    """Read the first field present out of one name or a list of alternatives.
+
+    Datasets in one lineage carry the same content under different column names -
+    ``content`` here, ``text`` there, ``max_stars_repo_path`` versus ``path`` - and
+    a gated repository cannot be inspected before a build. Listing the
+    alternatives keeps a rename from being a build failure. The first present name
+    wins, so the choice is deterministic for a given corpus.
+    """
+    if spec is None or isinstance(spec, str):
+        return _field(record, spec)
+    for name in spec:
+        value = _field(record, name)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _text_field(record: dict[str, Any], spec: str | list[str] | None) -> str | None:
+    value = _field_any(record, spec)
     return str(value) if value not in (None, "") else None
 
 
 def extract(record: dict[str, Any], source: dict[str, Any]) -> str:
     extractor = source.get("extractor", "plain")
-    raw = _field(record, source["text_field"])
+    raw = _field_any(record, source["text_field"])
     if extractor == "conversation":
         return _render_conversation(raw)
     return raw if isinstance(raw, str) else ""
@@ -271,7 +289,7 @@ def harvest(
             continue
         if len(_WHITESPACE.sub("", text)) < min_chars // 2:
             continue
-        cluster = _field(record, source.get("cluster_field"))
+        cluster = _field_any(record, source.get("cluster_field"))
         cluster_id = str(cluster) if cluster not in (None, "") else _sha256_text(text)
         if cluster_id in seen_clusters:
             continue
@@ -1157,9 +1175,10 @@ def probe(recipe_path: str, fixture_dir: str | None, rows: int) -> int:
         if result["scanned"] == 0:
             problems.append(f"{source['key']}: yielded no records")
         elif result["with_text"] == 0:
+            names = source["text_field"]
+            names = names if isinstance(names, str) else " or ".join(names)
             problems.append(
-                f"{source['key']}: no record carried text field "
-                f"'{source['text_field']}'"
+                f"{source['key']}: no record carried text field {names}"
             )
         elif result["eligible"] == 0:
             problems.append(
@@ -1293,9 +1312,14 @@ def _benchmark_probe(name: str, index: int) -> str:
     )
 
 
-def _set_field(record: dict[str, Any], dotted: str, value: Any) -> None:
+def _primary(spec: str | list[str]) -> str:
+    """The field name a fixture writes when a source lists alternatives."""
+    return spec if isinstance(spec, str) else spec[0]
+
+
+def _set_field(record: dict[str, Any], spec: str | list[str], value: Any) -> None:
     """Write a possibly nested field, mirroring :func:`_field`."""
-    parts = dotted.split(".")
+    parts = _primary(spec).split(".")
     target = record
     for part in parts[:-1]:
         target = target.setdefault(part, {})
@@ -1342,7 +1366,7 @@ def _fixture_corpus(root: str, recipe: dict[str, Any]) -> None:
                 suffix = suffixes[i % len(suffixes)] if i % 2 == 0 else ".py"
                 _set_field(record, source["path_field"], f"pkg/file{i}{suffix}")
             cluster_field = source.get("cluster_field")
-            if cluster_field and _field(record, cluster_field) in (None, ""):
+            if cluster_field and _field_any(record, cluster_field) in (None, ""):
                 # One repository is shared by every source in the github_repo
                 # namespace, so the cross-source unit dedup has a real collision
                 # to reject.
@@ -1361,9 +1385,8 @@ def _fixture_corpus(root: str, recipe: dict[str, Any]) -> None:
             near = dict(records[1])
             near["id"] = f"{source['key']}-near"
             if source.get("extractor") != "conversation":
-                near[source["text_field"]] = (
-                    str(near[source["text_field"]]) + " tailword"
-                )
+                text_key = _primary(source["text_field"])
+                near[text_key] = str(near[text_key]) + " tailword"
             records.append(near)
         # A planted leak: one document that verbatim contains a benchmark item,
         # so the scan is proven to detect contamination rather than merely run.
@@ -1396,6 +1419,27 @@ def _fixture_corpus(root: str, recipe: dict[str, Any]) -> None:
                     else:
                         record[name] = _benchmark_probe(spec["name"], i)
                 handle.write(json.dumps(record) + "\n")
+
+
+def _field_alias_failures() -> list[str]:
+    """Field addressing: nesting, alternatives, and their precedence."""
+    cases = [
+        ({"metadata": {"path": "a/b.json"}}, "metadata.path", "a/b.json"),
+        ({"text": "second"}, ["content", "text"], "second"),
+        ({"content": "first", "text": "second"}, ["content", "text"], "first"),
+        ({"content": "", "text": "second"}, ["content", "text"], "second"),
+        ({"other": 1}, ["content", "text"], None),
+        ({"metadata": "not a dict"}, "metadata.repo_name", None),
+    ]
+    failures = []
+    for record, spec, expected in cases:
+        actual = _field_any(record, spec)
+        if actual != expected:
+            failures.append(
+                f"field {spec} of {record} resolved to {actual!r}, "
+                f"expected {expected!r}"
+            )
+    return failures
 
 
 def _scan_equivalence_failures() -> list[str]:
@@ -1521,7 +1565,7 @@ def selftest() -> int:
         ) as fh:
             overlap = json.load(fh)
 
-        failures = _scan_equivalence_failures()
+        failures = _field_alias_failures() + _scan_equivalence_failures()
         if manifest["context_count"] != recipe["contexts"]:
             failures.append(
                 f"context count {manifest['context_count']} != "

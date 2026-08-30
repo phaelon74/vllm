@@ -19,7 +19,7 @@
     "reference": "https://github.com/local-inference-lab/rtx6kpro/blob/master/models/kimi-k3/distribution-fidelity-1024x2048.md",
     "deviations": [
       "codeparrot/github-code is read from its parquet shards rather than through its loader script, which datasets 3 refuses to execute. The bytes and the pinned revision are unchanged.",
-      "The structured-data stratum draws from common-pile/stackv2_edu_filtered filtered on per-file extension, not from codeparrot/github-code. github-code carries no .json, .yaml, .toml, .csv, or .xml files at all: its language table maps only to source-code extensions, so that stratum could never have been filled from it.",
+      "The structured-data stratum draws from the JSON, YAML, SQL, and protocol-buffer subsets of bigcode/starcoderdata rather than from codeparrot/github-code. github-code carries no structured-data files: its language table maps only to source-code extensions. common-pile/stackv2_edu_filtered, the other code source, turned out to be a documentation corpus - over 97 percent of its records are Markdown - so neither existing source could fill this stratum.",
       "GPQA-Diamond is pinned to Idavidrein/gpqa revision 633f5ee89ab8ad4522a9f850766b73f62147ffdd. The revision named in the reference belongs to an unnamed mirror and does not exist in the canonical repository."
     ]
   },
@@ -129,6 +129,7 @@
       "cluster_field": "metadata.repo_name",
       "path_field": "metadata.path",
       "cluster_namespace": "github_repo",
+      "content_note": "In practice this is repository documentation rather than source code: over 97 percent of the records streamed are Markdown. It supplies the technical-documentation half of the code stratum, and codeparrot/github-code supplies the source code.",
       "upstream_dataset_fingerprint": "17d0fa5bf48c67d6df705f1303ca740c14688e24f916708fe4227091e70acb64"
     },
     {
@@ -140,47 +141,59 @@
       "scan_limit": 200000,
       "license": "per-record open-source license",
       "extractor": "plain",
-      "text_field": "code",
+      "text_field": "content",
       "cluster_field": "repo_name",
       "path_field": "path",
       "cluster_namespace": "github_repo",
       "loader": "parquet",
       "data_files_template": "hf://datasets/codeparrot/github-code@{revision}/data/train-{index:05d}-of-01126.parquet",
       "data_files_shards": 64,
-      "loader_note": "The repository is reachable only through github-code.py, which datasets 3 refuses to execute. That script reads data/train-*.parquet and declares code, repo_name, path, language, license, size, so naming the shards directly reads identical bytes at the same pinned revision. 64 of 1126 shards are listed because scan_limit halts the stream far earlier.",
+      "loader_note": "The repository is reachable only through github-code.py, which datasets 3 refuses to execute. That script reads data/train-*.parquet, so naming the shards directly reads identical bytes at the same pinned revision. The stored columns are content, path, repo_name, license, size; the script renamed content to code and derived language from the path extension, neither of which this builder needs. 64 of 1126 shards are listed because scan_limit halts the stream far earlier.",
       "upstream_dataset_fingerprint": "4606a8b294eec8476bbeee4833a6bfa70e396d588fdb039bcc11852f03f3f6de"
     },
     {
-      "key": "stackv2_structured",
-      "dataset": "common-pile/stackv2_edu_filtered",
+      "key": "starcoder_structured",
+      "dataset": "bigcode/starcoderdata",
       "config": null,
-      "revision": "c354dbe88469a1153e97c6a63ac50591849654de",
+      "revision": "9fc30b578cedaec69e47302df72cf00feed7c8c4",
       "split": "train",
-      "scan_limit": 400000,
-      "license": "per-record metadata",
+      "scan_limit": 100000,
+      "license": "per-record permissive, under The Stack terms of use",
       "extractor": "plain",
-      "text_field": "text",
-      "cluster_field": "metadata.repo_name",
-      "path_field": "metadata.path",
+      "text_field": ["content", "text"],
+      "cluster_field": ["max_stars_repo_name", "repo_name"],
+      "path_field": ["max_stars_repo_path", "path"],
       "cluster_namespace": "github_repo",
       "min_chars": 2000,
       "oversample": 3,
-      "oversample_note": "Structured files are a small fraction of the stream, so every retained candidate costs many records read. Three times the allocation is enough headroom for dedup and leakage rejections without streaming the corpus twice over.",
+      "loader": "parquet",
+      "loader_note": "Only the JSON, YAML, SQL, and protocol-buffer subsets are named, so the stream carries structured data by construction rather than by filtering a general corpus. The repository has no loader script; its shards are read directly at a pinned revision.",
+      "data_files": [
+        "hf://datasets/bigcode/starcoderdata@{revision}/json/train-00000-of-00006.parquet",
+        "hf://datasets/bigcode/starcoderdata@{revision}/json/train-00001-of-00006.parquet",
+        "hf://datasets/bigcode/starcoderdata@{revision}/json/train-00002-of-00006.parquet",
+        "hf://datasets/bigcode/starcoderdata@{revision}/json/train-00003-of-00006.parquet",
+        "hf://datasets/bigcode/starcoderdata@{revision}/json/train-00004-of-00006.parquet",
+        "hf://datasets/bigcode/starcoderdata@{revision}/json/train-00005-of-00006.parquet",
+        "hf://datasets/bigcode/starcoderdata@{revision}/yaml/train-00000-of-00004.parquet",
+        "hf://datasets/bigcode/starcoderdata@{revision}/yaml/train-00001-of-00004.parquet",
+        "hf://datasets/bigcode/starcoderdata@{revision}/yaml/train-00002-of-00004.parquet",
+        "hf://datasets/bigcode/starcoderdata@{revision}/yaml/train-00003-of-00004.parquet",
+        "hf://datasets/bigcode/starcoderdata@{revision}/sql/train-00000-of-00011.parquet",
+        "hf://datasets/bigcode/starcoderdata@{revision}/sql/train-00001-of-00011.parquet",
+        "hf://datasets/bigcode/starcoderdata@{revision}/sql/train-00002-of-00011.parquet",
+        "hf://datasets/bigcode/starcoderdata@{revision}/sql/train-00003-of-00011.parquet",
+        "hf://datasets/bigcode/starcoderdata@{revision}/protocol-buffer/train-00000-of-00001.parquet"
+      ],
       "path_suffix_any": [
         ".json",
         ".jsonl",
         ".yaml",
         ".yml",
-        ".toml",
-        ".csv",
-        ".tsv",
-        ".xml",
         ".sql",
-        ".proto",
-        ".graphql",
-        ".ipynb"
+        ".proto"
       ],
-      "upstream_dataset_fingerprint": "17d0fa5bf48c67d6df705f1303ca740c14688e24f916708fe4227091e70acb64"
+      "upstream_dataset_fingerprint": null
     },
     {
       "key": "libretexts",
@@ -377,20 +390,14 @@
       "key": "structured_data_tools",
       "label": "Structured data, tool calls, APIs, JSON, and tables",
       "contexts": 48,
-      "sources": ["stackv2_structured"],
+      "sources": ["starcoder_structured"],
       "path_suffix_any": [
         ".json",
         ".jsonl",
         ".yaml",
         ".yml",
-        ".toml",
-        ".csv",
-        ".tsv",
-        ".xml",
         ".sql",
-        ".proto",
-        ".graphql",
-        ".ipynb"
+        ".proto"
       ]
     }
   ],

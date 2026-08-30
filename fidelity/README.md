@@ -57,7 +57,12 @@ columns each one actually has and how many records survive its filters. Harvesti
 costs minutes per source, so a renamed column, a revoked revision, or a gated
 repository needs to surface in the first minute rather than after the expensive
 work. Sources that only exposed a loader script, which current `datasets` refuses
-to execute, name their data files directly at the same pinned revision.
+to execute, name their data files directly at the same pinned revision, and a
+source may list alternative column names when one lineage renames a field.
+
+Two sources are gated and need their terms accepted once, on the Hub, under the
+same account as `HF_TOKEN`: `bigcode/starcoderdata` and `Idavidrein/gpqa`. `probe`
+reports either as unreachable until then.
 
 Harvested pools are cached under `<out>-cache`, keyed by everything that can
 change a pool: the source definition, the tokenizer identity, the context length,
