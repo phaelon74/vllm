@@ -873,6 +873,9 @@ def write_suite(
                     "file": f"tokens/{name}",
                     "stratum": stratum["key"],
                     "source_key": doc.source_key,
+                    "source_namespace": (
+                        source.get("cluster_namespace") or source["key"]
+                    ),
                     "source_cluster_id": doc.cluster_id,
                     "token_count": len(doc.tokens),
                     "scored_positions": len(doc.tokens) - 1,
@@ -889,6 +892,9 @@ def write_suite(
                     "dataset_config": source.get("config"),
                     "dataset_split": source.get("split"),
                     "license": source.get("license"),
+                    "source_namespace": (
+                        source.get("cluster_namespace") or source["key"]
+                    ),
                     "source_cluster_id": doc.cluster_id,
                     "title": doc.title,
                     "path": doc.path,
@@ -939,7 +945,16 @@ def write_suite(
             "analysis": partition_hash(partitions["analysis"]),
             "qualification": partition_hash(partitions["qualification"]),
         },
-        "source_cluster_count": len({c["source_cluster_id"] for c in contexts}),
+        "source_cluster_count": len(
+            {(c["source_namespace"], c["source_cluster_id"]) for c in contexts}
+        ),
+        "source_cluster_identity": (
+            "a source unit is the pair (source_namespace, source_cluster_id). The "
+            "namespace matters because identifier spaces are per-source: article "
+            "id 12 in the German Wikipedia is a different article from id 12 in "
+            "the English one, while a repository name means the same repository in "
+            "every source that indexes GitHub"
+        ),
         "strata": [
             {
                 "key": s["key"],
@@ -1251,6 +1266,24 @@ def verify(suite_dir: str) -> int:
 
     if sha256_tokens(flat) != manifest["token_sha256"]:
         problems.append("suite token hash mismatch")
+
+    units = [
+        (entry.get("source_namespace") or entry["source_key"],
+         entry["source_cluster_id"])
+        for entry in manifest["contexts"]
+    ]
+    if len(set(units)) != len(units):
+        repeated = len(units) - len(set(units))
+        problems.append(
+            f"{repeated} context(s) come from a source unit that already "
+            f"contributed one"
+        )
+    recorded = manifest.get("source_cluster_count")
+    if recorded is not None and recorded != len(set(units)):
+        problems.append(
+            f"source_cluster_count says {recorded} but the contexts hold "
+            f"{len(set(units))} distinct units"
+        )
 
     partitions_path = os.path.join(suite_dir, "partitions.json")
     if os.path.isfile(partitions_path):
@@ -1574,9 +1607,14 @@ def selftest() -> int:
         hashes = [c["token_sha256"] for c in manifest["contexts"]]
         if len(set(hashes)) != len(hashes):
             failures.append("duplicate contexts survived dedup")
-        clusters = [c["source_cluster_id"] for c in manifest["contexts"]]
-        if len(set(clusters)) != len(clusters):
-            failures.append("a source cluster contributed more than one context")
+        units = [
+            (c["source_namespace"], c["source_cluster_id"])
+            for c in manifest["contexts"]
+        ]
+        if len(set(units)) != len(units):
+            failures.append("a source unit contributed more than one context")
+        if manifest["source_cluster_count"] != len(set(units)):
+            failures.append("source_cluster_count disagrees with the contexts")
         total = len(partitions["analysis"]) + len(partitions["qualification"])
         if total != manifest["context_count"]:
             failures.append(f"partitions cover {total} of {manifest['context_count']}")
