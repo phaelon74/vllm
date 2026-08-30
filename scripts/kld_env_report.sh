@@ -89,7 +89,8 @@ log_cmd pip-freeze "$PY" -m pip freeze
 KLD_REPO_COMMIT=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null)
 KLD_REPO_DIRTY=0
 [[ -n $(git -C "$REPO_ROOT" status --porcelain 2>/dev/null) ]] && KLD_REPO_DIRTY=1
-export KLD_REPO_COMMIT KLD_REPO_DIRTY
+KLD_REPO_ROOT=$REPO_ROOT
+export KLD_REPO_COMMIT KLD_REPO_DIRTY KLD_REPO_ROOT
 "$PY" - >"$OUT_DIR/runtime.json" 2>"$OUT_DIR/runtime.err" <<'PYEOF'
 import json
 import os
@@ -101,6 +102,32 @@ PREFIXES = (
     "FLASHINFER", "OMP_", "MKL_", "HF_", "SAFETENSORS_",
 )
 
+# The watched prefixes are deliberately broad, and HF_TOKEN shares a namespace
+# with HF_HOME. A credential's value is never written to the report; that it was
+# set is, because an unset token changes what a run can reach.
+sys.path.insert(0, os.environ.get("KLD_REPO_ROOT") or os.getcwd())
+try:
+    from fidelity.redaction import redact_env
+except ImportError:
+    MARKERS = ("TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "COOKIE",
+               "SESSION", "AUTH", "API_KEY", "APIKEY", "ACCESS_KEY",
+               "PRIVATE_KEY", "SSH_KEY", "_KEY")
+
+    def redact_env(env):
+        clean = {}
+        hidden = []
+        for name, value in env.items():
+            if any(marker in name.upper() for marker in MARKERS):
+                clean[name] = "<redacted>"
+                hidden.append(name)
+            else:
+                clean[name] = value
+        return clean, sorted(hidden)
+
+captured_env, redacted_names = redact_env(
+    {k: v for k, v in sorted(os.environ.items()) if k.startswith(PREFIXES)}
+)
+
 info = {
     "python": platform.python_version(),
     "executable": sys.executable,
@@ -108,7 +135,12 @@ info = {
     "hostname": platform.node(),
     "vllm_commit": os.environ.get("KLD_REPO_COMMIT") or None,
     "vllm_tree_dirty": os.environ.get("KLD_REPO_DIRTY") == "1",
-    "env": {k: v for k, v in sorted(os.environ.items()) if k.startswith(PREFIXES)},
+    "env": captured_env,
+    "env_redacted": redacted_names,
+    "env_redaction_policy": (
+        "Values of variables whose names look like credentials are never "
+        "recorded. The names are, so a reader can see what was set."
+    ),
 }
 
 try:

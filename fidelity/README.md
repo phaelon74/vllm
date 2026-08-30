@@ -19,6 +19,7 @@ cannot publish a non-compliant result.
 | `compliance.py` | Fail-closed law evaluation; emits the compliance receipt |
 | `artifact.py` | Renders the one-pager, the leaderboard, and `checksums.txt` |
 | `publish.py` | Uploads to the Hub; refuses anything non-compliant or tampered |
+| `redaction.py` | The one secret policy shared by capture, rendering, and publish |
 | `campaigns/*.json` | Campaign definitions: suite, geometry, models, candidates |
 
 Scoring itself lives in `examples/offline_inference/score_mode_kld.py`, driven by
@@ -254,6 +255,13 @@ no candidate carries a receipt, or if any candidate is not law-compliant.
 `--skip-noncompliant` publishes the compliant candidates and records the withheld
 ones in the index. A refusal is reflected in the exit status even when other
 models publish, so automation cannot mistake a partial publish for a clean one.
+
+Every text file in the artifact is also scanned for credential shapes — Hugging
+Face, GitHub, and OpenAI-style tokens, AWS keys, private key blocks — and any hit
+refuses the model and the upload. That refusal is not skippable, because a
+published credential cannot be unpublished. Assembly redacts credential values
+out of `environment/runtime.json` on every run, so an artifact captured before
+this policy existed becomes safe the next time it is assembled.
 
 ## Overriding a law
 

@@ -20,6 +20,9 @@ import os
 import sys
 from typing import Any
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from redaction import redact_env  # noqa: E402 - sibling module
+
 LAWS_VERSION = 1
 PROGRAM = "Local Inference Lab"
 
@@ -222,6 +225,9 @@ def _environment(runtime_env: dict[str, Any], env_dir: str | None) -> list[str]:
 
     env_vars = runtime_env.get("env") or {}
     if env_vars:
+        # Redacted again at render time, not only at capture time: an artifact
+        # assembled from an older environment report must still be safe to publish.
+        safe, hidden = redact_env(env_vars)
         out += [
             "### Captured environment variables",
             "",
@@ -231,8 +237,14 @@ def _environment(runtime_env: dict[str, Any], env_dir: str | None) -> list[str]:
             "move a bitwise result, so they are part of the identity.",
             "",
         ]
+        if hidden:
+            out += [
+                f"Credential values are never published. Set but redacted: "
+                f"{', '.join('`' + name + '`' for name in hidden)}.",
+                "",
+            ]
         out += _table(
-            [(f"`{k}`", f"`{v}`") for k, v in sorted(env_vars.items())],
+            [(f"`{k}`", f"`{v}`") for k, v in sorted(safe.items())],
             ("Variable", "Value"),
         )
         out.append("")

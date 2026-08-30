@@ -31,6 +31,9 @@ import sys
 import tempfile
 from typing import Any
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from redaction import scan_tree  # noqa: E402 - sibling module
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_INDEX = "distribution-fidelity-index"
 
@@ -118,6 +121,17 @@ def gate(
     hard_stop: list[str] = []
     for root in model_roots(library):
         model = os.path.basename(root)
+        leaked = scan_tree(root)
+        if leaked:
+            # Never overridable and never skippable. A published credential cannot
+            # be unpublished, so this refuses before anything is staged.
+            listing = ", ".join(f"{rel} ({kind})" for rel, kind in leaked[:5])
+            hard_stop.append(
+                f"{model}: credential material in {len(leaked)} place(s): "
+                f"{listing}. Remove it and rotate the credential; publication "
+                f"cannot be forced past this."
+            )
+            continue
         problems = verify_checksums(root)
         if problems:
             hard_stop.append(
@@ -210,6 +224,13 @@ def build_index(library: str, plans: list[dict[str, Any]], namespace: str) -> st
 
 def upload(local: str, repo_id: str, private: bool, message: str) -> None:
     """Create the dataset repo if needed and upload a folder to it."""
+    leaked = scan_tree(local)
+    if leaked:
+        listing = ", ".join(f"{rel} ({kind})" for rel, kind in leaked[:5])
+        raise SystemExit(
+            f"refusing to upload {repo_id}: credential material in "
+            f"{len(leaked)} place(s): {listing}"
+        )
     try:
         from huggingface_hub import HfApi
     except ImportError as exc:

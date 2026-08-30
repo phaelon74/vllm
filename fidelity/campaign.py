@@ -28,6 +28,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from redaction import redact_env  # noqa: E402 - sibling module
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
 SCORER = os.path.join(REPO_ROOT, "examples", "offline_inference", "score_mode_kld.py")
@@ -393,6 +396,32 @@ def _copy_reference(capture: str, dest: str) -> None:
             shutil.copy2(src, dst)
 
 
+def _scrub_environment(env_dir: str) -> None:
+    """Strip credential values out of an assembled environment report."""
+    path = os.path.join(env_dir, "runtime.json")
+    if not os.path.isfile(path):
+        return
+    with open(path, encoding="utf-8") as handle:
+        runtime = json.load(handle)
+    safe, hidden = redact_env(runtime.get("env") or {})
+    if not hidden:
+        return
+    known = set(runtime.get("env_redacted") or [])
+    runtime["env"] = safe
+    runtime["env_redacted"] = sorted(known | set(hidden))
+    runtime["env_redaction_policy"] = (
+        "Values of variables whose names look like credentials are never "
+        "recorded. The names are, so a reader can see what was set."
+    )
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(runtime, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    print(
+        f"redacted {len(hidden)} credential value(s) in {path}: "
+        f"{', '.join(hidden)}"
+    )
+
+
 def cmd_assemble(config: Config, python: str) -> int:
     """Build the library tree, then checksums, then receipts, then documents."""
     for model in config.models:
@@ -403,6 +432,10 @@ def cmd_assemble(config: Config, python: str) -> int:
         env_dst = os.path.join(model_root, "environment")
         if os.path.isdir(env_src) and not os.path.isdir(env_dst):
             shutil.copytree(env_src, env_dst)
+        # Every assemble, not only the first: an artifact assembled from an
+        # environment report captured before the redaction policy existed must
+        # still be safe to publish.
+        _scrub_environment(env_dst)
         # Law 12 reads the artifact directory, and each model root is published as
         # a self-contained repo, so the laws ship inside it as well as at the
         # library root. Both copies land before checksums.txt is written.
