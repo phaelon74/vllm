@@ -3,23 +3,27 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Mint a frozen token-ID evaluation suite for distribution-fidelity work.
 
-Replicates the Kimi K3 distribution-fidelity recipe — the same eighteen sources
-at the same pinned revisions, the same ten allocation strata and counts, the same
-dedup, leakage scan, and analysis/qualification split — but emits token IDs for
-the tokenizer you name. Token IDs are not portable across tokenizers, so a suite
-must be minted per tokenizer family; the methodology is what transfers.
+Replicates the Kimi K3 distribution-fidelity recipe — the same sources at the same
+pinned revisions, the same ten allocation strata and counts, the same dedup,
+leakage scan, and analysis/qualification split — but emits token IDs for the
+tokenizer you name. Token IDs are not portable across tokenizers, so a suite must
+be minted per tokenizer family; the methodology is what transfers. Where the
+reference cannot be followed exactly, the recipe's ``upstream.deviations`` records
+what changed and why.
 
 The output is the evaluation input itself (Law 3): candidates consume the stored
 IDs directly. Retokenizing source text does not reproduce the suite.
 
 Usage:
+    python fidelity/suite.py selftest
+    python fidelity/suite.py probe
+
     python fidelity/suite.py build \\
         --recipe fidelity/suites/recipe-v1.json \\
         --tokenizer /media/fmodels/Qwen/Qwen3.6-27B \\
         --out /mnt/kld/suites/qwen3.6-1024x2048-v1
 
     python fidelity/suite.py verify --suite /mnt/kld/suites/qwen3.6-1024x2048-v1
-    python fidelity/suite.py selftest
 """
 
 import argparse
@@ -148,12 +152,51 @@ def _render_conversation(value: Any) -> str:
     return "\n\n".join(turns)
 
 
+def _field(record: Any, dotted: str | None) -> Any:
+    """Read a possibly nested record field, addressed as ``metadata.path``."""
+    if not dotted:
+        return None
+    value: Any = record
+    for part in dotted.split("."):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(part)
+    return value
+
+
+def _text_field(record: dict[str, Any], dotted: str | None) -> str | None:
+    value = _field(record, dotted)
+    return str(value) if value not in (None, "") else None
+
+
 def extract(record: dict[str, Any], source: dict[str, Any]) -> str:
     extractor = source.get("extractor", "plain")
-    raw = record.get(source["text_field"])
+    raw = _field(record, source["text_field"])
     if extractor == "conversation":
         return _render_conversation(raw)
     return raw if isinstance(raw, str) else ""
+
+
+def _resolve_data_files(source: dict[str, Any]) -> list[str]:
+    """Expand a source's data-file spec into a sorted, deterministic list.
+
+    Some Hub repositories are reachable only through a loader script, which newer
+    ``datasets`` refuses to execute. Naming their data files directly reads the
+    same bytes at the same pinned revision that the script would have read.
+    """
+    revision = source["revision"]
+    template = source.get("data_files_template")
+    if template:
+        shards = int(source["data_files_shards"])
+        files = [
+            template.format(revision=revision, index=index, shards=shards)
+            for index in range(shards)
+        ]
+    else:
+        spec = source["data_files"]
+        candidates = [spec] if isinstance(spec, str) else list(spec)
+        files = [str(f).format(revision=revision) for f in candidates]
+    return sorted(files)
 
 
 def iter_records(
@@ -177,13 +220,21 @@ def iter_records(
             "the datasets package is required to build from the Hub; run "
             "fidelity/bootstrap.sh or: uv pip install datasets"
         ) from exc
-    stream = load_dataset(
-        source["dataset"],
-        source.get("config"),
-        revision=source["revision"],
-        split=source.get("split", "train"),
-        streaming=True,
-    )
+    if source.get("loader"):
+        stream = load_dataset(
+            source["loader"],
+            data_files=_resolve_data_files(source),
+            split=source.get("split", "train"),
+            streaming=True,
+        )
+    else:
+        stream = load_dataset(
+            source["dataset"],
+            source.get("config"),
+            revision=source["revision"],
+            split=source.get("split", "train"),
+            streaming=True,
+        )
     yield from stream
 
 
@@ -212,14 +263,20 @@ def harvest(
             break
         if len(docs) >= retain:
             break
+        path = _text_field(record, source.get("path_field"))
+        if not _suffix_eligible(path, source.get("path_suffix_any")):
+            continue
         text = extract(record, source)
         if not text or len(text) < min_chars:
             continue
         if len(_WHITESPACE.sub("", text)) < min_chars // 2:
             continue
-        cluster = record.get(source.get("cluster_field") or "", None)
+        cluster = _field(record, source.get("cluster_field"))
         cluster_id = str(cluster) if cluster not in (None, "") else _sha256_text(text)
         if cluster_id in seen_clusters:
+            continue
+        normalized = normalize_for_scan(text)
+        if not content_eligible(source, path, normalized):
             continue
 
         encoded = tokenizer(text, add_special_tokens=False)["input_ids"]
@@ -239,20 +296,12 @@ def harvest(
                 cluster_id=cluster_id,
                 representation=source.get("extractor", "plain"),
                 content_sha256=content_sha,
-                normalized_text=normalize_for_scan(text),
+                normalized_text=normalized,
                 tokens=window,
                 token_offset=offset,
                 total_tokens=len(encoded),
-                title=(
-                    str(record.get(source["title_field"]))
-                    if source.get("title_field") and record.get(source["title_field"])
-                    else None
-                ),
-                path=(
-                    str(record.get(source["path_field"]))
-                    if source.get("path_field") and record.get(source["path_field"])
-                    else None
-                ),
+                title=_text_field(record, source.get("title_field")),
+                path=path,
                 signature=minhash(
                     window,
                     dedup["minhash_permutations"],
@@ -267,17 +316,146 @@ def harvest(
     return docs
 
 
-def stratum_eligible(doc: Document, stratum: dict[str, Any]) -> bool:
-    """Apply a stratum's content policy to a candidate."""
-    suffixes = stratum.get("path_suffix_any")
-    if suffixes:
-        path = (doc.path or "").lower()
-        if not any(path.endswith(s) for s in suffixes):
-            return False
-    required = stratum.get("require_any")
-    if required and not any(marker in doc.normalized_text for marker in required):
+CACHE_FORMAT_VERSION = 1
+
+
+def _cache_key(*parts: Any) -> str:
+    payload = json.dumps(parts, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def _cache_paths(cache_dir: str, name: str, key: str) -> tuple[str, str]:
+    stem = os.path.join(cache_dir, f"{name}-{key}")
+    return f"{stem}.jsonl", f"{stem}.meta.json"
+
+
+def _write_cache(data_path: str, meta_path: str, rows: list[Any],
+                 meta: dict[str, Any]) -> None:
+    """Write a cache entry so an interrupted write cannot be mistaken for data."""
+    os.makedirs(os.path.dirname(os.path.abspath(data_path)), exist_ok=True)
+    tmp = f"{data_path}.tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
+    os.replace(tmp, data_path)
+    _write_json(meta_path, meta)
+
+
+def _read_cache(data_path: str, meta_path: str) -> tuple[list[Any], dict[str, Any]]:
+    with open(meta_path, encoding="utf-8") as handle:
+        meta = json.load(handle)
+    rows = []
+    with open(data_path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows, meta
+
+
+def _document_row(doc: Document) -> dict[str, Any]:
+    return {
+        "source_key": doc.source_key,
+        "cluster_id": doc.cluster_id,
+        "representation": doc.representation,
+        "content_sha256": doc.content_sha256,
+        "normalized_text": doc.normalized_text,
+        "tokens": doc.tokens,
+        "token_offset": doc.token_offset,
+        "total_tokens": doc.total_tokens,
+        "title": doc.title,
+        "path": doc.path,
+        "signature": doc.signature,
+    }
+
+
+def harvest_cached(
+    source: dict[str, Any],
+    tokenizer: Any,
+    context_length: int,
+    retain: int,
+    dedup: dict[str, Any],
+    fixture_dir: str | None,
+    tok_identity: dict[str, Any],
+    cache_dir: str | None,
+    refresh: set[str],
+) -> list[Document]:
+    """Harvest a source, reusing a cached pool when the inputs are unchanged.
+
+    Harvesting is the expensive, network-bound half of a build, and a build that
+    fails late used to discard every completed source. The cache is keyed by
+    everything that can change a pool, so a rerun after a fix re-harvests only what
+    the fix touched.
+    """
+    if not cache_dir:
+        return harvest(source, tokenizer, context_length, retain, dedup, fixture_dir)
+
+    key = _cache_key(
+        CACHE_FORMAT_VERSION, source, tok_identity, context_length, dedup, fixture_dir
+    )
+    data_path, meta_path = _cache_paths(cache_dir, f"pool-{source['key']}", key)
+    if (
+        source["key"] not in refresh
+        and os.path.isfile(data_path)
+        and os.path.isfile(meta_path)
+    ):
+        rows, meta = _read_cache(data_path, meta_path)
+        if int(meta.get("retain", 0)) >= retain:
+            docs = [Document(**row) for row in rows][:retain]
+            print(
+                f"  {source['key']}: reusing {len(docs)} cached candidate "
+                f"context(s) from {os.path.basename(data_path)}"
+            )
+            return docs
+
+    docs = harvest(source, tokenizer, context_length, retain, dedup, fixture_dir)
+    _write_cache(
+        data_path,
+        meta_path,
+        [_document_row(doc) for doc in docs],
+        {
+            "cache_format_version": CACHE_FORMAT_VERSION,
+            "source_key": source["key"],
+            "cache_key": key,
+            "dataset": source["dataset"],
+            "revision": source["revision"],
+            "retain": retain,
+            "documents": len(docs),
+            "context_length": context_length,
+            "written_utc": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    return docs
+
+
+def _suffix_eligible(path: str | None, suffixes: list[str] | None) -> bool:
+    if not suffixes:
+        return True
+    lowered = (path or "").lower()
+    return any(lowered.endswith(str(s).lower()) for s in suffixes)
+
+
+def content_eligible(
+    spec: dict[str, Any], path: str | None, normalized_text: str
+) -> bool:
+    """Apply a content policy declared by either a source or a stratum.
+
+    A source declares its policy to make a rare file type reachable: the filter
+    runs while streaming, so the scan digs as deep as ``scan_limit`` allows rather
+    than hoping the first few thousand records happen to contain one. A stratum
+    declares the same policy to state what its slots are allowed to hold.
+    """
+    if not _suffix_eligible(path, spec.get("path_suffix_any")):
+        return False
+    required = spec.get("require_any")
+    if required and not any(marker in normalized_text for marker in required):
         return False
     return True
+
+
+def stratum_eligible(doc: Document, stratum: dict[str, Any]) -> bool:
+    """Apply a stratum's content policy to a candidate."""
+    return content_eligible(stratum, doc.path, doc.normalized_text)
 
 
 def select(
@@ -285,6 +463,7 @@ def select(
     pools: dict[str, list[Document]],
     dedup: dict[str, Any],
     blocked: set[str],
+    namespaces: dict[str, str] | None = None,
 ) -> tuple[dict[str, list[Document]], list[str]]:
     """Fill each stratum, rejecting duplicates and blocked documents.
 
@@ -293,12 +472,19 @@ def select(
     near-duplicates are rejected before allocation, as the recipe requires,
     which means a rejection here changes which document lands in a slot rather
     than leaving a slot empty.
+
+    Harvesting keeps one context per source unit within a source. Some sources
+    share an identifier space - three of them index the same GitHub repositories -
+    so units are also deduplicated across sources that declare the same
+    ``cluster_namespace``, which keeps one repository from contributing twice.
     """
     chosen: dict[str, list[Document]] = {}
     accepted_tokens: set[str] = set()
+    accepted_clusters: set[tuple[str, str]] = set()
     accepted_sigs: list[list[int]] = []
     shortfalls: list[str] = []
     threshold = dedup["jaccard_threshold"]
+    namespaces = namespaces or {}
 
     for stratum in strata:
         want = stratum["contexts"]
@@ -320,6 +506,9 @@ def select(
                         continue
                     if not stratum_eligible(doc, stratum):
                         continue
+                    unit = (namespaces.get(key, key), doc.cluster_id)
+                    if unit in accepted_clusters:
+                        continue
                     token_hash = doc.token_sha256
                     if token_hash in accepted_tokens:
                         continue
@@ -329,6 +518,7 @@ def select(
                     ):
                         continue
                     accepted_tokens.add(token_hash)
+                    accepted_clusters.add(unit)
                     accepted_sigs.append(doc.signature)
                     picked.append(doc)
                     break
@@ -367,28 +557,149 @@ def benchmark_items(
     return items
 
 
+def benchmark_items_cached(
+    spec: dict[str, Any],
+    fixture_dir: str | None,
+    cache_dir: str | None,
+    refresh: set[str],
+) -> list[tuple[str, list[str]]]:
+    if not cache_dir:
+        return benchmark_items(spec, fixture_dir)
+    key = _cache_key(CACHE_FORMAT_VERSION, spec, fixture_dir)
+    data_path, meta_path = _cache_paths(cache_dir, f"items-{spec['name']}", key)
+    if (
+        spec["name"] not in refresh
+        and os.path.isfile(data_path)
+        and os.path.isfile(meta_path)
+    ):
+        rows, _ = _read_cache(data_path, meta_path)
+        return [(row[0], row[1]) for row in rows]
+    items = benchmark_items(spec, fixture_dir)
+    _write_cache(
+        data_path,
+        meta_path,
+        [[item_id, fragments] for item_id, fragments in items],
+        {
+            "cache_format_version": CACHE_FORMAT_VERSION,
+            "benchmark": spec["name"],
+            "cache_key": key,
+            "dataset": spec["dataset"],
+            "revision": spec["revision"],
+            "items": len(items),
+            "written_utc": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    return items
+
+
+_WORD = re.compile(r"\w+", re.UNICODE)
+
+
+def _probe_words(fragment: str) -> list[str]:
+    """Distinctive interior words of a normalized fragment.
+
+    Interior only. A fragment's first and last words can be glued to neighbouring
+    characters in a document, but an interior word is delimited by non-word
+    characters inside the fragment itself, so those same delimiters appear in any
+    document containing the fragment verbatim. That makes the index a necessary
+    condition rather than a heuristic: no containment can be missed.
+    """
+    words = _WORD.findall(fragment)
+    interior = words[1:-1]
+    for floor in (8, 6, 4):
+        chosen = sorted(
+            {word for word in interior if len(word) >= floor},
+            key=lambda word: (-len(word), word),
+        )
+        if chosen:
+            return chosen[:2]
+    return []
+
+
+def _item_index(
+    items: list[tuple[str, list[str]]], match_rule: str
+) -> tuple[dict[str, set[int]], set[int]]:
+    """Index items by probe word, listing those that must be checked directly.
+
+    Under ``all`` every fragment is required, so probing the longest one is enough.
+    Under ``any`` a hit on any fragment counts, so every fragment is probed.
+    """
+    index: dict[str, set[int]] = {}
+    always: set[int] = set()
+    for position, (_item_id, fragments) in enumerate(items):
+        if not fragments:
+            continue
+        probe_sources = (
+            [max(fragments, key=len)] if match_rule == "all" else fragments
+        )
+        probes: set[str] = set()
+        for fragment in probe_sources:
+            words = _probe_words(fragment)
+            if not words:
+                probes.clear()
+                break
+            probes.update(words)
+        if probes:
+            for word in probes:
+                index.setdefault(word, set()).add(position)
+        else:
+            always.add(position)
+    return index, always
+
+
+def item_matches(text: str, fragments: list[str], match_rule: str) -> bool:
+    if match_rule == "all":
+        return all(fragment in text for fragment in fragments)
+    return any(fragment in text for fragment in fragments)
+
+
+def scan_items(
+    docs: list[Document], items: list[tuple[str, list[str]]], match_rule: str
+) -> dict[int, list[Document]]:
+    """Which documents contain which items, keyed by item position.
+
+    Documents are visited in order, so each item's hit list keeps corpus order.
+    """
+    index, always = _item_index(items, match_rule)
+    hits: dict[int, list[Document]] = {}
+    for doc in docs:
+        words = set(_WORD.findall(doc.normalized_text))
+        candidates = set(always)
+        for word in words & index.keys():
+            candidates |= index[word]
+        for position in candidates:
+            if item_matches(doc.normalized_text, items[position][1], match_rule):
+                hits.setdefault(position, []).append(doc)
+    return hits
+
+
 def leakage_scan(
     recipe: dict[str, Any],
     pools: dict[str, list[Document]],
     fixture_dir: str | None,
+    cache_dir: str | None = None,
+    refresh: set[str] | None = None,
 ) -> tuple[dict[str, Any], set[str]]:
-    """Scan candidates for complete benchmark items and block any that overlap."""
+    """Scan candidates for complete benchmark items and block any that overlap.
+
+    Comparing every item against every candidate is quadratic, and MMLU alone
+    contributes over fourteen thousand items: the direct form does not finish. An
+    inverted index over probe words reduces it to a containment check on the few
+    items a document could possibly hold, without weakening the match rule.
+    """
     blocked: set[str] = set()
     per_benchmark = []
     all_docs = [doc for pool in pools.values() for doc in pool]
     for spec in recipe.get("benchmarks", []):
-        items = benchmark_items(spec, fixture_dir)
+        items = benchmark_items_cached(spec, fixture_dir, cache_dir, refresh or set())
+        match_rule = spec.get("match", "any")
+        hits_by_item = scan_items(all_docs, items, match_rule)
         hits = []
-        for item_id, fragments in items:
-            for doc in all_docs:
-                if spec.get("match") == "all":
-                    matched = all(f in doc.normalized_text for f in fragments)
-                else:
-                    matched = any(f in doc.normalized_text for f in fragments)
-                if matched:
-                    hits.append({"item": item_id, "content_sha256":
-                                 doc.content_sha256, "source": doc.source_key})
-                    blocked.add(doc.content_sha256)
+        for position in sorted(hits_by_item):
+            for doc in hits_by_item[position]:
+                hits.append({"item": items[position][0], "content_sha256":
+                             doc.content_sha256, "source": doc.source_key})
+                blocked.add(doc.content_sha256)
         per_benchmark.append(
             {
                 "name": spec["name"],
@@ -408,6 +719,10 @@ def leakage_scan(
     report = {
         "kind": "capability overlap scan",
         "normalization": "NFKC, casefold, whitespace-collapsed exact containment",
+        "prefilter": (
+            "inverted index over interior probe words of each item fragment, a "
+            "necessary condition for containment, verified by exact containment"
+        ),
         "candidates_scanned": len(all_docs),
         "benchmarks": per_benchmark,
         "blocked_documents": sorted(blocked),
@@ -639,8 +954,10 @@ def write_suite(
                         if k
                         in (
                             "key", "dataset", "config", "revision", "split",
-                            "scan_limit", "license", "extractor",
-                            "upstream_dataset_fingerprint",
+                            "scan_limit", "license", "extractor", "loader",
+                            "data_files", "data_files_template",
+                            "data_files_shards", "path_suffix_any", "min_chars",
+                            "cluster_namespace", "upstream_dataset_fingerprint",
                         )
                     },
                     "dataset_fingerprint": dataset_fingerprint(source),
@@ -664,9 +981,12 @@ def build(
     oversample: int,
     suite_id: str | None,
     allow_shortfall: bool,
+    cache_dir: str | None = None,
+    refresh: set[str] | None = None,
 ) -> int:
     with open(recipe_path, encoding="utf-8") as handle:
         recipe = json.load(handle)
+    refresh = refresh or set()
 
     declared = sum(s["contexts"] for s in recipe["strata"])
     if declared != recipe["contexts"]:
@@ -691,27 +1011,41 @@ def build(
             need[key] = need.get(key, 0) + stratum["contexts"]
 
     print(f"=== harvesting {len(recipe['sources'])} source(s)")
+    if cache_dir:
+        print(f"  cache: {cache_dir}")
     pools: dict[str, list[Document]] = {}
     for source in recipe["sources"]:
         want = need.get(source["key"], 0)
         if want == 0:
             continue
-        pools[source["key"]] = harvest(
+        pools[source["key"]] = harvest_cached(
             source,
             tokenizer,
             recipe["context_length"],
-            want * oversample,
+            want * int(source.get("oversample") or oversample),
             recipe["dedup"],
             fixture_dir,
+            tok_identity,
+            cache_dir,
+            refresh,
         )
 
     print("=== scanning for benchmark leakage")
-    overlap, blocked = leakage_scan(recipe, pools, fixture_dir)
+    overlap, blocked = leakage_scan(recipe, pools, fixture_dir, cache_dir, refresh)
     if blocked:
         print(f"  blocking {len(blocked)} candidate(s) with complete overlaps")
 
     print("=== allocating strata")
-    chosen, shortfalls = select(recipe["strata"], pools, recipe["dedup"], blocked)
+    chosen, shortfalls = select(
+        recipe["strata"],
+        pools,
+        recipe["dedup"],
+        blocked,
+        {
+            s["key"]: s.get("cluster_namespace") or s["key"]
+            for s in recipe["sources"]
+        },
+    )
     for stratum in recipe["strata"]:
         print(
             f"  {stratum['key']}: {len(chosen[stratum['key']])} of "
@@ -746,6 +1080,123 @@ def build(
     print(f"analysis: {len(partitions['analysis'])}  "
           f"qualification: {len(partitions['qualification'])}")
     print(f"written to {out_dir}")
+    return 0
+
+
+def _probe_source(
+    source: dict[str, Any], fixture_dir: str | None, rows: int
+) -> dict[str, Any]:
+    """Stream a bounded prefix of one source and report what it actually holds."""
+    limit = rows
+    if source.get("path_suffix_any"):
+        # A filtered source is looking for a rare file type, so a short prefix
+        # says nothing about whether the filter can ever be satisfied.
+        limit = min(int(source.get("scan_limit", 20000)), rows * 50)
+    min_chars = int(source.get("min_chars", 4000))
+    columns: set[str] = set()
+    extensions: dict[str, int] = {}
+    scanned = 0
+    with_text = 0
+    eligible = 0
+    for record in iter_records(source, fixture_dir):
+        scanned += 1
+        if isinstance(record, dict):
+            columns.update(record.keys())
+        path = _text_field(record, source.get("path_field"))
+        if path:
+            suffix = os.path.splitext(path)[1].lower() or "(none)"
+            extensions[suffix] = extensions.get(suffix, 0) + 1
+        if _suffix_eligible(path, source.get("path_suffix_any")):
+            text = extract(record, source)
+            if text:
+                with_text += 1
+                if len(text) >= min_chars and content_eligible(
+                    source, path, normalize_for_scan(text)
+                ):
+                    eligible += 1
+        if scanned >= limit:
+            break
+    return {
+        "scanned": scanned,
+        "with_text": with_text,
+        "eligible": eligible,
+        "columns": sorted(columns),
+        "extensions": sorted(extensions.items(), key=lambda kv: (-kv[1], kv[0])),
+    }
+
+
+def probe(recipe_path: str, fixture_dir: str | None, rows: int) -> int:
+    """Check every source and benchmark is reachable and shaped as declared.
+
+    A harvest costs minutes per source and a leakage scan needs every benchmark,
+    so an unreachable repository, a renamed column, or a revision that no longer
+    exists must surface here rather than after the expensive work.
+    """
+    with open(recipe_path, encoding="utf-8") as handle:
+        recipe = json.load(handle)
+
+    problems: list[str] = []
+    print(f"=== probing {len(recipe['sources'])} source(s)")
+    for source in recipe["sources"]:
+        try:
+            result = _probe_source(source, fixture_dir, rows)
+        except Exception as exc:  # noqa: BLE001 - report, do not abort the sweep
+            problems.append(
+                f"{source['key']} ({source['dataset']}): {type(exc).__name__}: {exc}"
+            )
+            print(f"  {source['key']}: UNREACHABLE  {type(exc).__name__}: {exc}")
+            continue
+        print(
+            f"  {source['key']}: scanned {result['scanned']}, "
+            f"{result['with_text']} with text, {result['eligible']} eligible"
+        )
+        print(f"    columns: {', '.join(result['columns'][:12]) or 'none'}")
+        if result["extensions"]:
+            top = ", ".join(f"{ext} {n}" for ext, n in result["extensions"][:6])
+            print(f"    extensions: {top}")
+        if result["scanned"] == 0:
+            problems.append(f"{source['key']}: yielded no records")
+        elif result["with_text"] == 0:
+            problems.append(
+                f"{source['key']}: no record carried text field "
+                f"'{source['text_field']}'"
+            )
+        elif result["eligible"] == 0:
+            problems.append(
+                f"{source['key']}: no record in {result['scanned']} passed its own "
+                f"filters, so its strata cannot fill"
+            )
+
+    print(f"=== probing {len(recipe.get('benchmarks', []))} benchmark(s)")
+    for spec in recipe.get("benchmarks", []):
+        source = {**spec, "key": spec["name"], "text_field": spec["fields"][0]}
+        try:
+            result = _probe_source({**source, "min_chars": 1}, fixture_dir, rows)
+        except Exception as exc:  # noqa: BLE001 - report, do not abort the sweep
+            problems.append(
+                f"{spec['name']} ({spec['dataset']}): {type(exc).__name__}: {exc}"
+            )
+            print(f"  {spec['name']}: UNREACHABLE  {type(exc).__name__}: {exc}")
+            continue
+        missing = [f for f in spec["fields"] if f not in result["columns"]]
+        print(
+            f"  {spec['name']}: scanned {result['scanned']}, fields present: "
+            f"{'yes' if not missing else 'missing ' + ', '.join(missing)}"
+        )
+        if result["scanned"] == 0:
+            problems.append(f"{spec['name']}: yielded no records")
+        if missing:
+            problems.append(
+                f"{spec['name']}: missing field(s) {', '.join(missing)}; the "
+                f"leakage scan would silently find nothing"
+            )
+
+    for line in problems:
+        print(f"PROBLEM  {line}", file=sys.stderr)
+    if problems:
+        print(f"{len(problems)} problem(s); build would fail", file=sys.stderr)
+        return 1
+    print("\nprobe passed: every source and benchmark is reachable and shaped")
     return 0
 
 
@@ -842,22 +1293,34 @@ def _benchmark_probe(name: str, index: int) -> str:
     )
 
 
+def _set_field(record: dict[str, Any], dotted: str, value: Any) -> None:
+    """Write a possibly nested field, mirroring :func:`_field`."""
+    parts = dotted.split(".")
+    target = record
+    for part in parts[:-1]:
+        target = target.setdefault(part, {})
+    target[parts[-1]] = value
+
+
 def _fixture_corpus(root: str, recipe: dict[str, Any]) -> None:
     """Synthesize a corpus large enough to fill every stratum."""
     os.makedirs(root, exist_ok=True)
     need: dict[str, int] = {}
+    by_key = {s["key"]: s for s in recipe["strata"]}
     for stratum in recipe["strata"]:
         for key in stratum["sources"]:
             need[key] = need.get(key, 0) + stratum["contexts"]
 
-    math_markers = " ".join(recipe["strata"][6]["require_any"])
-    suffixes = recipe["strata"][9]["path_suffix_any"]
+    math_markers = " ".join(by_key["worked_math_reasoning"]["require_any"])
 
     for source in recipe["sources"]:
         want = need.get(source["key"], 0)
         if not want:
             continue
         records = []
+        suffixes = source.get("path_suffix_any") or by_key["structured_data_tools"][
+            "path_suffix_any"
+        ]
         for i in range(want * 3):
             body = " ".join(
                 f"{source['key']}{i}w{j}" for j in range(recipe["context_length"] + 40)
@@ -866,19 +1329,30 @@ def _fixture_corpus(root: str, recipe: dict[str, Any]) -> None:
                 body = f"{math_markers} {body}"
             record: dict[str, Any] = {"id": f"{source['key']}-{i}"}
             if source.get("extractor") == "conversation":
-                record[source["text_field"]] = [
+                _set_field(record, source["text_field"], [
                     {"role": "user", "content": body[: len(body) // 2]},
                     {"role": "assistant", "content": body[len(body) // 2:]},
-                ]
+                ])
                 record["conversation_hash"] = f"{source['key']}-{i}"
             else:
-                record[source["text_field"]] = body
+                _set_field(record, source["text_field"], body)
             if source.get("title_field"):
-                record[source["title_field"]] = f"Title {i}"
+                _set_field(record, source["title_field"], f"Title {i}")
             if source.get("path_field"):
                 suffix = suffixes[i % len(suffixes)] if i % 2 == 0 else ".py"
-                record[source["path_field"]] = f"pkg/file{i}{suffix}"
-                record[source["cluster_field"]] = f"org/repo{i}"
+                _set_field(record, source["path_field"], f"pkg/file{i}{suffix}")
+            cluster_field = source.get("cluster_field")
+            if cluster_field and _field(record, cluster_field) in (None, ""):
+                # One repository is shared by every source in the github_repo
+                # namespace, so the cross-source unit dedup has a real collision
+                # to reject.
+                shared = i == 0 and source.get("cluster_namespace") == "github_repo"
+                _set_field(
+                    record,
+                    cluster_field,
+                    "org/shared-repo" if shared
+                    else f"org/{source['key']}-unit{i}",
+                )
             records.append(record)
         # Two exact duplicates and one near-duplicate, so dedup is exercised
         # rather than merely present.
@@ -924,6 +1398,77 @@ def _fixture_corpus(root: str, recipe: dict[str, Any]) -> None:
                 handle.write(json.dumps(record) + "\n")
 
 
+def _scan_equivalence_failures() -> list[str]:
+    """Prove the indexed scan agrees with the direct comparison it replaced.
+
+    The index is what makes the scan finish at all, so it has to be exactly as
+    strict. The cases below are the ones that could plausibly slip through it:
+    fragments whose only long words sit at an edge, fragments made entirely of
+    short words, punctuation and digits at word boundaries, and non-Latin text.
+    """
+    passages = [
+        "the quick brown fox jumps over the lazy dog near the riverbank",
+        "def compute_total(values): return sum(values) / len(values) + 1",
+        "a b c d e f g h i j k l m n o p",
+        "unicode: \u0432\u043e\u043f\u0440\u043e\u0441 \u043e \u0442\u0435\u0440"
+        "\u043c\u043e\u0434\u0438\u043d\u0430\u043c\u0438\u043a\u0435 \u0438 "
+        "\u044d\u043d\u0442\u0440\u043e\u043f\u0438\u0438",
+        "\u4e2d\u6587\u6d4b\u8bd5\u6587\u672c include ascii tokens too",
+        "answer choices: (a) 12.5 (b) 13.75 (c) 14.0 (d) none of the above",
+        "prefixmatch antidisestablishmentarianism suffixmatch",
+    ]
+    docs = [
+        Document(
+            source_key="synthetic",
+            cluster_id=f"unit-{index}",
+            representation="plain",
+            content_sha256=_sha256_text(passage),
+            normalized_text=normalize_for_scan(f"lead in text {passage} trailing text"),
+            tokens=[index],
+            token_offset=0,
+            total_tokens=1,
+        )
+        for index, passage in enumerate(passages)
+    ]
+    fragments_by_item = [
+        [normalize_for_scan(p)] for p in passages
+    ] + [
+        # Substrings that begin and end mid-word, absent items, and multi-fragment
+        # items mixing a present fragment with a missing one.
+        [normalize_for_scan("uick brown fox jumps ove")],
+        [normalize_for_scan("no such passage exists anywhere in the corpus")],
+        [normalize_for_scan(passages[0]), normalize_for_scan(passages[1])],
+        [normalize_for_scan(passages[0]), normalize_for_scan("absent fragment here")],
+        [normalize_for_scan("a b c d")],
+        [normalize_for_scan("12.5 (b) 13.75")],
+    ]
+    items = [(f"synthetic:{i}", f) for i, f in enumerate(fragments_by_item)]
+
+    failures = []
+    for match_rule in ("any", "all"):
+        expected = {}
+        for position, (_item, fragments) in enumerate(items):
+            matched = [
+                doc
+                for doc in docs
+                if item_matches(doc.normalized_text, fragments, match_rule)
+            ]
+            if matched:
+                expected[position] = matched
+        actual = scan_items(docs, items, match_rule)
+        if actual != expected:
+            missed = {
+                items[p][0]: [d.cluster_id for d in expected[p]]
+                for p in expected
+                if actual.get(p) != expected[p]
+            }
+            failures.append(
+                f"indexed scan disagrees with direct comparison under "
+                f"match={match_rule}: {missed}"
+            )
+    return failures
+
+
 def selftest() -> int:
     """Build a small suite from synthetic sources and verify every invariant."""
     import shutil
@@ -955,6 +1500,10 @@ def selftest() -> int:
         small_recipe = os.path.join(work, "recipe.json")
         _write_json(small_recipe, recipe)
         _fixture_corpus(fixture, recipe)
+        if probe(small_recipe, fixture, 200) != 0:
+            print("FAIL  probe rejected the fixture corpus", file=sys.stderr)
+            return 1
+
         out = os.path.join(work, "suite")
         rc = build(small_recipe, "fixture", out, fixture, 6, "selftest-suite", False)
         if rc != 0:
@@ -972,7 +1521,7 @@ def selftest() -> int:
         ) as fh:
             overlap = json.load(fh)
 
-        failures = []
+        failures = _scan_equivalence_failures()
         if manifest["context_count"] != recipe["contexts"]:
             failures.append(
                 f"context count {manifest['context_count']} != "
@@ -1014,6 +1563,32 @@ def selftest() -> int:
         if manifest2["partition_token_sha256"] != manifest["partition_token_sha256"]:
             failures.append("rebuild is not deterministic: partitions moved")
 
+        # A cached build must reproduce the suite from the cache alone, which is
+        # what makes a failed build resumable rather than merely faster.
+        cache = os.path.join(work, "cache")
+        out3 = os.path.join(work, "suite3")
+        build(small_recipe, "fixture", out3, fixture, 6, "selftest-suite", False,
+              cache, set())
+        pooled = [n for n in os.listdir(cache) if n.startswith("pool-")]
+        if not pooled:
+            failures.append("no pools were cached")
+        for name in os.listdir(fixture):
+            os.remove(os.path.join(fixture, name))
+        out4 = os.path.join(work, "suite4")
+        build(small_recipe, "fixture", out4, fixture, 6, "selftest-suite", False,
+              cache, set())
+        with open(os.path.join(out4, "suite-manifest.json"), encoding="utf-8") as fh:
+            manifest4 = json.load(fh)
+        if manifest4["token_sha256"] != manifest["token_sha256"]:
+            failures.append("cached rebuild did not reproduce the suite")
+        with open(
+            os.path.join(out4, "validation", "capability-overlap.json"),
+            encoding="utf-8",
+        ) as fh:
+            overlap4 = json.load(fh)
+        if overlap4["blocked_documents"] != overlap["blocked_documents"]:
+            failures.append("cached rebuild lost the planted benchmark leak")
+
         for line in failures:
             print(f"FAIL  {line}", file=sys.stderr)
         if failures:
@@ -1040,14 +1615,46 @@ def main() -> int:
     b.add_argument("--out", required=True)
     b.add_argument("--suite-id")
     b.add_argument("--fixture", help="build from local JSONL fixtures, not the Hub")
-    b.add_argument("--oversample", type=int, default=6)
+    b.add_argument(
+        "--oversample",
+        type=int,
+        default=6,
+        help="candidates harvested per allocated slot; a source may override it",
+    )
     b.add_argument("--allow-shortfall", action="store_true")
+    b.add_argument(
+        "--cache-dir",
+        help="where harvested pools are cached so a failed build resumes. "
+        "Defaults to <out>-cache, deliberately outside the published suite",
+    )
+    b.add_argument(
+        "--no-cache", action="store_true", help="harvest every source from scratch"
+    )
+    b.add_argument(
+        "--refresh",
+        action="append",
+        default=[],
+        metavar="KEY",
+        help="re-harvest this source or benchmark even if it is cached; repeatable",
+    )
     b.set_defaults(
         func=lambda a: build(
             a.recipe, a.tokenizer, a.out, a.fixture, a.oversample, a.suite_id,
             a.allow_shortfall,
+            None if a.no_cache else (
+                a.cache_dir or f"{a.out.rstrip('/' + os.sep)}-cache"
+            ),
+            set(a.refresh),
         )
     )
+
+    p = sub.add_parser(
+        "probe", help="check every source and benchmark before a long build"
+    )
+    p.add_argument("--recipe", default=os.path.join(HERE, "suites", "recipe-v1.json"))
+    p.add_argument("--fixture", help="probe local JSONL fixtures, not the Hub")
+    p.add_argument("--rows", type=int, default=200)
+    p.set_defaults(func=lambda a: probe(a.recipe, a.fixture, a.rows))
 
     v = sub.add_parser("verify", help="re-derive every hash from the token files")
     v.add_argument("--suite", required=True)

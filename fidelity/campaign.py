@@ -372,14 +372,25 @@ def _find(work: str, pattern: str) -> str | None:
 
 
 def _copy_reference(capture: str, dest: str) -> None:
-    """Publish the reusable reference: tensors, head, and its bound manifest."""
+    """Publish the reusable reference: tensors, head, and its bound manifest.
+
+    Captured tensors run to tens of gigabytes. When the capture and the library
+    sit on one filesystem a hard link publishes them without a second copy; the
+    files are never rewritten in place, so the two names cannot diverge. A copy is
+    the fallback across filesystems.
+    """
     os.makedirs(dest, exist_ok=True)
     if not os.path.isdir(capture):
         return
     for name in sorted(os.listdir(capture)):
         src = os.path.join(capture, name)
-        if os.path.isfile(src) and not os.path.exists(os.path.join(dest, name)):
-            shutil.copy2(src, os.path.join(dest, name))
+        dst = os.path.join(dest, name)
+        if not os.path.isfile(src) or os.path.exists(dst):
+            continue
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copy2(src, dst)
 
 
 def cmd_assemble(config: Config, python: str) -> int:

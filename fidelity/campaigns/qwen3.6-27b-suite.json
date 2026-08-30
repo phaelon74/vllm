@@ -1,16 +1,15 @@
 {
-  "name": "qwen3.6-fp8-fidelity",
+  "name": "qwen3.6-27b-fidelity-suite",
   "library": "/media/fmodels2/Local-Inference-Lab/library",
-  "work": "/media/fmodels2/Local-Inference-Lab/work/qwen3.6",
+  "work": "/media/fmodels2/Local-Inference-Lab/work/qwen3.6-27b-suite",
+  "suite_dir": "/media/fmodels2/Local-Inference-Lab/suites/qwen3.6-1024x2048-v1",
+  "suite_partition": "analysis",
   "partition": "analysis",
-  "rows": 100,
   "context_length": 2048,
   "score_from": 0,
   "runner_v2": false,
   "storage": "hidden",
   "max_num_seqs": 1,
-  "dataset": "Salesforce/wikitext",
-  "dataset_config": "wikitext-2-raw-v1",
   "models": [
     {
       "name": "Qwen3.6-27B",
@@ -21,18 +20,6 @@
         {
           "name": "Qwen3.6-27B-FP8",
           "path": "/media/fmodels/Qwen/Qwen3.6-27B-FP8"
-        }
-      ]
-    },
-    {
-      "name": "Qwen3.6-35B-A3B",
-      "reference": {
-        "path": "/media/fmodels/Qwen/Qwen3.6-35B-A3B"
-      },
-      "candidates": [
-        {
-          "name": "Qwen3.6-35B-A3B-FP8",
-          "path": "/media/fmodels/Qwen/Qwen3.6-35B-A3B-FP8"
         }
       ]
     }

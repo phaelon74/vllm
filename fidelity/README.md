@@ -34,6 +34,7 @@ reproduce the evaluation.
 
 ```bash
 python fidelity/suite.py selftest        # exercise the builder offline first
+python fidelity/suite.py probe           # then prove every source is reachable
 
 python fidelity/suite.py build \
   --recipe fidelity/suites/recipe-v1.json \
@@ -44,10 +45,30 @@ python fidelity/suite.py verify --suite /mnt/kld/suites/qwen3.6-1024x2048-v1
 ```
 
 `recipe-v1.json` replicates the Kimi K3 distribution-fidelity recipe: the same
-eighteen sources at the same pinned dataset revisions, the same ten allocation
-strata and counts totalling 1,024 contexts, the same exact and near-duplicate
-dedup, the same benchmark-overlap scan, and the same 768/256 analysis and
-qualification split.
+sources at the same pinned dataset revisions, the same ten allocation strata and
+counts totalling 1,024 contexts, the same exact and near-duplicate dedup, the same
+benchmark-overlap scan, and the same 768/256 analysis and qualification split.
+Where it cannot follow the reference exactly, `upstream.deviations` in the recipe
+records what changed and why, and the reason is carried into the published source
+registry rather than left implicit.
+
+`probe` streams a bounded prefix of every source and benchmark, reporting the
+columns each one actually has and how many records survive its filters. Harvesting
+costs minutes per source, so a renamed column, a revoked revision, or a gated
+repository needs to surface in the first minute rather than after the expensive
+work. Sources that only exposed a loader script, which current `datasets` refuses
+to execute, name their data files directly at the same pinned revision.
+
+Harvested pools are cached under `<out>-cache`, keyed by everything that can
+change a pool: the source definition, the tokenizer identity, the context length,
+and the dedup parameters. A build that fails late therefore re-harvests only what
+changed, and `--refresh <key>` forces one source to be re-read. `--no-cache`
+disables it. The cache sits outside the suite directory and is never published.
+
+`--oversample` sets how many candidates are harvested per allocated slot, giving
+dedup and leakage rejections room to reject without leaving a slot empty. A source
+that filters for a rare file type reads many records per retained candidate, so it
+may declare its own `oversample` in the recipe rather than pay the global factor.
 
 **Token IDs are not portable across tokenizers.** Their suite is Kimi-tokenized
 and unusable for Qwen, and ours is equally unusable for a model with a different
@@ -58,12 +79,17 @@ differs from the one it was minted for.
 What the builder guarantees, all checked by `selftest`:
 
 - One context per coherent source unit, so a long article cannot dominate a
-  stratum.
+  stratum. Sources that share an identifier space, such as the three that index
+  GitHub repositories, are deduplicated against each other too, so one repository
+  cannot enter the suite twice through two sources.
 - Exact token-duplicate and MinHash near-duplicate rejection before allocation.
 - A benchmark-overlap scan against HumanEval, MMLU, and GPQA-Diamond at pinned
   revisions. For MMLU a match needs the question *and* every answer choice, so a
   short general question occurring naturally in reference prose is not mistaken
   for contamination. Documents with a complete overlap are blocked from the suite.
+  The scan is indexed by the interior words of each item fragment, a necessary
+  condition for containment that `selftest` checks against the direct comparison
+  it replaced; the direct form is quadratic and does not finish against MMLU.
 - Deterministic everything: token offsets, allocation order, partition
   assignment, and therefore every hash. Rebuilding from identical inputs
   reproduces the suite bit for bit, which `selftest` asserts by building twice.

@@ -1,8 +1,8 @@
 {
   "name": "qwen3.6-fp8-fidelity-suite",
-  "library": "/home/phaedawg/kld-library",
-  "work": "/home/phaedawg/kld-work/qwen3.6-suite",
-  "suite_dir": "/home/phaedawg/kld-suites/qwen3.6-1024x2048-v1",
+  "library": "/media/fmodels2/Local-Inference-Lab/library",
+  "work": "/media/fmodels2/Local-Inference-Lab/work/qwen3.6-suite",
+  "suite_dir": "/media/fmodels2/Local-Inference-Lab/suites/qwen3.6-1024x2048-v1",
   "suite_partition": "analysis",
   "partition": "analysis",
   "context_length": 2048,
