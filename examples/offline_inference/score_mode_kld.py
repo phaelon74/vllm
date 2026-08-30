@@ -396,6 +396,43 @@ def _dump_positions(chunks: Any, score_from: int, path: str) -> None:
     print(f"Wrote {len(kld)} per-position values to {path}")
 
 
+def _routing_info(model_path: str) -> dict[str, Any] | None:
+    """Expert counts for a routed checkpoint, or None if it is dense.
+
+    Recorded at capture time because Law 14 applies to routed models only, and
+    the decision of whether it applies must come from the checkpoint rather than
+    from whoever configured the campaign.
+    """
+    config_path = os.path.join(model_path, "config.json")
+    if not os.path.isfile(config_path):
+        return None
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            config = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    count_keys = (
+        "num_experts",
+        "n_routed_experts",
+        "num_local_experts",
+        "moe_num_experts",
+    )
+    topk_keys = ("num_experts_per_tok", "moe_topk", "num_experts_per_token")
+    for section in (config, config.get("text_config") or {}):
+        experts = next(
+            (section[key] for key in count_keys if isinstance(section.get(key), int)),
+            None,
+        )
+        if not experts:
+            continue
+        topk = next(
+            (section[key] for key in topk_keys if isinstance(section.get(key), int)),
+            None,
+        )
+        return {"num_experts": experts, "num_experts_per_tok": topk}
+    return None
+
+
 def _declared_vocab_size(model_path: str) -> int | None:
     """Read the checkpoint's declared output width, padding included.
 
@@ -686,6 +723,7 @@ def calculate_kld(
                 ),
                 "max_num_seqs": (llm_kwargs or {}).get("max_num_seqs"),
                 "declared_vocab_size": _declared_vocab_size(reference_model_path),
+                "reference_routing": _routing_info(reference_model_path),
                 "token_suite": suite_identity,
                 "reference_model": os.path.abspath(reference_model_path),
                 "reference_config_sha256": (

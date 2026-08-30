@@ -19,6 +19,7 @@ Ordering is enforced, not suggested: the zero baseline gates every candidate
 """
 
 import argparse
+import glob
 import json
 import os
 import shutil
@@ -78,6 +79,12 @@ class Config:
     partition: str = "analysis"
     dataset: str = "Salesforce/wikitext"
     dataset_config: str = "wikitext-2-raw-v1"
+    # The expert cell is the one that discriminates between formats, so a routed
+    # model carries it for every scheme on the ladder, not only the deployed one.
+    ladder: list[str] = field(
+        default_factory=lambda: ["fp8_block", "mxfp8", "nvfp4"]
+    )
+    prune_variants: bool = True
     approvals: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -270,8 +277,16 @@ def score_one(
     rows: int,
     decompose: bool,
     suite_limit: int | None = None,
+    capture_label: str | None = None,
 ) -> tuple[str, str]:
-    """Score one pair. Returns (report_path, capture_dir)."""
+    """Score one pair. Returns (report_path, capture_dir).
+
+    `capture_label` lets several candidates share one teacher capture. The
+    manifest binds a capture to the tokens, geometry, and runtime rather than to
+    the candidate, so recapturing the same reference per candidate would spend
+    tens of gigabytes and a forward pass to produce identical tensors. It matters
+    once a routed model adds a component cell and a scheme ladder.
+    """
     tp, util, _ = plan_gpus([student, teacher])
     # Everything the capture manifest binds itself to belongs in the directory
     # name, or a reused capture becomes a confusing abort instead of a recapture.
@@ -279,11 +294,14 @@ def score_one(
         scope = f"{config.suite_partition}{suite_limit or ''}"
     else:
         scope = f"r{rows}"
-    tag = (
-        f"{label}-v{int(config.runner_v2)}-tp{tp}-{scope}"
+    suffix = (
+        f"-v{int(config.runner_v2)}-tp{tp}-{scope}"
         f"-c{config.context_length}-s{config.score_from}"
     )
-    capture = os.path.join(config.work, "captures", tag)
+    tag = f"{label}{suffix}"
+    capture = os.path.join(
+        config.work, "captures", f"{capture_label or label}{suffix}"
+    )
     report = os.path.join(config.work, "reports", f"{tag}.json")
     log = os.path.join(config.work, "logs", f"{tag}.log")
     os.makedirs(os.path.dirname(report), exist_ok=True)
@@ -328,6 +346,194 @@ def score_one(
     return report, capture
 
 
+def build_variant(
+    config: Config,
+    python: str,
+    reference: str,
+    match: str,
+    components: str,
+    scheme: str | None,
+) -> str:
+    """Build a QDQ variant if absent, and return its path.
+
+    The weights are deleted once its report exists (`prune_variants`), because a
+    scheme ladder is several checkpoint copies and the report plus the QDQ
+    manifest are what an artifact publishes.
+    """
+    slug = components.replace(",", "-")
+    name = f"{os.path.basename(reference)}-qdq-{slug}-{scheme or 'matched'}"
+    out = os.path.join(config.work, "variants", name)
+    if os.path.isfile(os.path.join(out, "qdq-manifest.json")) and glob.glob(
+        os.path.join(out, "*.safetensors")
+    ):
+        print(f"=== variant {name} already built")
+        return out
+    cmd = [
+        python, os.path.join(HERE, "qdq.py"),
+        "--model", reference,
+        "--out", out,
+        "--components", components,
+        "--match", match,
+    ]
+    if scheme:
+        cmd += ["--scheme", scheme]
+    print(f"=== building variant {name}")
+    rc = _run(cmd, log_path=os.path.join(config.work, "logs", f"{name}.log"))
+    if rc != 0:
+        raise SystemExit(f"variant build failed for {name}")
+    return out
+
+
+def _prune_variant(path: str) -> None:
+    """Drop a variant's weights, keeping its QDQ manifest as provenance."""
+    for name in sorted(os.listdir(path)):
+        if name == "qdq-manifest.json":
+            continue
+        target = os.path.join(path, name)
+        if os.path.isfile(target):
+            os.remove(target)
+    print(f"  pruned variant weights in {path}")
+
+
+def _cell(report_path: str, capture_manifest: dict[str, Any], config: Config,
+          variant: str, scheme: str) -> dict[str, Any]:
+    """One attribution cell, carrying the identity Law 14 compares against."""
+    with open(report_path, encoding="utf-8") as handle:
+        report = json.load(handle)
+    return {
+        "mean_kld": report.get("mean_kld"),
+        "partition": config.partition,
+        "token_sha256": capture_manifest.get("token_sha256"),
+        "reference_config_sha256": capture_manifest.get("reference_config_sha256"),
+        "variant": os.path.basename(variant),
+        "scheme": scheme,
+        "report": report_path,
+        "qdq_manifest": os.path.join(variant, "qdq-manifest.json"),
+    }
+
+
+def attribute_model(
+    config: Config,
+    python: str,
+    model: Model,
+    deployed: Candidate,
+    capture_dir: str,
+) -> str | None:
+    """Score the component cells and the scheme ladder for a routed model.
+
+    Returns the attribution path, or None when the reference is dense and Law 14
+    does not apply.
+    """
+    sys.path.insert(0, HERE)
+    import qdq
+
+    routing = qdq_routing(model.reference_path)
+    if not routing:
+        return None
+
+    inspection = qdq.inspect(deployed.path)
+    deployed_scheme = inspection["detected_scheme"]
+    if deployed_scheme is None:
+        raise SystemExit(
+            f"{deployed.name} carries no weight scales, so there is no deployed "
+            f"scheme to attribute. Law 14 needs one; is this candidate actually "
+            f"quantized?"
+        )
+    router_quantized = bool(
+        (inspection["coverage"].get("router") or {}).get("quantized")
+    )
+    print(
+        f"Law 14: {model.name} routes over {routing['num_experts']} experts; "
+        f"{deployed.name} is {deployed_scheme}, router "
+        f"{'quantized' if router_quantized else 'left in BF16'}"
+    )
+
+    manifest_path = os.path.join(capture_dir, "manifest.json")
+    capture_manifest: dict[str, Any] = {}
+    if os.path.isfile(manifest_path):
+        with open(manifest_path, encoding="utf-8") as handle:
+            capture_manifest = json.load(handle)
+
+    def score_variant(components: str, scheme: str | None) -> dict[str, Any]:
+        variant = build_variant(
+            config, python, model.reference_path, deployed.path, components, scheme
+        )
+        label = f"{model.name}-qdq-{components.replace(',', '-')}-{scheme or 'matched'}"
+        report, _ = score_one(
+            config, python, label, variant, model.reference_path, config.rows,
+            decompose=False, capture_label=f"{model.name}-ref",
+        )
+        cell = _cell(
+            report, capture_manifest, config, variant, scheme or deployed_scheme
+        )
+        if config.prune_variants:
+            _prune_variant(variant)
+        return cell
+
+    attribution: dict[str, Any] = {
+        "deployed": {
+            "candidate": deployed.name,
+            "scheme": deployed_scheme,
+            "inspection": inspection,
+        },
+        "expert_cell": score_variant("experts", deployed_scheme),
+    }
+    if router_quantized:
+        attribution["router_cell"] = score_variant("router", deployed_scheme)
+    else:
+        attribution["router_cell"] = {
+            "status": "not_applicable",
+            "evidence": (
+                f"qdq.py --inspect {os.path.basename(deployed.path)}: router "
+                f"0 of {(inspection['coverage']['router'] or {}).get('weights')} "
+                f"weights quantized"
+            ),
+        }
+
+    ladder = []
+    for scheme in config.ladder:
+        if scheme == deployed_scheme:
+            entry = dict(attribution["expert_cell"])
+        else:
+            entry = score_variant("experts", scheme)
+        ladder.append(
+            {
+                "scheme": scheme,
+                "mean_kld": entry["mean_kld"],
+                "variant": entry["variant"],
+                "report": entry["report"],
+            }
+        )
+    attribution["ladder"] = ladder
+
+    out = os.path.join(config.work, "attribution", f"{deployed.name}.json")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(attribution, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    print(f"Law 14: wrote {out}")
+    return out
+
+
+def qdq_routing(reference_path: str) -> dict[str, Any] | None:
+    """Expert counts declared by a reference checkpoint, or None if dense."""
+    path = os.path.join(reference_path, "config.json")
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as handle:
+        config = json.load(handle)
+    for section in (config, config.get("text_config") or {}):
+        for key in (
+            "num_experts",
+            "n_routed_experts",
+            "num_local_experts",
+            "moe_num_experts",
+        ):
+            if isinstance(section.get(key), int) and section[key] > 1:
+                return {"num_experts": section[key]}
+    return None
+
+
 def cmd_score(config: Config, python: str) -> int:
     """Capture the environment, gate on the zero baseline, score candidates."""
     os.makedirs(config.work, exist_ok=True)
@@ -355,10 +561,15 @@ def cmd_score(config: Config, python: str) -> int:
         print(f"Law 1 satisfied: {model.name} self-KLD is exactly 0.0")
 
         for cand in model.candidates:
-            score_one(
+            _, capture = score_one(
                 config, python, cand.name, cand.path, model.reference_path,
                 config.rows, decompose=config.storage != "logits",
+                capture_label=f"{model.name}-ref",
             )
+            # Law 14: a routed model's single mean is not publishable, so the
+            # component cells are scored here rather than left to whoever reads
+            # the artifact.
+            attribute_model(config, python, model, cand, capture)
     return 0
 
 
@@ -384,6 +595,9 @@ def _copy_reference(capture: str, dest: str) -> None:
     """
     os.makedirs(dest, exist_ok=True)
     if not os.path.isdir(capture):
+        # Silence here would produce an artifact missing its reusable reference,
+        # which Law 12 would then fail for a reason that points nowhere.
+        print(f"WARNING  no capture directory at {capture}", file=sys.stderr)
         return
     for name in sorted(os.listdir(capture)):
         src = os.path.join(capture, name)
@@ -463,7 +677,15 @@ def cmd_assemble(config: Config, python: str) -> int:
                 print(f"skipping {cand.name}: no report in {config.work}/reports")
                 continue
             tag = os.path.basename(report)[: -len(".json")]
-            capture = os.path.join(config.work, "captures", tag)
+            # Candidates of one model share a teacher capture, so the capture
+            # directory carries the reference's label with the candidate's
+            # geometry suffix.
+            suffix = tag[len(cand.name):]
+            capture = os.path.join(
+                config.work, "captures", f"{model.name}-ref{suffix}"
+            )
+            if not os.path.isdir(capture):
+                capture = os.path.join(config.work, "captures", tag)
             _copy_reference(capture, os.path.join(model_root, "reference"))
             cand_dir = os.path.join(model_root, cand.name)
             os.makedirs(cand_dir, exist_ok=True)
@@ -471,6 +693,13 @@ def cmd_assemble(config: Config, python: str) -> int:
             manifest_src = os.path.join(capture, "manifest.json")
             if os.path.isfile(manifest_src):
                 shutil.copy2(manifest_src, os.path.join(cand_dir, "manifest.json"))
+            attribution = os.path.join(
+                config.work, "attribution", f"{cand.name}.json"
+            )
+            if os.path.isfile(attribution):
+                shutil.copy2(
+                    attribution, os.path.join(cand_dir, "attribution.json")
+                )
 
         # Law 12 verifies the assembled tree, so checksums must exist before
         # compliance runs. Swapping these two steps produces a spurious failure.
@@ -499,6 +728,9 @@ def cmd_assemble(config: Config, python: str) -> int:
             ]
             if os.path.isfile(suite_manifest):
                 cmd += ["--suite", suite_manifest]
+            attribution = os.path.join(cand_dir, "attribution.json")
+            if os.path.isfile(attribution):
+                cmd += ["--attribution", attribution]
             if config.approvals and os.path.isfile(config.approvals):
                 cmd += ["--approvals", config.approvals]
             if _run(cmd) != 0:

@@ -21,6 +21,7 @@ cannot publish a non-compliant result.
 | `publish.py` | Uploads to the Hub; refuses anything non-compliant or tampered |
 | `redaction.py` | The one secret policy shared by capture, rendering, and publish |
 | `tails.py` | Whether a mean describes the distribution or a few hundred positions |
+| `qdq.py` | Builds single-component quantize-dequantize variants of a BF16 checkpoint, and inspects a quantized one for its scheme |
 | `campaigns/*.json` | Campaign definitions: suite, geometry, models, candidates |
 
 Scoring itself lives in `examples/offline_inference/score_mode_kld.py`, driven by
@@ -270,11 +271,53 @@ unpublished. Assembly redacts credential values out of `environment/runtime.json
 on every run — in the work directory as well as the library copy — so an artifact
 captured before this policy existed becomes safe the next time it is assembled.
 
+## Routed models: what the mean hides
+
+Routing cost saturates. A perturbation to a router logit changes an expert
+selection only when it crosses a near-tie, and how many near-ties a model has is a
+property of the model rather than of the perturbation, so an eight-bit router and a
+four-bit router cost about the same. On one MoE checkpoint:
+
+| Cell | MXFP8 | NVFP4 | Ratio |
+|---|---|---|---|
+| Experts only | 0.002953 | 0.106539 | 36× |
+| Router only | 0.200938 | 0.193147 | 1.0× |
+| Deployed | 0.211934 | 0.253426 | 1.2× |
+
+The expert weights differ by a factor of 36. The deployed means differ by 1.2,
+because a router term near 0.20 dominates both. A reader given only the deployed
+column would conclude the formats are nearly equivalent, and would be wrong by an
+order of magnitude. Two engineering conclusions follow: never quantize a router,
+since the weights are a rounding error in the parameter count and the cost barely
+improves with precision; and never rank schemes on a deployed mean that includes
+one.
+
+Law 14 makes the decomposition mandatory for any reference whose config declares
+experts. `campaign.py` detects that from the checkpoint, inspects the deployed
+candidate for its scheme and router coverage, builds the cells with `qdq.py`,
+scores them against the capture the deployed run already produced, and writes
+`attribution.json`. Compliance refuses a routed candidate that has none, and the
+one-pager prints the cells with the ranking floor beside them.
+
+The ladder is the same expert cell at each scheme, which is what makes a later
+comparison possible without rerunning the campaign:
+
+```json
+{"ladder": ["fp8_block", "mxfp8", "nvfp4"], "prune_variants": true}
+```
+
+Variant weights are deleted once a variant's report exists, keeping its
+`qdq-manifest.json`; a three-scheme ladder is otherwise several full copies of the
+reference on disk. Candidates of one model now share a single teacher capture,
+since the manifest binds a capture to the tokens and geometry rather than to the
+candidate — without that, a ladder would recapture identical reference tensors once
+per cell.
+
 ## Overriding a law
 
 A deviation needs a named approver, a written justification, and a timestamp
 (Law 13). Anything less is not an approval and the underlying failure stands.
-Only Laws 1, 8, 11, and 12 permit an override at all.
+Only Laws 1, 8, 11, 12, and 14 permit an override at all.
 
 ```json
 {

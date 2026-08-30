@@ -1,8 +1,12 @@
 # Local Inference Lab — Distribution Fidelity Laws
 
-**Laws version:** 1
+**Laws version:** 2
 **Status:** draft, pending coordination with `local-inference-lab` on the
 publication namespace and suite format.
+
+Version 2 adds Law 14. A receipt at version 1 says nothing about component
+attribution either way, so a version-1 result for a routed model is not a
+version-2 result and should be rescored rather than relabeled.
 
 These laws govern every distribution-fidelity measurement this program
 publishes. They are not guidance. The pipeline refuses to produce or upload an
@@ -145,8 +149,9 @@ result, so a number without its stack cannot be reproduced or defended.
 **Never a credential.** Provenance records that a variable was set, never a
 credential's value. The watched prefixes put `HF_TOKEN` in the same namespace as
 `HF_HOME`, so a variable with a whole name-word of `TOKEN`, `KEY`, `SECRET`,
-`PASSWORD`, `AUTH`, `COOKIE`, or `SESSION` is recorded with its value replaced. Redaction
-applies at capture, again at rendering, and again as a refusal to upload, because
+`PASSWORD`, `AUTH`, `COOKIE`, or `SESSION` is recorded with its value replaced.
+Redaction applies at capture, again at rendering, and again as a refusal to upload,
+because
 a published credential cannot be unpublished.
 
 **Check.** The artifact contains an environment report whose GPU, driver, torch,
@@ -274,3 +279,54 @@ indistinguishable from a bug.
 `approver`, `justification`, and `timestamp`, and the one-pager renders them.
 
 **Override.** None. This law has no exceptions.
+
+## Law 14 — Component attribution on routed models
+
+**Required.** For a checkpoint that routes tokens to experts, a fidelity number
+does not publish as a single mean. The artifact carries, measured on the same
+tokens against the same reference and at the deployed checkpoint's own scheme and
+granularity:
+
+1. the **expert cell** — the reference with only its expert weights rounded
+   through the deployed scheme;
+2. the **router cell** — the reference with only its router rounded, or
+   `not_applicable` with inspection evidence when the deployed checkpoint leaves
+   the router unquantized;
+3. the **deployed cell** — the candidate as it ships.
+
+**Why.** Routing cost saturates, and a saturating term cannot rank anything. A
+perturbation to a router logit changes an expert selection only when it crosses a
+near-tie, so the count of changed selections is governed by how many near-ties the
+model has, not by how large the perturbation was. An eight-bit router and a
+four-bit router therefore cost about the same. Measured on one MoE checkpoint,
+NVFP4 and MXFP8 expert weights differed by a factor of 36 (0.1065 against
+0.0030), while the deployed means differed by a factor of 1.2 (0.2534 against
+0.2119), because a router term near 0.20 dominated both. A reader given only the
+deployed means would conclude the two formats are nearly equivalent. They are not.
+
+**Floor.** The router cell is a floor in the sense Law 1's repeat spread is a
+floor. Two candidates whose deployed means differ by less than the router cell are
+not ranked by that difference, and an artifact that ranks them ranks them on the
+expert cell and says so in the same sentence as the claim.
+
+**Ladder.** A campaign on a routed reference also scores the expert cell at each
+scheme on its ladder, not only at the deployed one. The cost of one more cell is a
+QDQ pass and a scoring run against a capture that already exists; the cost of not
+having it is a comparison nobody can make later without redoing the campaign.
+
+**Check.** For a reference whose capture manifest records declared experts, the
+compliance receipt requires an expert cell and a router cell, each naming the
+variant checkpoint and its QDQ manifest, and each carrying the same partition,
+token digest, and reference config digest as the deployed cell. A cell measured on
+other tokens is not a decomposition of this number and is rejected as one.
+
+**Override.** Permitted under Law 13 for a dense checkpoint misdetected as routed,
+and for an exploratory result that is never published as a ranking. Not permitted
+for a published comparison between two quantization schemes, which is the case the
+law exists for.
+
+## Numbering
+
+Laws are append-only. A published receipt cites its laws by number, so renumbering
+would silently change what an existing artifact claims to have satisfied. A law
+that is superseded is marked as such and keeps its number.

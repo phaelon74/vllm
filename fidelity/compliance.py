@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-LAWS_VERSION = 1
+LAWS_VERSION = 2
 
 PASS = "pass"
 FAIL = "fail"
@@ -34,7 +34,7 @@ NOT_APPLICABLE = "not_applicable"
 
 # Laws whose text permits a recorded deviation. Anything else is absolute and an
 # approval entry cannot rescue it.
-OVERRIDABLE = frozenset({1, 8, 11, 12})
+OVERRIDABLE = frozenset({1, 8, 11, 12, 14})
 
 
 @dataclass
@@ -74,6 +74,7 @@ class Campaign:
     partition: str = "analysis"
     freeze_receipt: dict[str, Any] | None = None
     repeat_study: dict[str, Any] | None = None
+    attribution: dict[str, Any] | None = None
     approvals: dict[str, Any] = field(default_factory=dict)
 
 
@@ -416,6 +417,100 @@ def law_12_reusable_reference(c: Campaign) -> Finding:
     return Finding(12, title, PASS, "suite, reference, head, and checksums present")
 
 
+def _cell_comparable(cell: dict[str, Any], c: Campaign) -> str | None:
+    """Why a component cell cannot be compared to the deployed cell, or None.
+
+    A cell measured on different tokens, a different partition, or against a
+    different reference capture is not a decomposition of this number. It would
+    look like one on a one-pager, which is the failure worth preventing.
+    """
+    if not isinstance(cell, dict):
+        return "is not an object"
+    if not isinstance(cell.get("mean_kld"), (int, float)):
+        return "carries no mean_kld"
+    for field_name, expected in (
+        ("partition", c.partition),
+        ("token_sha256", c.manifest.get("token_sha256")),
+        ("reference_config_sha256", c.manifest.get("reference_config_sha256")),
+    ):
+        actual = cell.get(field_name)
+        if expected is not None and actual != expected:
+            return f"{field_name} is {actual!r}, deployed is {expected!r}"
+    return None
+
+
+def law_14_component_attribution(c: Campaign) -> Finding:
+    """A routed model's number is attributed to router and experts separately."""
+    title = "Component attribution"
+    routing = c.manifest.get("reference_routing")
+    if not routing or not routing.get("num_experts"):
+        return Finding(
+            14, title, NOT_APPLICABLE, "reference declares no experts"
+        )
+    experts = routing["num_experts"]
+    if not c.attribution:
+        return Finding(
+            14,
+            title,
+            FAIL,
+            f"reference routes over {experts} experts, so a single mean cannot "
+            f"be published: no attribution supplied (build the cells with "
+            f"fidelity/qdq.py)",
+        )
+
+    expert_cell = c.attribution.get("expert_cell")
+    if not isinstance(expert_cell, dict):
+        return Finding(14, title, FAIL, "attribution has no expert_cell")
+    problem = _cell_comparable(expert_cell, c)
+    if problem:
+        return Finding(14, title, FAIL, f"expert_cell {problem}")
+
+    router_cell = c.attribution.get("router_cell")
+    if not isinstance(router_cell, dict):
+        return Finding(14, title, FAIL, "attribution has no router_cell")
+    if router_cell.get("status") == NOT_APPLICABLE:
+        if not router_cell.get("evidence"):
+            return Finding(
+                14,
+                title,
+                FAIL,
+                "router_cell is not_applicable but cites no inspection "
+                "evidence that the deployed checkpoint leaves the router "
+                "unquantized",
+            )
+        floor = 0.0
+        router_detail = "router unquantized in the deployed checkpoint"
+    else:
+        problem = _cell_comparable(router_cell, c)
+        if problem:
+            return Finding(14, title, FAIL, f"router_cell {problem}")
+        floor = float(router_cell["mean_kld"])
+        router_detail = f"router {floor:.8f}"
+
+    return Finding(
+        14,
+        title,
+        PASS,
+        f"experts {float(expert_cell['mean_kld']):.8f}, {router_detail}; "
+        f"ranking floor {floor:.8f}",
+    )
+
+
+def attribution_floor(attribution: dict[str, Any] | None) -> float | None:
+    """The router cell's mean, below which a difference does not rank anything."""
+    if not isinstance(attribution, dict):
+        return None
+    cell = attribution.get("router_cell")
+    if not isinstance(cell, dict):
+        return None
+    if cell.get("status") == NOT_APPLICABLE:
+        return 0.0
+    mean = cell.get("mean_kld")
+    return float(mean) if isinstance(mean, (int, float)) else None
+
+
+# Registered after every check is defined. Numbering is append-only, so Law 14
+# sits at the end even though it is evaluated with the rest.
 LAWS: tuple[tuple[int, Callable[[Campaign], Finding]], ...] = (
     (1, law_1_zero_baseline),
     (2, law_2_determinism),
@@ -429,6 +524,7 @@ LAWS: tuple[tuple[int, Callable[[Campaign], Finding]], ...] = (
     (10, law_10_comparability),
     (11, law_11_freeze_before_qualification),
     (12, law_12_reusable_reference),
+    (14, law_14_component_attribution),
 )
 
 
@@ -533,6 +629,8 @@ def build_receipt(c: Campaign, findings: list[Finding]) -> dict[str, Any]:
         "nondeterminism_floor": (
             repeat_spread(c.repeat_study) if baseline not in (0.0, None) else 0.0
         ),
+        "attribution": c.attribution,
+        "ranking_floor": attribution_floor(c.attribution),
         "program": "Local Inference Lab — Distribution Fidelity",
         "laws_version": LAWS_VERSION,
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
@@ -573,6 +671,11 @@ def main() -> int:
         "--repeat-study",
         help="three-capture repeat study JSON, required to override Law 1",
     )
+    parser.add_argument(
+        "--attribution",
+        help="component cells and scheme ladder JSON, required for a routed "
+        "reference (Law 14)",
+    )
     parser.add_argument("--approvals", help="recorded deviations JSON (Law 13)")
     parser.add_argument("--out", help="write the receipt here")
     args = parser.parse_args()
@@ -595,6 +698,7 @@ def main() -> int:
         partition=args.partition,
         freeze_receipt=_load(args.freeze_receipt),
         repeat_study=_load(args.repeat_study),
+        attribution=_load(args.attribution),
         approvals=_load(args.approvals) or {},
     )
 

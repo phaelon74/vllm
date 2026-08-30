@@ -23,7 +23,7 @@ from typing import Any
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from redaction import redact_env  # noqa: E402 - sibling module
 
-LAWS_VERSION = 1
+LAWS_VERSION = 2
 PROGRAM = "Local Inference Lab"
 
 
@@ -454,6 +454,81 @@ def _compliance(receipt: dict[str, Any], baseline: dict[str, Any] | None) -> lis
     return out
 
 
+def _attribution(receipt: dict[str, Any]) -> list[str]:
+    """Where a routed model's divergence came from, per Law 14."""
+    attribution = receipt.get("attribution")
+    if not isinstance(attribution, dict):
+        return []
+    deployed = receipt.get("mean_kld")
+    expert = (attribution.get("expert_cell") or {}).get("mean_kld")
+    router_cell = attribution.get("router_cell") or {}
+    router_na = router_cell.get("status") == "not_applicable"
+    router = None if router_na else router_cell.get("mean_kld")
+    floor = receipt.get("ranking_floor")
+
+    out = [
+        "## Component attribution",
+        "",
+        "This reference routes tokens to experts, so the deployed mean is not a "
+        "single effect. Each cell below is the reference with one component "
+        "rounded through the deployed scheme, scored on the same tokens.",
+        "",
+    ]
+    rows = [
+        ("Experts only", _kld(expert)),
+        (
+            "Router only",
+            "n/a — unquantized in this checkpoint" if router_na else _kld(router),
+        ),
+        ("Deployed", _kld(deployed)),
+    ]
+    out += _table(rows, ("Cell", "Mean KLD"))
+    out.append("")
+    if isinstance(floor, (int, float)) and floor > 0:
+        out += [
+            f"**Ranking floor {_kld(floor)}.** Routing cost saturates: a router "
+            f"perturbation changes an expert selection only when it crosses a "
+            f"near-tie, so schemes of very different precision pay almost the "
+            f"same router cost. Two candidates whose deployed means differ by "
+            f"less than this floor are not ranked by that difference. Rank them "
+            f"on the experts-only cell.",
+            "",
+        ]
+    elif router_na:
+        out += [
+            "The deployed checkpoint leaves the router in BF16, so there is no "
+            "saturating routing term and the deployed mean is attributable to "
+            "the quantized components.",
+            "",
+        ]
+        evidence = router_cell.get("evidence")
+        if evidence:
+            out += [f"Evidence: {evidence}", ""]
+
+    ladder = attribution.get("ladder")
+    if isinstance(ladder, list) and ladder:
+        out += [
+            "### Scheme ladder",
+            "",
+            "The same expert weights rounded through each scheme, which is the "
+            "cell that discriminates between them.",
+            "",
+        ]
+        out += _table(
+            [
+                (
+                    str(entry.get("scheme")),
+                    _kld(entry.get("mean_kld")),
+                    str(entry.get("variant") or ""),
+                )
+                for entry in ladder
+            ],
+            ("Scheme", "Experts-only mean KLD", "Variant"),
+        )
+        out.append("")
+    return out
+
+
 def _scope() -> list[str]:
     return [
         "## Scope",
@@ -504,6 +579,7 @@ def render_onepager(
             "",
         ]
     parts += _identity(report, manifest, receipt, runtime_env)
+    parts += _attribution(receipt)
     parts += _head_split(report, manifest)
     parts += _profiles(report)
     parts += _compliance(receipt, baseline)
