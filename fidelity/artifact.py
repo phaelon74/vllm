@@ -471,6 +471,50 @@ def _link(cell: dict[str, Any] | None) -> str:
     return " · ".join(links)
 
 
+def _deployed_quantization(deployed: dict[str, Any]) -> list[str]:
+    """What the shipped checkpoint actually quantized, and how finely.
+
+    Rendered before the cells because it decides which cells exist: a checkpoint
+    that leaves its router in BF16 has no router cell to measure, and one that
+    quantizes only part of its attention is not described by "FP8".
+    """
+    inspection = deployed.get("inspection")
+    if not isinstance(inspection, dict):
+        return []
+    out = ["### What the deployed checkpoint quantizes", ""]
+    facts = [
+        ("Scheme", str(inspection.get("detected_scheme") or "n/a")),
+        ("Block", str(inspection.get("detected_block") or "n/a")),
+        ("Declared method", str(inspection.get("quant_method") or "n/a")),
+        ("Activation scheme", str(inspection.get("activation_scheme") or "n/a")),
+    ]
+    out += _table(facts, ("Property", "Value"))
+    out.append("")
+    coverage = inspection.get("coverage") or {}
+    rows = []
+    for component, counts in coverage.items():
+        total = (counts or {}).get("weights") or 0
+        done = (counts or {}).get("quantized") or 0
+        if not total and not done:
+            continue
+        verdict = "all" if done and done >= total else ("none" if not done else "some")
+        rows.append((component, f"{done} / {total}", verdict))
+    if rows:
+        out += _table(rows, ("Component", "Quantized weights", "Coverage"))
+        out.append("")
+    partial = [name for name, _, verdict in rows if verdict == "some"]
+    if partial:
+        out += [
+            f"Partial coverage in {', '.join(partial)}, so the format name alone "
+            f"does not describe this checkpoint. A QDQ cell selects weights by "
+            f"name pattern and rounds every one it matches, which for a partly "
+            f"quantized component rounds more than the checkpoint does and makes "
+            f"that cell an upper bound rather than a match.",
+            "",
+        ]
+    return out
+
+
 def _attribution(receipt: dict[str, Any]) -> list[str]:
     """Where a routed model's divergence came from, per Law 14."""
     attribution = receipt.get("attribution")
@@ -498,6 +542,8 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
         "the expert it no longer uses costs nothing.",
         "",
     ]
+    out += _deployed_quantization(attribution.get("deployed") or {})
+    out += ["### Component cells", ""]
     rows = [
         (
             "Experts only",
