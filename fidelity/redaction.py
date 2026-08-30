@@ -22,23 +22,66 @@ from typing import Any
 
 REDACTED = "<redacted>"
 
-# Substring match on the upper-cased variable name. Deliberately broad: a false
-# positive costs one line of provenance, a false negative publishes a credential.
-SECRET_NAME_MARKERS = (
-    "TOKEN",
-    "SECRET",
-    "PASSWORD",
-    "PASSWD",
-    "CREDENTIAL",
-    "COOKIE",
-    "SESSION",
-    "AUTH",
-    "API_KEY",
-    "APIKEY",
-    "ACCESS_KEY",
-    "PRIVATE_KEY",
-    "SSH_KEY",
-    "_KEY",
+# Environment variables are named by convention, so a whole underscore-separated
+# word is the unit of matching. Substring matching would catch TOKENIZERS_
+# PARALLELISM; word matching catches HF_TOKEN and VLLM_API_KEY and leaves the
+# tokenizer setting readable.
+SECRET_WORDS = frozenset(
+    {
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "PWD",
+        "KEY",
+        "APIKEY",
+        "CREDENTIAL",
+        "CREDENTIALS",
+        "COOKIE",
+        "AUTH",
+        "AUTHORIZATION",
+        "SESSION",
+    }
+)
+
+# Data fields are named by whoever wrote the schema, so only an exact name counts.
+# This program's own artifacts are full of token_sha256, cache_key, source_key,
+# and eos_token, none of which are credentials; matching a word inside a field
+# name flags all of them and teaches a reader to ignore the check.
+SECRET_FIELD_NAMES = frozenset(
+    {
+        "token",
+        "hf_token",
+        "huggingface_token",
+        "hugging_face_token",
+        "api_token",
+        "access_token",
+        "auth_token",
+        "authtoken",
+        "refresh_token",
+        "session_token",
+        "bearer_token",
+        "secret",
+        "client_secret",
+        "api_secret",
+        "secret_key",
+        "secret_access_key",
+        "aws_secret_access_key",
+        "access_key",
+        "access_key_id",
+        "aws_access_key_id",
+        "api_key",
+        "apikey",
+        "private_key",
+        "ssh_key",
+        "password",
+        "passwd",
+        "pwd",
+        "credential",
+        "credentials",
+        "cookie",
+        "authorization",
+    }
 )
 
 # Recognizable credential shapes, for scanning content whose values we cannot
@@ -54,10 +97,22 @@ SECRET_VALUE_PATTERNS = (
 
 _TEXT_SUFFIXES = (".json", ".md", ".txt", ".csv", ".tsv", ".yaml", ".yml", ".log")
 
+# Values that a credential name can legitimately hold in this program's data: a
+# tokenizer's special-token marker, and a content digest.
+_NOT_A_CREDENTIAL = (
+    re.compile(r"^<\|?[^<>|]+\|?>$"),
+    re.compile(r"^[0-9a-f]{32,}$"),
+)
 
-def is_secret_name(name: str) -> bool:
-    upper = name.upper()
-    return any(marker in upper for marker in SECRET_NAME_MARKERS)
+
+def is_secret_env_name(name: str) -> bool:
+    """Whether an environment variable's value must never be recorded."""
+    return bool(SECRET_WORDS.intersection(re.split(r"[_\-.]", name.upper())))
+
+
+def is_secret_field_name(name: str) -> bool:
+    """Whether a data field's name is exactly a credential's name."""
+    return name.lower().replace("-", "_") in SECRET_FIELD_NAMES
 
 
 def redact_env(env: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -69,7 +124,7 @@ def redact_env(env: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     clean: dict[str, Any] = {}
     hidden: list[str] = []
     for name, value in env.items():
-        if is_secret_name(name):
+        if is_secret_env_name(name):
             clean[name] = REDACTED
             hidden.append(name)
         else:
@@ -82,19 +137,25 @@ def find_secret_values(text: str) -> list[str]:
     return sorted({label for label, rx in SECRET_VALUE_PATTERNS if rx.search(text)})
 
 
+def _could_be_credential(value: str) -> bool:
+    if not value or value == REDACTED:
+        return False
+    return not any(rx.match(value) for rx in _NOT_A_CREDENTIAL)
+
+
 def find_secret_fields(data: Any, path: str = "") -> list[str]:
-    """Paths of credential-named JSON fields still carrying a value.
+    """Paths of exactly-credential-named JSON fields still carrying a value.
 
     Shape matching only catches credentials that look like the issuers we know.
-    A field named like a secret holding anything other than the redaction marker
-    is reported whatever its value looks like.
+    A field whose name *is* a credential's name, holding anything other than the
+    redaction marker, is reported whatever its value looks like.
     """
     found: list[str] = []
     if isinstance(data, dict):
         for key, value in data.items():
             here = f"{path}.{key}" if path else str(key)
-            named = isinstance(key, str) and is_secret_name(key)
-            if named and isinstance(value, str) and value and value != REDACTED:
+            named = isinstance(key, str) and is_secret_field_name(key)
+            if named and isinstance(value, str) and _could_be_credential(value):
                 found.append(here)
             found += find_secret_fields(value, here)
     elif isinstance(data, list):

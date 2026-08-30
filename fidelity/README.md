@@ -258,9 +258,12 @@ models publish, so automation cannot mistake a partial publish for a clean one.
 
 Every text file in the artifact is also scanned two ways: for recognizable
 credential shapes — Hugging Face, GitHub, and OpenAI-style tokens, AWS keys,
-private key blocks — and, in JSON, for any field whose *name* looks like a
-credential and still carries a value, which catches a secret that resembles
-nothing in particular. Either kind of hit refuses the model and the upload, and
+private key blocks — and, in JSON, for any field whose name *is* a credential's
+name (`token`, `api_key`, `password`, and the like) still carrying a value, which
+catches a secret that resembles nothing in particular. Field names match exactly,
+so this artifact's own `token_sha256`, `cache_key`, and `eos_token` are not
+credentials and are not flagged. Either kind of hit refuses the model and the
+upload, and
 that refusal is not skippable, because a published credential cannot be
 unpublished. Assembly redacts credential values out of `environment/runtime.json`
 on every run — in the work directory as well as the library copy — so an artifact

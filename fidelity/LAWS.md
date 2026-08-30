@@ -143,18 +143,18 @@ stack. Kernel selection, driver version, and even ECC state can move a bitwise
 result, so a number without its stack cannot be reproduced or defended.
 
 **Never a credential.** Provenance records that a variable was set, never a
-credential's value. Watched variable names are matched broadly, which puts
-`HF_TOKEN` in the same namespace as `HF_HOME`, so any name that looks like a
-token, key, password, or session is recorded with its value replaced. Redaction
+credential's value. The watched prefixes put `HF_TOKEN` in the same namespace as
+`HF_HOME`, so a variable with a whole name-word of `TOKEN`, `KEY`, `SECRET`,
+`PASSWORD`, `AUTH`, `COOKIE`, or `SESSION` is recorded with its value replaced. Redaction
 applies at capture, again at rendering, and again as a refusal to upload, because
 a published credential cannot be unpublished.
 
 **Check.** The artifact contains an environment report whose GPU, driver, torch,
 vLLM, and commit fields are populated, and whose recorded checkpoint hashes match
 those referenced by the reports. Publication additionally scans every text file in
-the artifact, refusing on a recognizable credential shape or on a
-credential-named field that still carries a value, and that refusal cannot be
-overridden or skipped.
+the artifact, refusing on a recognizable credential shape or on a field whose name
+is exactly a credential's name and still carries a value, and that refusal cannot
+be overridden or skipped.
 
 **Override.** Not permitted.
 

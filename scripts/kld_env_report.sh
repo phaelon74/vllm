@@ -109,15 +109,17 @@ sys.path.insert(0, os.environ.get("KLD_REPO_ROOT") or os.getcwd())
 try:
     from fidelity.redaction import redact_env
 except ImportError:
-    MARKERS = ("TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "COOKIE",
-               "SESSION", "AUTH", "API_KEY", "APIKEY", "ACCESS_KEY",
-               "PRIVATE_KEY", "SSH_KEY", "_KEY")
+    import re
+
+    WORDS = {"TOKEN", "SECRET", "PASSWORD", "PASSWD", "PWD", "KEY", "APIKEY",
+             "CREDENTIAL", "CREDENTIALS", "COOKIE", "AUTH", "AUTHORIZATION",
+             "SESSION"}
 
     def redact_env(env):
         clean = {}
         hidden = []
         for name, value in env.items():
-            if any(marker in name.upper() for marker in MARKERS):
+            if WORDS.intersection(re.split(r"[_\-.]", name.upper())):
                 clean[name] = "<redacted>"
                 hidden.append(name)
             else:
