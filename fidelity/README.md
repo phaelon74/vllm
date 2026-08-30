@@ -296,8 +296,43 @@ Law 14 makes the decomposition mandatory for any reference whose config declares
 experts. `campaign.py` detects that from the checkpoint, inspects the deployed
 candidate for its scheme and router coverage, builds the cells with `qdq.py`,
 scores them against the capture the deployed run already produced, and writes
-`attribution.json`. Compliance refuses a routed candidate that has none, and the
-one-pager prints the cells with the ranking floor beside them.
+`attribution.json`. Compliance refuses a routed candidate that has none, and also
+refuses one whose capture manifest predates routing detection, so a routed model
+cannot exempt itself by omission. The one-pager prints the cells with the ranking
+floor beside them and links every supporting report and QDQ manifest; the
+leaderboard carries an experts-only column next to the deployed mean.
+
+Cells are named for the component carrying the error rather than written as `B×Q`
+or `Q×B`. That notation leaves the order of the factors to the reader, and it is
+routinely read both ways, which turns a shared metric into two different metrics
+wearing one label.
+
+### Where each cell sits on the perturbation ladder
+
+Quantization is not the only thing between a reference and a served token. Ordered
+by what each rung adds:
+
+| Rung | What it adds | Cell |
+|---|---|---|
+| 0 | Two implementations of the same high-precision weights | not measured — see below |
+| 1 | Weight rounding, reference routing | `expert_cell` |
+| 2 | Routing flips on top of weight rounding | `composite_cell` |
+| 3 | Quantized kernels, batch 1, deterministic, BF16 KV | deployed `report.json` |
+| 4 | A quantized KV cache | not measured |
+| 5 | Realistic batching and shapes | not measured |
+
+Rung 3 minus rung 2 is published as the kernel and engine arithmetic term: the
+same rounding, once on BF16 kernels and once on the quantized ones. Rungs 4 and 5
+are out of scope by construction — Law 2 requires eager execution, batch 1, and no
+prefix caching, because a measurement that includes serving variance cannot
+attribute anything. They belong in a serving-variance study that cites this
+artifact as its floor, not in this artifact.
+
+Rung 0 is not the zero baseline. Law 1 compares a reference to itself through one
+implementation and demands exactly 0.0, which is a determinism check. Comparing two
+*implementations* of the same BF16 weights — vLLM against Transformers, say —
+measures something else and would be a genuine floor for cross-stack claims. This
+program does not measure it, and no number here should be read as if it did.
 
 The ladder is the same expert cell at each scheme, which is what makes a later
 comparison possible without rerunning the campaign:

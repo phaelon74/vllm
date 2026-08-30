@@ -454,36 +454,91 @@ def _compliance(receipt: dict[str, Any], baseline: dict[str, Any] | None) -> lis
     return out
 
 
+def _link(cell: dict[str, Any] | None) -> str:
+    """Markdown links to a cell's published report and QDQ manifest.
+
+    Only relative paths are linked. A cell still carrying its work-directory path
+    was not published, and a link into a path the reader does not have is worse
+    than no link.
+    """
+    if not isinstance(cell, dict):
+        return ""
+    links = []
+    for key, label in (("report", "report"), ("qdq_manifest", "manifest")):
+        path = cell.get(key)
+        if isinstance(path, str) and not os.path.isabs(path):
+            links.append(f"[{label}]({path})")
+    return " · ".join(links)
+
+
 def _attribution(receipt: dict[str, Any]) -> list[str]:
     """Where a routed model's divergence came from, per Law 14."""
     attribution = receipt.get("attribution")
     if not isinstance(attribution, dict):
         return []
     deployed = receipt.get("mean_kld")
-    expert = (attribution.get("expert_cell") or {}).get("mean_kld")
+    expert_cell = attribution.get("expert_cell") or {}
+    expert = expert_cell.get("mean_kld")
     router_cell = attribution.get("router_cell") or {}
     router_na = router_cell.get("status") == "not_applicable"
     router = None if router_na else router_cell.get("mean_kld")
     floor = receipt.get("ranking_floor")
 
+    composite = attribution.get("composite_cell") or {}
+    engine = attribution.get("engine_arithmetic")
+
     out = [
         "## Component attribution",
         "",
         "This reference routes tokens to experts, so the deployed mean is not a "
-        "single effect. Each cell below is the reference with one component "
-        "rounded through the deployed scheme, scored on the same tokens.",
+        "single effect. Each cell is the reference with one component rounded "
+        "through the deployed scheme and run on BF16 kernels, scored on the same "
+        "tokens against the same capture. The cells do not sum to the deployed "
+        "mean and are not meant to: once a token is routed elsewhere, degrading "
+        "the expert it no longer uses costs nothing.",
         "",
     ]
     rows = [
-        ("Experts only", _kld(expert)),
+        (
+            "Experts only",
+            "weight precision, reference routing",
+            _kld(expert),
+            _link(expert_cell),
+        ),
         (
             "Router only",
-            "n/a — unquantized in this checkpoint" if router_na else _kld(router),
+            "routing flips, reference experts",
+            "n/a — router unquantized" if router_na else _kld(router),
+            _link(router_cell),
         ),
-        ("Deployed", _kld(deployed)),
     ]
-    out += _table(rows, ("Cell", "Mean KLD"))
+    if composite:
+        rows.append(
+            (
+                "Every quantized component",
+                f"{', '.join(composite.get('components') or [])}, BF16 kernels",
+                _kld(composite.get("mean_kld")),
+                _link(composite),
+            )
+        )
+    rows.append(
+        (
+            "Deployed",
+            "as shipped, quantized kernels",
+            _kld(deployed),
+            "[report.json](report.json)",
+        )
+    )
+    out += _table(rows, ("Cell", "What it isolates", "Mean KLD", "Support"))
     out.append("")
+    if isinstance(engine, (int, float)):
+        out += [
+            f"**Kernel and engine arithmetic: {engine:+.8f}.** The deployed cell "
+            f"differs from the same rounding on BF16 kernels by this much, which "
+            f"is what the quantized kernels contribute beyond the format itself. "
+            f"A number near zero says the format explains the deployment.",
+            "",
+        ]
     if isinstance(floor, (int, float)) and floor > 0:
         out += [
             f"**Ranking floor {_kld(floor)}.** Routing cost saturates: a router "
@@ -520,12 +575,18 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
                     str(entry.get("scheme")),
                     _kld(entry.get("mean_kld")),
                     str(entry.get("variant") or ""),
+                    _link(entry),
                 )
                 for entry in ladder
             ],
-            ("Scheme", "Experts-only mean KLD", "Variant"),
+            ("Scheme", "Experts-only mean KLD", "Variant", "Support"),
         )
         out.append("")
+    out += [
+        "Full cells, digests, and the deployed checkpoint's inspection are in "
+        "[attribution.json](attribution.json).",
+        "",
+    ]
     return out
 
 
@@ -660,10 +721,14 @@ def render_leaderboard(results: list[dict[str, Any]]) -> tuple[str, list[list[An
             overridden = item["receipt"].get("overridden_laws") or []
             if compliant and overridden:
                 status = f"yes (Law {', '.join(str(o) for o in overridden)} override)"
+            attribution = item["receipt"].get("attribution") or {}
+            expert = (attribution.get("expert_cell") or {}).get("mean_kld")
+            floor = item["receipt"].get("ranking_floor")
             rows.append(
                 (
                     item["label"],
                     _kld(report.get("mean_kld")),
+                    _kld(expert) if attribution else "n/a",
                     _kld(report.get("median_kld")),
                     _kld(report.get("p99_kld")),
                     _kld(report.get("max_kld")),
@@ -673,15 +738,24 @@ def render_leaderboard(results: list[dict[str, Any]]) -> tuple[str, list[list[An
                 )
             )
             csv_rows.append([key[:12], item["label"], report.get("mean_kld"),
+                             expert, floor,
                              report.get("median_kld"), report.get("p99_kld"),
                              report.get("max_kld"), report.get("top1_agreement"),
                              report.get("num_positions"), compliant])
         lines += _table(
             rows,
-            ("Candidate", "Mean KLD", "Median", "p99", "Max", "Top-1", "Positions",
-             "Law-compliant"),
+            ("Candidate", "Mean KLD", "Experts only", "Median", "p99", "Max",
+             "Top-1", "Positions", "Law-compliant"),
         )
         lines.append("")
+        if any(m["receipt"].get("ranking_floor") for m in ranked):
+            lines += [
+                "Rows for routed models are ranked on the deployed mean, but the "
+                "deployed mean of a checkpoint with a quantized router is "
+                "dominated by a saturating routing term (Law 14). Compare the "
+                "experts-only column to compare quantization schemes.",
+                "",
+            ]
     return "\n".join(lines).rstrip() + "\n", csv_rows
 
 
@@ -748,7 +822,8 @@ def _cmd_leaderboard(args: argparse.Namespace) -> int:
         os.makedirs(os.path.dirname(os.path.abspath(args.csv)), exist_ok=True)
         with open(args.csv, "w", encoding="utf-8", newline="") as handle:
             writer = csv.writer(handle)
-            writer.writerow(["group", "candidate", "mean_kld", "median_kld",
+            writer.writerow(["group", "candidate", "mean_kld",
+                             "expert_cell_kld", "ranking_floor", "median_kld",
                              "p99_kld", "max_kld", "top1_agreement", "positions",
                              "law_compliant"])
             writer.writerows(csv_rows)

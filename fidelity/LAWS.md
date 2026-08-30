@@ -309,6 +309,12 @@ floor. Two candidates whose deployed means differ by less than the router cell a
 not ranked by that difference, and an artifact that ranks them ranks them on the
 expert cell and says so in the same sentence as the claim.
 
+**Naming.** Cells are named for the component that carries the error, never as
+`B×Q` or `Q×B`. That notation does not say which factor is the router, and two
+readers will order it two ways and mean opposite things by the same symbol. A cell
+is `expert_cell`, `router_cell`, or `composite_cell`, and a published artifact
+spells out what each one isolates.
+
 **Ladder.** A campaign on a routed reference also scores the expert cell at each
 scheme on its ladder, not only at the deployed one. The cost of one more cell is a
 QDQ pass and a scoring run against a capture that already exists; the cost of not

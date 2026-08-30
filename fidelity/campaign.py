@@ -418,6 +418,7 @@ def attribute_model(
     model: Model,
     deployed: Candidate,
     capture_dir: str,
+    deployed_report: str,
 ) -> str | None:
     """Score the component cells and the scheme ladder for a routed model.
 
@@ -470,10 +471,14 @@ def attribute_model(
             _prune_variant(variant)
         return cell
 
+    with open(deployed_report, encoding="utf-8") as handle:
+        deployed_mean = json.load(handle).get("mean_kld")
     attribution: dict[str, Any] = {
         "deployed": {
             "candidate": deployed.name,
             "scheme": deployed_scheme,
+            "mean_kld": deployed_mean,
+            "report": deployed_report,
             "inspection": inspection,
         },
         "expert_cell": score_variant("experts", deployed_scheme),
@@ -489,6 +494,27 @@ def attribute_model(
                 f"weights quantized"
             ),
         }
+
+    # Every component the deployed checkpoint quantizes, rounded through QDQ and
+    # run on BF16 kernels. Subtracting it from the deployed mean leaves what the
+    # quantized kernels themselves contribute, which no cell above can see.
+    quantized = [
+        component
+        for component in qdq.COMPONENTS
+        if (inspection["coverage"].get(component) or {}).get("quantized")
+    ]
+    if quantized == ["experts"]:
+        composite = dict(attribution["expert_cell"])
+    elif quantized:
+        composite = score_variant(",".join(quantized), deployed_scheme)
+    else:
+        composite = {}
+    if composite:
+        attribution["composite_cell"] = dict(composite, components=quantized)
+        if isinstance(deployed_mean, (int, float)) and isinstance(
+            composite.get("mean_kld"), (int, float)
+        ):
+            attribution["engine_arithmetic"] = deployed_mean - composite["mean_kld"]
 
     ladder = []
     for scheme in config.ladder:
@@ -561,7 +587,7 @@ def cmd_score(config: Config, python: str) -> int:
         print(f"Law 1 satisfied: {model.name} self-KLD is exactly 0.0")
 
         for cand in model.candidates:
-            _, capture = score_one(
+            report, capture = score_one(
                 config, python, cand.name, cand.path, model.reference_path,
                 config.rows, decompose=config.storage != "logits",
                 capture_label=f"{model.name}-ref",
@@ -569,7 +595,7 @@ def cmd_score(config: Config, python: str) -> int:
             # Law 14: a routed model's single mean is not publishable, so the
             # component cells are scored here rather than left to whoever reads
             # the artifact.
-            attribute_model(config, python, model, cand, capture)
+            attribute_model(config, python, model, cand, capture, report)
     return 0
 
 
@@ -608,6 +634,53 @@ def _copy_reference(capture: str, dest: str) -> None:
             os.link(src, dst)
         except OSError:
             shutil.copy2(src, dst)
+
+
+def _publish_attribution(src: str, cand_dir: str) -> None:
+    """Copy every cell's report and QDQ manifest next to the candidate.
+
+    The scored attribution points at the work directory, which no reader of the
+    artifact has. Each supporting file is published under `attribution/` and the
+    paths are rewritten to be relative to the candidate directory, so the
+    one-pager can link them and `checksums.txt` covers them.
+    """
+    with open(src, encoding="utf-8") as handle:
+        attribution = json.load(handle)
+    support = os.path.join(cand_dir, "attribution")
+    os.makedirs(support, exist_ok=True)
+
+    def publish(cell: dict[str, Any]) -> None:
+        variant = cell.get("variant") or "cell"
+        for key, suffix in (
+            ("report", "report.json"),
+            ("qdq_manifest", "qdq-manifest.json"),
+        ):
+            path = cell.get(key)
+            if not path or not os.path.isfile(path):
+                cell.pop(key, None)
+                continue
+            name = f"{variant}-{suffix}" if key == "qdq_manifest" else f"{variant}.json"
+            shutil.copy2(path, os.path.join(support, name))
+            cell[key] = f"attribution/{name}"
+
+    for key in ("expert_cell", "router_cell", "composite_cell"):
+        cell = attribution.get(key)
+        if isinstance(cell, dict):
+            publish(cell)
+    for entry in attribution.get("ladder") or []:
+        if isinstance(entry, dict):
+            publish(entry)
+    # The deployed report is already published as report.json beside this file.
+    deployed = attribution.get("deployed")
+    if isinstance(deployed, dict) and deployed.get("report"):
+        deployed["report"] = "report.json"
+
+    with open(
+        os.path.join(cand_dir, "attribution.json"), "w",
+        encoding="utf-8", newline="\n",
+    ) as handle:
+        json.dump(attribution, handle, indent=2, sort_keys=True)
+        handle.write("\n")
 
 
 def _scrub_environment(env_dir: str) -> None:
@@ -697,9 +770,7 @@ def cmd_assemble(config: Config, python: str) -> int:
                 config.work, "attribution", f"{cand.name}.json"
             )
             if os.path.isfile(attribution):
-                shutil.copy2(
-                    attribution, os.path.join(cand_dir, "attribution.json")
-                )
+                _publish_attribution(attribution, cand_dir)
 
         # Law 12 verifies the assembled tree, so checksums must exist before
         # compliance runs. Swapping these two steps produces a spurious failure.

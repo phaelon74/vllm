@@ -442,6 +442,15 @@ def _cell_comparable(cell: dict[str, Any], c: Campaign) -> str | None:
 def law_14_component_attribution(c: Campaign) -> Finding:
     """A routed model's number is attributed to router and experts separately."""
     title = "Component attribution"
+    if "reference_routing" not in c.manifest:
+        return Finding(
+            14,
+            title,
+            FAIL,
+            "capture manifest predates routing detection, so whether this law "
+            "applies is unknown; recapture the reference rather than let a "
+            "routed model exempt itself by omission",
+        )
     routing = c.manifest.get("reference_routing")
     if not routing or not routing.get("num_experts"):
         return Finding(
