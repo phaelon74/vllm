@@ -352,6 +352,50 @@ def load_token_suite(
     return windows, identity
 
 
+def _dump_positions(chunks: Any, score_from: int, path: str) -> None:
+    """Write the per-position arrays the summary reduces away.
+
+    A mean over two million positions hides whether it describes all of them or
+    a few hundred outliers, and those are different findings: broad precision
+    loss versus a small number of positions where something structural changed.
+    The arrays are what a tail analysis needs and are far too small to justify
+    recomputing a scoring run to get them.
+    """
+    from vllm.v1.sample.kld import slice_kld_result
+
+    kld: list[float] = []
+    reverse: list[float] = []
+    confidence: list[float] = []
+    agree: list[int] = []
+    row_index: list[int] = []
+    depth: list[int] = []
+    for index, chunk in enumerate(chunks):
+        sliced = slice_kld_result(chunk, score_from)
+        kld += list(sliced.kld_ref_to_model)
+        reverse += list(sliced.kld_model_to_ref)
+        confidence += list(sliced.ref_top1_prob)
+        agree += [
+            int(a == b) for a, b in zip(sliced.model_top1, sliced.ref_top1)
+        ]
+        row_index += [index] * len(sliced.kld_ref_to_model)
+        depth += [
+            score_from + offset for offset in range(len(sliced.kld_ref_to_model))
+        ]
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    save_file(
+        {
+            "kld": torch.tensor(kld, dtype=torch.float32),
+            "kld_reverse": torch.tensor(reverse, dtype=torch.float32),
+            "ref_top1_prob": torch.tensor(confidence, dtype=torch.float32),
+            "top1_agree": torch.tensor(agree, dtype=torch.uint8),
+            "row": torch.tensor(row_index, dtype=torch.int32),
+            "depth": torch.tensor(depth, dtype=torch.int32),
+        },
+        path,
+    )
+    print(f"Wrote {len(kld)} per-position values to {path}")
+
+
 def _declared_vocab_size(model_path: str) -> int | None:
     """Read the checkpoint's declared output width, padding included.
 
@@ -427,6 +471,7 @@ def calculate_kld(
     token_suite: str | None = None,
     suite_partition: str = "all",
     suite_limit: int | None = None,
+    dump_positions: str | None = None,
 ) -> dict[str, Any]:
     """Two-phase KLD: capture teacher references, then score the student."""
     from vllm.v1.sample.kld import (
@@ -897,6 +942,9 @@ def calculate_kld(
             raise RuntimeError("kld_result is None; KLD plumbing is broken")
         chunks.append(out.kld_result)
 
+    if dump_positions:
+        _dump_positions(chunks, score_from, dump_positions)
+
     report = summarize_kld_rows(
         chunks, score_from=score_from, context_length=context_length
     )
@@ -1248,6 +1296,14 @@ def main():
         "baseline only; a limited run cannot match the suite's partition hash",
     )
     parser.add_argument(
+        "--dump-positions",
+        type=str,
+        default=None,
+        help="Write per-position KLD, reference confidence, top-1 agreement, "
+        "row, and depth to this safetensors file, for tail analysis by "
+        "fidelity/tails.py",
+    )
+    parser.add_argument(
         "--dataset-config",
         type=str,
         default=None,
@@ -1494,6 +1550,7 @@ def main():
         token_suite=args.token_suite,
         suite_partition=args.suite_partition,
         suite_limit=args.suite_limit,
+        dump_positions=args.dump_positions,
     )
     elapsed_time = time.time() - start_time
 

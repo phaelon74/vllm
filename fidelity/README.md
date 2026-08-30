@@ -20,6 +20,7 @@ cannot publish a non-compliant result.
 | `artifact.py` | Renders the one-pager, the leaderboard, and `checksums.txt` |
 | `publish.py` | Uploads to the Hub; refuses anything non-compliant or tampered |
 | `redaction.py` | The one secret policy shared by capture, rendering, and publish |
+| `tails.py` | Whether a mean describes the distribution or a few hundred positions |
 | `campaigns/*.json` | Campaign definitions: suite, geometry, models, candidates |
 
 Scoring itself lives in `examples/offline_inference/score_mode_kld.py`, driven by
