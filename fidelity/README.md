@@ -167,6 +167,7 @@ baseline, the environment — lives once at the model root.
   LAWS.md                       the laws these artifacts were produced under
   leaderboard.md, leaderboard.csv
   Qwen3.6-27B/
+    LAWS.md                     shipped inside the artifact, which is published alone
     README.md                   this model's identity and its candidate table
     suite/suite-manifest.json   token hashes, sources, strata, partitions
     suite/tokens/               the frozen token IDs that are the evaluation input

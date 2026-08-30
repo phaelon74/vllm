@@ -403,8 +403,12 @@ def cmd_assemble(config: Config, python: str) -> int:
         env_dst = os.path.join(model_root, "environment")
         if os.path.isdir(env_src) and not os.path.isdir(env_dst):
             shutil.copytree(env_src, env_dst)
-        shutil.copy2(os.path.join(HERE, "LAWS.md"),
-                     os.path.join(config.library, "LAWS.md"))
+        # Law 12 reads the artifact directory, and each model root is published as
+        # a self-contained repo, so the laws ship inside it as well as at the
+        # library root. Both copies land before checksums.txt is written.
+        laws = os.path.join(HERE, "LAWS.md")
+        shutil.copy2(laws, os.path.join(config.library, "LAWS.md"))
+        shutil.copy2(laws, os.path.join(model_root, "LAWS.md"))
 
         if config.suite_dir and os.path.isdir(config.suite_dir):
             suite_dst = os.path.join(model_root, "suite")
