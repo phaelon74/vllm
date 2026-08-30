@@ -478,6 +478,8 @@ def cmd_assemble(config: Config, python: str) -> int:
                 "--self-report",
                 os.path.join(model_root, "baselines", "self-kld.json"),
                 "--env-dir", os.path.join(model_root, "environment"),
+                "--artifact-dir", model_root,
+                "--candidate-dir", cand.name,
                 "--label", f"{model.name} / {cand.name}",
                 "--out", os.path.join(cand_dir, "report.md"),
             ])

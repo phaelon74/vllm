@@ -136,6 +136,219 @@ def _identity(
     return ["## Identity", "", *_table(rows, ("Item", "Value")), ""]
 
 
+def _text_line(env_dir: str | None, name: str, needle: str) -> str:
+    """One line out of a captured command's output, by substring."""
+    if not env_dir:
+        return "n/a"
+    path = os.path.join(env_dir, name)
+    if not os.path.isfile(path):
+        return "n/a"
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if needle in line:
+                return line.strip()
+    return "n/a"
+
+
+def _cudnn(value: Any) -> str:
+    """torch reports cuDNN as a packed integer, which reads as a typo otherwise."""
+    if not isinstance(value, int):
+        return "n/a"
+    return f"{value // 10000}.{(value % 10000) // 100}.{value % 100} ({value})"
+
+
+def _environment(runtime_env: dict[str, Any], env_dir: str | None) -> list[str]:
+    """The host, toolchain, and runtime the number is bound to, per Law 6.
+
+    A fidelity number is a property of a stack, not of a checkpoint alone. What is
+    summarized here is recorded in full under ``environment/``; this table is the
+    part a reader needs before deciding whether their own stack is comparable.
+    """
+    torch_info = runtime_env.get("torch") or {}
+    capture = runtime_env.get("capture_runtime_manifest") or {}
+    vllm_info = runtime_env.get("vllm") or {}
+    dirty = runtime_env.get("vllm_tree_dirty")
+    rows = [
+        ("Host", str(runtime_env.get("hostname") or "n/a")),
+        ("Platform", str(runtime_env.get("platform") or "n/a")),
+        ("Python", str(runtime_env.get("python") or "n/a")),
+        ("vLLM", str(vllm_info.get("version") or "n/a")),
+        (
+            "vLLM commit",
+            f"{runtime_env.get('vllm_commit') or 'n/a'}"
+            f"{' (working tree dirty)' if dirty else ''}",
+        ),
+        ("torch", str(torch_info.get("version") or "n/a")),
+        ("torch CUDA runtime", str(torch_info.get("cuda") or "n/a")),
+        ("cuDNN", _cudnn(torch_info.get("cudnn"))),
+        ("NCCL", str(torch_info.get("nccl") or "n/a")),
+        ("CUDA arch list", ", ".join(torch_info.get("arch_list") or []) or "n/a"),
+        ("nvcc", _text_line(env_dir, "toolchain-nvcc.txt", "release")),
+        ("gcc", _text_line(env_dir, "toolchain-gcc.txt", "gcc (")),
+        ("glibc / ldd", _text_line(env_dir, "toolchain-ldd.txt", "ldd (")),
+        ("NVIDIA driver", str(capture.get("driver") or "n/a")),
+        (
+            "float32 matmul precision",
+            str(torch_info.get("float32_matmul_precision") or "n/a"),
+        ),
+        ("TF32 (matmul / cuDNN)",
+         f"{torch_info.get('allow_tf32_matmul')} / "
+         f"{torch_info.get('allow_tf32_cudnn')}"),
+        (
+            "torch deterministic algorithms",
+            str(torch_info.get("deterministic_algorithms")),
+        ),
+    ]
+    out = ["## Environment", "", *_table(rows, ("Item", "Value")), ""]
+
+    devices = runtime_env.get("devices") or []
+    if devices:
+        device_rows = [
+            (
+                str(d.get("index")),
+                str(d.get("name")),
+                str(d.get("capability")),
+                f"{d.get('total_memory_gib')} GiB",
+                str(d.get("multi_processor_count")),
+            )
+            for d in devices
+        ]
+        out += ["### GPUs", ""]
+        out += _table(
+            device_rows,
+            ("Index", "Device", "Compute capability", "Memory", "SMs"),
+        )
+        out.append("")
+
+    env_vars = runtime_env.get("env") or {}
+    if env_vars:
+        out += [
+            "### Captured environment variables",
+            "",
+            "Every set variable matching the prefixes the capture watches: "
+            "`VLLM_`, `TORCH`, `PYTORCH`, `CUDA`, `CUBLAS`, `NCCL`, `TRITON`, "
+            "`FLASHINFER`, `OMP_`, `MKL_`, `HF_`, `SAFETENSORS_`. Any of these can "
+            "move a bitwise result, so they are part of the identity.",
+            "",
+        ]
+        out += _table(
+            [(f"`{k}`", f"`{v}`") for k, v in sorted(env_vars.items())],
+            ("Variable", "Value"),
+        )
+        out.append("")
+    return out
+
+
+def _bytes(size: int) -> str:
+    for limit, unit in ((2**30, "GiB"), (2**20, "MiB"), (2**10, "KiB")):
+        if size >= limit:
+            return f"{size / limit:.2f} {unit}"
+    return f"{size} B"
+
+
+def _size(path: str) -> str:
+    if not os.path.isdir(path):
+        return _bytes(os.path.getsize(path))
+    total = 0
+    count = 0
+    for root, _, names in os.walk(path):
+        count += len(names)
+        total += sum(os.path.getsize(os.path.join(root, name)) for name in names)
+    return f"{_bytes(total)} in {count} file{'' if count == 1 else 's'}"
+
+
+def _files(artifact_dir: str | None, candidate: str | None) -> list[str]:
+    """What every file in the artifact is for, and which ones to reuse.
+
+    An artifact that a reader has to reverse-engineer is not reproducible in any
+    useful sense. The reference distributions in particular are the expensive half
+    of anyone else's comparison, so their reuse is spelled out rather than implied.
+    """
+    if not artifact_dir or not os.path.isdir(artifact_dir):
+        return []
+    prefix = f"{candidate}/" if candidate else ""
+    entries: list[tuple[str, str]] = [
+        (f"{prefix}report.md", "This document."),
+        (f"{prefix}report.json",
+         "Every statistic behind it, machine-readable: per-bucket means, "
+         "percentiles, agreement rates, and the phase timings."),
+        (f"{prefix}manifest.json",
+         "The capture manifest this result is bound to (Law 5). Scoring refuses "
+         "to run if the live configuration differs from it."),
+        (f"{prefix}compliance.json",
+         "The law-by-law receipt, including the comparability key."),
+        ("baselines/self-kld.json",
+         "The zero-baseline proof required by Law 1: the reference scored against "
+         "a capture of itself."),
+        ("suite/suite-manifest.json",
+         "The frozen evaluation input's identity: token hashes per context and per "
+         "partition, sources, strata, and the analysis/qualification split."),
+        ("suite/tokens",
+         "The token IDs themselves. These are the evaluation input, not a "
+         "description of it; retokenizing source text does not reproduce them."),
+        ("suite/sources.json",
+         "Per-context provenance: dataset, revision, licence, source unit, and the "
+         "deterministic token offset chosen within the document."),
+        ("suite/validation/capability-overlap.json",
+         "The benchmark-contamination scan and every document it blocked."),
+        ("reference/manifest.json",
+         "The reference capture's own manifest: geometry, vocabulary, storage "
+         "mode, and a hash for every tensor file."),
+        ("reference",
+         "The reusable reference distributions. Pass this directory as "
+         "`--reference-logits` to score a new candidate against the same "
+         "reference without loading the reference checkpoint."),
+        ("reference/lm_head.safetensors",
+         "The reference language-model head, which turns the stored hidden states "
+         "back into reference logits."),
+        ("environment/runtime.json",
+         "Machine-readable provenance: torch, CUDA, cuDNN, NCCL, driver, devices, "
+         "and the captured environment variables."),
+        ("environment/summary.md",
+         "The same provenance as prose, plus an index of every captured file."),
+        ("environment/toolchain-nvcc.txt",
+         "`nvcc --version` verbatim; `toolchain-gcc.txt` and `toolchain-ldd.txt` "
+         "sit beside it."),
+        ("environment/gpu-smi-query.txt",
+         "`nvidia-smi -q` verbatim: ECC state, persistence mode, clocks, and "
+         "throttle reasons, any of which can move a bitwise result."),
+        ("environment/pip-freeze.txt",
+         "Every installed package version in the scoring environment."),
+        ("environment/models",
+         "Checkpoint fingerprints: file listing, sizes, config and tokenizer "
+         "hashes, and `config.json` verbatim for each model scored."),
+        ("checksums.txt",
+         "`sha256sum --check` compatible over every other file here. This is "
+         "authoritative for integrity (Law 12)."),
+        ("LAWS.md",
+         "The laws this artifact was produced under, including the override "
+         "procedure."),
+    ]
+    rows = []
+    for rel, purpose in entries:
+        full = os.path.join(artifact_dir, rel.replace("/", os.sep))
+        if not os.path.exists(full):
+            # The one-pager is being written as this renders, so it is listed
+            # regardless; anything else absent is simply not part of this artifact.
+            if not rel.endswith("report.md"):
+                continue
+            rows.append((f"`{rel}`", "\u2014", purpose))
+            continue
+        rows.append((f"`{rel}`", _size(full), purpose))
+    if not rows:
+        return []
+    return [
+        "## Files in this artifact",
+        "",
+        "Paths are relative to the artifact root, the same paths `checksums.txt` "
+        "uses. Verify the whole tree with `sha256sum --check checksums.txt` from "
+        "that root.",
+        "",
+        *_table(rows, ("Path", "Size", "What it is")),
+        "",
+    ]
+
+
 def _profiles(report: dict[str, Any]) -> list[str]:
     """Depth and confidence profiles, per Law 9."""
     out: list[str] = []
@@ -253,6 +466,9 @@ def render_onepager(
     runtime_env: dict[str, Any],
     baseline: dict[str, Any] | None,
     label: str,
+    env_dir: str | None = None,
+    artifact_dir: str | None = None,
+    candidate_dir: str | None = None,
 ) -> str:
     """Render the candidate one-pager."""
     parts = _headline(report, label)
@@ -279,6 +495,8 @@ def render_onepager(
     parts += _head_split(report, manifest)
     parts += _profiles(report)
     parts += _compliance(receipt, baseline)
+    parts += _environment(runtime_env, env_dir)
+    parts += _files(artifact_dir, candidate_dir)
     parts += _scope()
     return "\n".join(parts).rstrip() + "\n"
 
@@ -414,9 +632,17 @@ def _cmd_onepager(args: argparse.Namespace) -> int:
     runtime_env = {}
     if args.env_dir:
         runtime_env = _load(os.path.join(args.env_dir, "runtime.json")) or {}
-    label = args.label or os.path.basename(str(report.get("student_model", "candidate")))
+    label = args.label or os.path.basename(
+        str(report.get("student_model", "candidate"))
+    )
+    candidate_dir = args.candidate_dir
+    if candidate_dir is None and args.artifact_dir:
+        here = os.path.dirname(os.path.abspath(args.out))
+        rel = os.path.relpath(here, os.path.abspath(args.artifact_dir))
+        candidate_dir = rel.replace(os.sep, "/") if rel not in (".", "..") else None
     text = render_onepager(
-        report, manifest, receipt, runtime_env, _load(args.self_report), label
+        report, manifest, receipt, runtime_env, _load(args.self_report), label,
+        args.env_dir, args.artifact_dir, candidate_dir,
     )
     _write(args.out, text)
     return 0
@@ -459,6 +685,14 @@ def main() -> int:
     one.add_argument("--receipt", required=True, help="compliance receipt JSON")
     one.add_argument("--self-report", help="zero-baseline report JSON")
     one.add_argument("--env-dir")
+    one.add_argument(
+        "--artifact-dir",
+        help="assembled artifact root, so the one-pager can index its own files",
+    )
+    one.add_argument(
+        "--candidate-dir",
+        help="this candidate's path within the artifact; inferred from --out",
+    )
     one.add_argument("--label")
     one.add_argument("--out", required=True)
     one.set_defaults(func=_cmd_onepager)
