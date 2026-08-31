@@ -244,6 +244,68 @@ def _fp8_quant_dequant(tensor: Any, scheme: str, block_size: int) -> Any:
 SCALE_SUFFIXES = ("weight_scale", "weight_scale_inv", "weight_scale_2", "scales")
 
 
+def unloadable_reason(model: str) -> str | None:
+    """Why vLLM will crash or refuse this checkpoint, or None if unknown.
+
+    Runs on config.json only. The AMD Quark W4A16 export stores AWQ metadata in
+    ``algo_config`` as a list of dicts; ``QuarkConfig.apply_vllm_mapper`` then
+    feeds that list to ``WeightsMapper.apply_list``, which assumes strings and
+    raises ``AttributeError: 'dict' object has no attribute 'endswith'`` inside
+    EngineCore. Installing ``amd-quark`` does not change that: the crash is in
+    vLLM's mapper, and this tree has no INT4 W4A16 QuarkScheme anyway.
+    """
+    path = os.path.join(model, "config.json")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            config = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"config.json unreadable: {exc}"
+    return unloadable_reason_from_config(config)
+
+
+def unloadable_reason_from_config(config: dict[str, Any]) -> str | None:
+    quant = config.get("quantization_config")
+    if not isinstance(quant, dict):
+        return None
+    method = str(quant.get("quant_method") or "").lower()
+    if method != "quark":
+        return None
+    if "export" not in quant:
+        return (
+            "quark checkpoint has no quantization_config.export; "
+            "vLLM refuses to load it"
+        )
+    for key, value in quant.items():
+        if isinstance(value, list) and any(
+            not isinstance(item, str) for item in value
+        ):
+            return (
+                f"quark field {key!r} is a list of non-strings; "
+                "vLLM WeightsMapper.apply_list crashes on load "
+                "(not a missing amd-quark package)"
+            )
+    weight = (quant.get("global_quant_config") or {}).get("weight") or {}
+    dtype = str(weight.get("dtype") or "").lower()
+    if dtype == "int4":
+        qscheme = weight.get("qscheme") or "unspecified"
+        return (
+            f"quark {dtype} {qscheme} is not a vLLM QuarkScheme "
+            "(no W4A16 INT4 path); installing amd-quark will not help"
+        )
+    return None
+
+
+def _quark_declared_scheme(quant: dict[str, Any]) -> str | None:
+    if str(quant.get("quant_method") or "").lower() != "quark":
+        return None
+    weight = (quant.get("global_quant_config") or {}).get("weight") or {}
+    dtype = weight.get("dtype")
+    if not dtype:
+        return None
+    qscheme = weight.get("qscheme")
+    return f"quark_{dtype}" + (f"_{qscheme}" if qscheme else "")
+
+
 def _scale_shapes(model: str) -> dict[str, tuple[int, ...]]:
     """Map each quantized weight to its scale's shape, reading headers only."""
     from safetensors import safe_open
@@ -276,6 +338,8 @@ def inspect(model: str) -> dict[str, Any]:
     with open(os.path.join(model, "config.json"), encoding="utf-8") as handle:
         config = json.load(handle)
     quant = config.get("quantization_config") or {}
+    reason = unloadable_reason_from_config(config)
+    quark_scheme = _quark_declared_scheme(quant)
 
     scales = _scale_shapes(model)
     weight_shapes: dict[str, tuple[int, ...]] = {}
@@ -333,9 +397,10 @@ def inspect(model: str) -> dict[str, Any]:
             for key in ("fmt", "activation_scheme", "weight_block_size", "strategy")
             if quant.get(key) is not None
         },
-        "detected_scheme": granularity,
+        "detected_scheme": quark_scheme or granularity,
         "detected_block": block,
         "coverage": coverage,
+        "unloadable_reason": reason,
     }
 
 
@@ -357,6 +422,8 @@ def render_inspection(report: dict[str, Any]) -> str:
         done = counts["quantized"]
         verdict = "all" if done and done >= total else ("none" if not done else "some")
         lines.append(f"    {component}: {done} / {total} ({verdict})")
+    if report.get("unloadable_reason"):
+        lines += ["", f"  will not load: {report['unloadable_reason']}"]
     router = report["coverage"].get("router") or {}
     if router.get("weights") and not router.get("quantized"):
         lines += [
@@ -514,6 +581,32 @@ def _vllm_version() -> str | None:
 
 def selftest() -> int:
     """Prove the properties the 2x2 depends on, on tensors small enough to check."""
+    amd_quark = {
+        "quantization_config": {
+            "quant_method": "quark",
+            "algo_config": [
+                {"name": "awq", "scaling_layers": [{"inp": "mlp.gate_proj"}]}
+            ],
+            "export": {"kv_cache_group": [], "pack_method": "reorder"},
+            "global_quant_config": {
+                "weight": {"dtype": "int4", "qscheme": "per_group"}
+            },
+        }
+    }
+    reason = unloadable_reason_from_config(amd_quark)
+    assert reason is not None and "algo_config" in reason, reason
+    assert "amd-quark" in reason
+    fp8_quark = {
+        "quantization_config": {
+            "quant_method": "quark",
+            "export": {"kv_cache_group": ["*k_proj"], "pack_method": "reorder"},
+            "exclude": ["lm_head"],
+            "global_quant_config": {
+                "weight": {"dtype": "fp8", "qscheme": "per_tensor"}
+            },
+        }
+    }
+    assert unloadable_reason_from_config(fp8_quark) is None
     import torch
 
     torch.manual_seed(0)

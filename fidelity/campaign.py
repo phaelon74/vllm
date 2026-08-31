@@ -272,6 +272,14 @@ def inspect_checkpoint(
     return dest
 
 
+def refuse_if_unloadable(path: str) -> None:
+    """Raise CampaignError if config.json says vLLM will crash on load."""
+    import qdq as _qdq
+    reason = _qdq.unloadable_reason(path)
+    if reason:
+        raise CampaignError(f"will not load: {reason}")
+
+
 def fetch_checkpoint(repo: str, dest: str, revision: str | None) -> int:
     cmd = ["hf", "download", repo, "--local-dir", dest]
     if revision:
@@ -407,6 +415,13 @@ def cmd_download(config: Config, python: str | None = None) -> int:
                         python, cand.path,
                         inspect_record(config.work, cand.name),
                     )
+                    import qdq as _qdq
+                    reason = _qdq.unloadable_reason(cand.path)
+                    if reason:
+                        print(
+                            f"WARNING  {cand.name} will not load: {reason}",
+                            file=sys.stderr,
+                        )
     if failed:
         print(
             f"{len(failed)} download(s) failed: {', '.join(failed)}",
@@ -922,6 +937,7 @@ def _score_candidate(
     inspect_checkpoint(
         python, cand.path, inspect_record(config.work, cand.name)
     )
+    refuse_if_unloadable(cand.path)
 
     report, capture = score_one(
         config, python, cand.name, cand.path, model.reference_path,
@@ -942,6 +958,29 @@ def _score_candidate(
     attribute_model(config, python, model, cand, capture, report)
 
 
+def preflight_suite(config: Config) -> None:
+    """Refuse to score against a suite_dir that has not been minted.
+
+    A missing suite used to surface as LAW 1 STOP because the baseline is the
+    first scoring command. That is the wrong law: Law 3 requires frozen token
+    IDs, and the model has not been loaded yet.
+    """
+    if not config.suite_dir:
+        return
+    manifest = os.path.join(config.suite_dir, "suite-manifest.json")
+    if os.path.isfile(manifest):
+        return
+    raise SystemExit(
+        f"token suite is not minted: {manifest}\n"
+        "Law 3 requires frozen token IDs before any scoring run. Compare the "
+        "tokenizer against an existing suite of the same family, then either "
+        "point suite_dir at it or mint:\n"
+        f"  python fidelity/suite.py build "
+        f"--recipe fidelity/suites/recipe-v1.json "
+        f"--tokenizer <reference> --out {config.suite_dir}"
+    )
+
+
 def cmd_score(config: Config, python: str) -> int:
     """Gate on the zero baseline, then score candidates.
 
@@ -953,6 +992,7 @@ def cmd_score(config: Config, python: str) -> int:
         raise SystemExit(
             f"unknown fetch={config.fetch!r}; want 'upfront' or 'lease'"
         )
+    preflight_suite(config)
     os.makedirs(config.work, exist_ok=True)
     failed: list[str] = []
 

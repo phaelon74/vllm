@@ -181,6 +181,11 @@ Before a candidate is scored, `provenance.py` compares `architectures`,
 `text_config` when those fields are nested). A mismatch is a failed candidate,
 not a KLD number. The comparison is published as `provenance.json`. Scoring
 writes `inspect.json` so the format matrix is known before GPU time is spent.
+A checkpoint whose `config.json` will crash vLLM on load (for example a Quark
+W4A16 export whose `algo_config` is a list of dicts, which
+`WeightsMapper.apply_list` cannot map) is refused from `config.json` alone.
+That is a skipped candidate, not an EngineCore abort, and installing
+`amd-quark` does not change it.
 
 Every model in a campaign is ingested, scored, and assembled by the identical
 code path. That is the point: a comparison between two candidates means nothing
