@@ -89,11 +89,15 @@ COMPONENT_PATTERNS: dict[str, tuple[str, ...]] = {
 
 # Quantizing these would change what the fidelity comparison means: the head is
 # held constant so trunk and head effects stay separable (Law 8), and the
-# embedding is not a matmul weight in the same sense.
+# embedding is not a matmul weight in the same sense. Normalization weights are
+# excluded because no quantizer touches them - they are 1-D gains, not matmul
+# operands - and counting them as attention coverage misreports a fully
+# quantized projection set as partial.
 NEVER = (
     r"\.?embed_tokens\.weight$",
     r"^lm_head\.weight$",
     r"\.lm_head\.weight$",
+    r"norm\.weight$",
 )
 
 COMPONENTS = tuple(COMPONENT_PATTERNS)
@@ -439,7 +443,15 @@ def convert(
             for name in f.keys():
                 tensor = f.get_tensor(name)
                 component = classify(name, selected)
-                if component is None or not torch.is_floating_point(tensor):
+                # A 1-D parameter is a gain, a bias, or a scale, never a matmul
+                # operand, and no quantizer rounds one. Copying it verbatim keeps
+                # an over-broad pattern from turning into a crash 2 shards into a
+                # 26-shard conversion.
+                if (
+                    component is None
+                    or tensor.ndim < 2
+                    or not torch.is_floating_point(tensor)
+                ):
                     tensors[name] = tensor
                     untouched += 1
                     continue
