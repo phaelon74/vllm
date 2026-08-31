@@ -40,8 +40,12 @@ SCORER = os.path.join(REPO_ROOT, "examples", "offline_inference", "score_mode_kl
 # GiB per request, which vLLM's memory profiler does not account for. These
 # leave room for it rather than letting the KV cache claim the card.
 WEIGHT_FRACTION = 0.60
-KV_CACHE_GIB = 8
-HEADROOM_GIB = 12
+# One sequence of at most a few thousand tokens needs a trivial KV cache, and
+# every GiB reserved for it is a GiB the head-decomposition logits cannot use.
+KV_CACHE_GIB = 2
+# Room for a chunk of vocabulary-wide logits and their float copies, on top of
+# the weights and the cache.
+HEADROOM_GIB = 16
 TP_CANDIDATES = (1, 2, 4, 8)
 
 
@@ -339,8 +343,14 @@ def score_one(
         cmd.append("--decompose-head")
 
     print(f"=== {tag} (TP={tp} util={util:.2f})")
-    rc = _run(cmd, log_path=log,
-              env={"VLLM_USE_V2_MODEL_RUNNER": str(int(config.runner_v2))})
+    rc = _run(cmd, log_path=log, env={
+        "VLLM_USE_V2_MODEL_RUNNER": str(int(config.runner_v2)),
+        # Scoring allocates and frees vocabulary-wide tensors thousands of
+        # times; without expandable segments the pool fragments.
+        "PYTORCH_CUDA_ALLOC_CONF": os.environ.get(
+            "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
+        ),
+    })
     if rc != 0:
         raise SystemExit(f"scoring failed for {tag}; see {log}")
     return report, capture

@@ -1077,6 +1077,12 @@ def _decompose_head_kld(
             if any(result != per_worker[0] for result in per_worker[1:]):
                 raise RuntimeError("Trunk KLD differs across workers")
             trunk_chunks.append(per_worker[0])
+            # A window's hidden states and the logits derived from them are
+            # gigabytes. Held across a thousand windows, the freed-but-reserved
+            # blocks fragment the pool until an allocation that fits nowhere
+            # fails on a GPU that reports free memory.
+            del student_h, hidden_out
+            torch.cuda.empty_cache()
     trunk_report = summarize_kld_rows(
         trunk_chunks,
         score_from=score_from,

@@ -556,8 +556,15 @@ def compute_trunk_kld_in_model(
     teacher_hidden_path: str,
     head_path: str,
     kld_vocab_size: int | None,
+    position_chunk: int = 256,
 ) -> KLDResult:
-    """Compute shared-teacher-head KLD through model logits semantics."""
+    """Compute shared-teacher-head KLD through model logits semantics.
+
+    Positions are processed in chunks. A full row of logits over a large
+    vocabulary is gigabytes, and two of them plus the float copies KLD needs do
+    not fit beside a loaded model and its KV cache. Every quantity here is
+    computed per position, so chunking changes nothing about the result.
+    """
     from safetensors.torch import load_file
 
     student = load_file(student_hidden_path)["hidden_states"]
@@ -567,18 +574,25 @@ def compute_trunk_kld_in_model(
             "Student and teacher hidden-state shapes must match for trunk KLD; "
             f"got {tuple(student.shape)} and {tuple(teacher.shape)}"
         )
+    if position_chunk < 1:
+        raise ValueError(f"position_chunk must be positive, got {position_chunk}")
     weight = load_lm_head_weight(head_path)
     device = next(model.parameters()).device
     replay_state = build_replay_lm_head(model, weight, device)
-    student_logits = replay_lm_head_in_model(
-        model, replay_state, student.to(device)
-    )
-    teacher_logits = replay_lm_head_in_model(
-        model, replay_state, teacher.to(device)
-    )
-    return compute_kld_chunk(
-        student_logits, teacher_logits, kld_vocab_size
-    )
+    chunks: list[KLDResult] = []
+    for start in range(0, student.shape[0], position_chunk):
+        stop = min(start + position_chunk, student.shape[0])
+        student_logits = replay_lm_head_in_model(
+            model, replay_state, student[start:stop].to(device)
+        )
+        teacher_logits = replay_lm_head_in_model(
+            model, replay_state, teacher[start:stop].to(device)
+        )
+        chunks.append(
+            compute_kld_chunk(student_logits, teacher_logits, kld_vocab_size)
+        )
+        del student_logits, teacher_logits
+    return concat_kld_results(chunks)
 
 
 def tokenizer_identity(tokenizer: Any) -> dict[str, Any]:
