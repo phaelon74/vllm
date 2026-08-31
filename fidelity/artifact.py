@@ -590,12 +590,28 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
     out += _table(
         rows, ("Cell", "What it isolates", "Mean KLD", "Selections changed", "Support")
     )
-    out += [
-        "",
-        "The selections column is why none of these cells is routing-free: each "
-        "one reroutes some tokens purely as a consequence of rounding weights "
-        "upstream of a router it never touched.",
+    measured_cells = [
+        cell
+        for cell in (expert_cell, router_cell, composite)
+        if isinstance(cell, dict)
+        and isinstance(cell.get("selection_flip_rate"), (int, float))
     ]
+    if measured_cells:
+        out += [
+            "",
+            "The selections column is why none of these cells is routing-free: "
+            "each one reroutes some tokens purely as a consequence of rounding "
+            "weights upstream of a router it never touched.",
+        ]
+    else:
+        out += [
+            "",
+            "The cells above were scored before per-cell rerouting was recorded, "
+            "so their selection rates are unknown. That does not make them "
+            "routing-free: rounding any weight moves the residual stream and "
+            "every router downstream of it sees different inputs. Only the "
+            "deployed row's rate is measured here.",
+        ]
     out.append("")
     if isinstance(engine, (int, float)):
         share = (
