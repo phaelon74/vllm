@@ -23,6 +23,7 @@ cannot publish a non-compliant result.
 | `tails.py` | Whether a mean describes the distribution or a few hundred positions |
 | `qdq.py` | Builds single-component quantize-dequantize variants of a BF16 checkpoint, and inspects a quantized one for its scheme |
 | `strata.py` | Attributes a mean to the kinds of text it was measured on (Law 15) |
+| `sweep.py` | Reports and reclaims scratch the published library does not use |
 | `campaigns/*.json` | Campaign definitions: suite, geometry, models, candidates |
 
 Scoring itself lives in `examples/offline_inference/score_mode_kld.py`, driven by
@@ -442,6 +443,48 @@ not, so the previous report, receipt, and one-pager were restored.
 `--force` replaces them anyway, which is the right call when the new failure is
 the honest one — a law was added, or the old result was compliant under weaker
 rules.
+
+The environment is the one thing the guard cannot protect, because it is refreshed
+before the candidate loop and belongs to the model rather than to any candidate.
+Assembly therefore leaves it alone when the work directory contributes no report
+and no baseline, since in that case the published environment is the only truthful
+record of whatever did produce the numbers:
+
+```text
+!!! Qwen3.6-27B: no reports or baseline in /work/qwen3.6; leaving the published
+environment untouched
+```
+
+## Reclaiming scratch space
+
+The library is the index. `sweep.py` digests every published file and then asks of
+each work tree whether anything in it is byte-identical to something published.
+Matching by content rather than by path matters: a report is copied into the
+library under a different name than it carries in the work tree, and a run
+assembled from the wrong config leaves files whose names look plausible.
+
+```bash
+python fidelity/sweep.py --library /path/to/library
+```
+
+The dry run is the default and names four categories:
+
+- **Stale trees.** No report in them was ever published. This is the shape a
+  campaign run against the wrong config leaves behind, and it is the one category
+  that is safe to remove wholesale (`--delete-stale`).
+- **Unpruned QDQ variants.** Rebuildable from the reference in minutes, while the
+  `qdq-manifest.json` beside them is the published provenance and stays
+  (`--prune-variants`).
+- **Reference captures.** A cache, not scratch. Deleting one costs a forward pass
+  and tens of gigabytes of rewriting the next time a candidate is scored against
+  that reference, so it takes an explicit `--delete-captures`.
+- **Unpublished reports and logs.** Listed, never deleted. A report is what makes
+  a rescore unnecessary, and a log is the audit trail behind a published number;
+  both are small enough that reclaiming them is a bad trade in either direction.
+
+The sweep refuses to delete anything while a published candidate lacks a passing
+receipt, because until every receipt passes there is no settled latest run to
+sweep against.
 
 ## Overriding a law
 
