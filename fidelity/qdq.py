@@ -530,10 +530,43 @@ def selftest() -> int:
         f"nvfp4 rms {error['nvfp4']} is not worse than mxfp8 "
         f"{error['mxfp8']}; the rounding is wrong somewhere"
     )
-    assert error["fp8_per_channel"] <= error["fp8_per_tensor"], (
-        "a per-channel scale cannot be worse than one scale for the matrix"
+    print(f"  ladder is ordered: nvfp4 {error['nvfp4']:.4f} > mxfp8 "
+          f"{error['mxfp8']:.4f}")
+
+    # FP8 granularity is nearly free on a well-conditioned matrix, because E4M3
+    # carries an exponent per element: the relative step follows the mantissa,
+    # not the scale, so a finer scale buys almost nothing and the small residual
+    # difference is which side of a binade each value lands on. Granularity earns
+    # its keep only when one row's dynamic range does not fit the format.
+    spread = abs(error["fp8_per_channel"] - error["fp8_per_tensor"])
+    assert spread < 0.1 * error["fp8_per_tensor"], (
+        f"per-channel {error['fp8_per_channel']} and per-tensor "
+        f"{error['fp8_per_tensor']} differ by more than 10% on a well-"
+        f"conditioned matrix, which neither granularity should manage"
     )
-    print("  ladder is ordered: nvfp4 > mxfp8, per-channel <= per-tensor")
+
+    # With one row six orders of magnitude louder, a single scale drives the rest
+    # of the matrix into E4M3's subnormals and a per-row scale does not.
+    outlier = weight.clone()
+    outlier[0] *= 1e6
+    # Measured on the quiet rows alone. Over the whole matrix the outlier row
+    # dominates the norm, so a metric relative to it would report that losing
+    # every other row costs nothing.
+    quiet = slice(1, None)
+    by_tensor = _error_stats(
+        outlier[quiet], quantize_dequantize(outlier, "fp8_per_tensor", 64)[quiet]
+    )["relative_rms"]
+    by_channel = _error_stats(
+        outlier[quiet], quantize_dequantize(outlier, "fp8_per_channel", 64)[quiet]
+    )["relative_rms"]
+    assert by_channel < 0.5 * by_tensor, (
+        f"on the quiet rows of a matrix with one outlier row, per-channel "
+        f"{by_channel} did not clearly beat per-tensor {by_tensor}, which is the "
+        f"case granularity exists for"
+    )
+    print(f"  granularity: within 10% when well conditioned; on quiet rows "
+          f"beside an outlier, per-channel {by_channel:.4f} vs per-tensor "
+          f"{by_tensor:.4f}")
 
     stacked = torch.randn(4, 32, 64, dtype=torch.bfloat16)
     stacked[0] *= 1000.0
