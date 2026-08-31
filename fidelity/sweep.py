@@ -39,15 +39,36 @@ def digest(path: str) -> str | None:
     return h.hexdigest()
 
 
-def tree_size(path: str) -> int:
+def tree_stats(path: str) -> tuple[int, int]:
+    """Bytes this tree occupies, and how many of them are shared with elsewhere.
+
+    Counted per inode rather than per name. Assembly publishes the reference by
+    hard link when the work directory and the library sit on one filesystem, so
+    summing file sizes double-counts tens of gigabytes and makes a cache that
+    costs nothing extra look like the largest thing on the disk. Shared bytes
+    survive deletion here because the library still names them.
+    """
     total = 0
+    shared = 0
+    seen: set[tuple[int, int]] = set()
     for root, _, names in os.walk(path):
         for name in names:
             try:
-                total += os.path.getsize(os.path.join(root, name))
+                st = os.lstat(os.path.join(root, name))
             except OSError:
-                pass
-    return total
+                continue
+            key = (st.st_dev, st.st_ino)
+            if key in seen:
+                continue
+            seen.add(key)
+            total += st.st_size
+            if st.st_nlink > 1:
+                shared += st.st_size
+    return total, shared
+
+
+def tree_size(path: str) -> int:
+    return tree_stats(path)[0]
 
 
 def published_digests(library: str) -> set[str]:
@@ -155,9 +176,16 @@ def describe(tree: dict, owners: list[str]) -> None:
     captures = [str(p) for p in tree["captures"]]  # type: ignore[union-attr]
     variants = [str(p) for p in tree["variants"]]  # type: ignore[union-attr]
     if captures:
-        size = sum(tree_size(p) for p in captures)
+        stats = [tree_stats(p) for p in captures]
+        size = sum(s for s, _ in stats)
+        shared = sum(h for _, h in stats)
         plural = "dir" if len(captures) == 1 else "dirs"
         print(f"    captures: {len(captures)} {plural} {gib(size)}  (reusable cache)")
+        if shared:
+            print(
+                f"      {gib(shared)} of that is hard-linked to the published "
+                f"library and would not be freed by deleting it"
+            )
     if variants:
         size = sum(tree_size(p) for p in variants)
         print(f"    variants: {len(variants)} unpruned {gib(size)}  (rebuildable)")
@@ -166,8 +194,17 @@ def describe(tree: dict, owners: list[str]) -> None:
 
 
 def remove(path: str, live: bool) -> int:
-    """Delete a file or tree, returning the bytes reclaimed."""
-    size = tree_size(path) if os.path.isdir(path) else os.path.getsize(path)
+    """Delete a file or tree, returning the bytes actually reclaimed.
+
+    Bytes another name still points at are not reclaimed by unlinking this one,
+    so a hard-linked reference does not count toward the total.
+    """
+    if os.path.isdir(path):
+        total, shared = tree_stats(path)
+        size = total - shared
+    else:
+        st = os.lstat(path)
+        size = 0 if st.st_nlink > 1 else st.st_size
     if live:
         if os.path.isdir(path):
             shutil.rmtree(path)
