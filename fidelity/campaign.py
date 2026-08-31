@@ -960,16 +960,31 @@ def cmd_assemble(config: Config, python: str, force: bool = False) -> int:
         os.makedirs(model_root, exist_ok=True)
         preserved: dict[str, dict[str, bytes]] = {}
 
+        found = [
+            (cand, report)
+            for cand in model.candidates
+            for report in [_find(config.work, cand.name)]
+            if report
+        ]
+        baseline = _find(config.work, f"{model.name}-self")
+
         env_src = os.path.join(config.work, "environment")
         env_dst = os.path.join(model_root, "environment")
         # The source is scrubbed first, so a credential captured before the
         # redaction policy existed stops propagating into later model roots
         # instead of being cleaned up once per copy.
         _scrub_environment(env_src)
-        # Refreshed on every assembly, not copied once. A model root that keeps
-        # the first environment it ever saw publishes numbers beside the stack of
-        # some earlier campaign.
-        if os.path.isdir(env_src):
+        # Refreshed whenever this work directory contributes a measurement, so a
+        # model root cannot keep an environment from some earlier campaign. When
+        # it contributes nothing the existing environment is the truthful record
+        # of whatever did produce the published numbers, and overwriting it would
+        # bind them to a stack that never ran them.
+        if not (found or baseline):
+            print(
+                f"!!! {model.name}: no reports or baseline in {config.work}; "
+                "leaving the published environment untouched"
+            )
+        elif os.path.isdir(env_src):
             shutil.copytree(env_src, env_dst, dirs_exist_ok=True)
         _scrub_environment(env_dst)
         # Law 12 reads the artifact directory, and each model root is published as
@@ -984,7 +999,6 @@ def cmd_assemble(config: Config, python: str, force: bool = False) -> int:
             if not os.path.isdir(suite_dst):
                 shutil.copytree(config.suite_dir, suite_dst)
 
-        baseline = _find(config.work, f"{model.name}-self")
         if baseline:
             os.makedirs(os.path.join(model_root, "baselines"), exist_ok=True)
             shutil.copy2(
@@ -993,10 +1007,9 @@ def cmd_assemble(config: Config, python: str, force: bool = False) -> int:
             )
 
         for cand in model.candidates:
-            report = _find(config.work, cand.name)
-            if not report:
+            if not any(cand is c for c, _ in found):
                 print(f"skipping {cand.name}: no report in {config.work}/reports")
-                continue
+        for cand, report in found:
             tag = os.path.basename(report)[: -len(".json")]
             # Candidates of one model share a teacher capture, so the capture
             # directory carries the reference's label with the candidate's
