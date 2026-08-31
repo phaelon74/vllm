@@ -325,6 +325,13 @@ readers will order it two ways and mean opposite things by the same symbol. A ce
 is `expert_cell`, `router_cell`, or `composite_cell`, and a published artifact
 spells out what each one isolates.
 
+**Weight rounding is not the deployment.** A QDQ cell rounds weights and runs on
+BF16 kernels. A deployed checkpoint may also quantize activations and does use
+quantized kernels, so the artifact reports the deployed mean minus the composite
+cell. On one FP8 MoE checkpoint that term was 40% of the deployed mean, which no
+arrangement of weight-only cells can see. A component decomposition that omits it
+attributes a deployment to weight precision alone and understates it.
+
 **Ladder.** A campaign on a routed reference also scores the expert cell at each
 scheme on its ladder, not only at the deployed one. The cost of one more cell is a
 QDQ pass and a scoring run against a capture that already exists; the cost of not

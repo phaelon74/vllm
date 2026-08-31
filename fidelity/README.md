@@ -321,8 +321,12 @@ by what each rung adds:
 | 4 | A quantized KV cache | not measured |
 | 5 | Realistic batching and shapes | not measured |
 
-Rung 3 minus rung 2 is published as the kernel and engine arithmetic term: the
-same rounding, once on BF16 kernels and once on the quantized ones. Rungs 4 and 5
+Rung 3 minus rung 2 is published as the "beyond weight rounding" term. Where the
+checkpoint quantizes activations, that term carries activation quantization as well
+as kernel arithmetic, and the one-pager says which from the checkpoint's own
+`activation_scheme`. On `Qwen3.6-35B-A3B-FP8` it came to +0.00744 against a
+deployed mean of 0.01838 — 40% of the divergence, invisible to every weight-only
+cell. Rungs 4 and 5
 are out of scope by construction — Law 2 requires eager execution, batch 1, and no
 prefix caching, because a measurement that includes serving variance cannot
 attribute anything. They belong in a serving-variance study that cites this

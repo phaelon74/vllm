@@ -530,6 +530,8 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
 
     composite = attribution.get("composite_cell") or {}
     engine = attribution.get("engine_arithmetic")
+    deployed_cell = attribution.get("deployed") or {}
+    activations = (deployed_cell.get("inspection") or {}).get("activation_scheme")
 
     out = [
         "## Component attribution",
@@ -578,11 +580,24 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
     out += _table(rows, ("Cell", "What it isolates", "Mean KLD", "Support"))
     out.append("")
     if isinstance(engine, (int, float)):
+        share = (
+            f" ({abs(engine) / float(deployed):.0%} of the deployed mean)"
+            if isinstance(deployed, (int, float)) and deployed
+            else ""
+        )
+        cause = (
+            f"The checkpoint quantizes activations ({activations}), so this term "
+            f"is activation quantization together with kernel arithmetic, not "
+            f"kernel arithmetic alone."
+            if activations in ("dynamic", "static")
+            else "The checkpoint quantizes weights only, so this term is kernel "
+            "arithmetic."
+        )
         out += [
-            f"**Kernel and engine arithmetic: {engine:+.8f}.** The deployed cell "
-            f"differs from the same rounding on BF16 kernels by this much, which "
-            f"is what the quantized kernels contribute beyond the format itself. "
-            f"A number near zero says the format explains the deployment.",
+            f"**Beyond weight rounding: {engine:+.8f}**{share}. Every cell above "
+            f"rounds weights and runs on BF16 kernels. The deployed checkpoint "
+            f"differs from the composite cell by this much. {cause} A weight-only "
+            f"analysis, which is what any QDQ cell is, cannot see it.",
             "",
         ]
     if isinstance(floor, (int, float)) and floor > 0:
