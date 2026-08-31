@@ -299,6 +299,52 @@ def capture_environment(config: Config, python: str) -> str:
     return env_dir
 
 
+def score_identity(
+    config: Config,
+    label: str,
+    student: str,
+    teacher: str,
+    rows: int,
+    suite_limit: int | None = None,
+    plan_from: str | None = None,
+) -> tuple[str, str, int, float]:
+    """The tag, suffix, and GPU plan a scoring run would use.
+
+    Separated from the run so a caller can find the report a run would produce
+    without producing it. `plan_from` stands in for the student when planning: a
+    QDQ variant has the reference's geometry, and once its weights are pruned the
+    variant on disk no longer implies the tensor-parallel degree it was scored at.
+    """
+    tp, util, _ = plan_gpus([plan_from or student, teacher])
+    # Everything the capture manifest binds itself to belongs in the directory
+    # name, or a reused capture becomes a confusing abort instead of a recapture.
+    if config.suite_dir:
+        scope = f"{config.suite_partition}{suite_limit or ''}"
+    else:
+        scope = f"r{rows}"
+    suffix = (
+        f"-v{int(config.runner_v2)}-tp{tp}-{scope}"
+        f"-c{config.context_length}-s{config.score_from}"
+    )
+    return f"{label}{suffix}", suffix, tp, util
+
+
+def score_report(
+    config: Config,
+    label: str,
+    student: str,
+    teacher: str,
+    rows: int,
+    suite_limit: int | None = None,
+    plan_from: str | None = None,
+) -> str:
+    """Where a scoring run's report would land."""
+    tag, _, _, _ = score_identity(
+        config, label, student, teacher, rows, suite_limit, plan_from
+    )
+    return os.path.join(config.work, "reports", f"{tag}.json")
+
+
 def score_one(
     config: Config,
     python: str,
@@ -310,6 +356,7 @@ def score_one(
     suite_limit: int | None = None,
     capture_label: str | None = None,
     measure_routing: bool = False,
+    plan_from: str | None = None,
 ) -> tuple[str, str]:
     """Score one pair. Returns (report_path, capture_dir).
 
@@ -319,18 +366,9 @@ def score_one(
     tens of gigabytes and a forward pass to produce identical tensors. It matters
     once a routed model adds a component cell and a scheme ladder.
     """
-    tp, util, _ = plan_gpus([student, teacher])
-    # Everything the capture manifest binds itself to belongs in the directory
-    # name, or a reused capture becomes a confusing abort instead of a recapture.
-    if config.suite_dir:
-        scope = f"{config.suite_partition}{suite_limit or ''}"
-    else:
-        scope = f"r{rows}"
-    suffix = (
-        f"-v{int(config.runner_v2)}-tp{tp}-{scope}"
-        f"-c{config.context_length}-s{config.score_from}"
+    tag, suffix, tp, util = score_identity(
+        config, label, student, teacher, rows, suite_limit, plan_from
     )
-    tag = f"{label}{suffix}"
     capture = os.path.join(
         config.work, "captures", f"{capture_label or label}{suffix}"
     )
@@ -396,6 +434,15 @@ def score_one(
     return report, capture
 
 
+def variant_path(
+    config: Config, reference: str, components: str, scheme: str | None
+) -> str:
+    """Where a QDQ variant lives, whether or not its weights are still there."""
+    slug = components.replace(",", "-")
+    name = f"{os.path.basename(reference)}-qdq-{slug}-{scheme or 'matched'}"
+    return os.path.join(config.work, "variants", name)
+
+
 def build_variant(
     config: Config,
     python: str,
@@ -410,9 +457,8 @@ def build_variant(
     scheme ladder is several checkpoint copies and the report plus the QDQ
     manifest are what an artifact publishes.
     """
-    slug = components.replace(",", "-")
-    name = f"{os.path.basename(reference)}-qdq-{slug}-{scheme or 'matched'}"
-    out = os.path.join(config.work, "variants", name)
+    out = variant_path(config, reference, components, scheme)
+    name = os.path.basename(out)
     if os.path.isfile(os.path.join(out, "qdq-manifest.json")) and glob.glob(
         os.path.join(out, "*.safetensors")
     ):
@@ -511,21 +557,34 @@ def attribute_model(
             capture_manifest = json.load(handle)
 
     def score_variant(components: str, scheme: str | None) -> dict[str, Any]:
-        variant = build_variant(
-            config, python, model.reference_path, deployed.path, components, scheme
-        )
         label = f"{model.name}-qdq-{components.replace(',', '-')}-{scheme or 'matched'}"
+        variant = variant_path(config, model.reference_path, components, scheme)
+        # `prune_variants` deletes a variant's weights once it is scored, so
+        # rebuilding before checking for the report writes a full checkpoint
+        # copy to disk only to discard it again.
+        cached = score_report(
+            config, label, variant, model.reference_path, config.rows,
+            plan_from=model.reference_path,
+        )
+        if not os.path.isfile(cached):
+            variant = build_variant(
+                config, python, model.reference_path, deployed.path,
+                components, scheme,
+            )
         report, _ = score_one(
             config, python, label, variant, model.reference_path, config.rows,
             decompose=False, capture_label=f"{model.name}-ref",
             # A cell that only rounds weights still reroutes tokens, and the
             # cheapest way to show that is to measure it in the cell itself.
             measure_routing=True,
+            plan_from=model.reference_path,
         )
         cell = _cell(
             report, capture_manifest, config, variant, scheme or deployed_scheme
         )
-        if config.prune_variants:
+        if config.prune_variants and glob.glob(
+            os.path.join(variant, "*.safetensors")
+        ):
             _prune_variant(variant)
         return cell
 
