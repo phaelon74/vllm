@@ -249,12 +249,37 @@ def cmd_download(config: Config) -> int:
     return 0
 
 
+def _repo_head() -> str | None:
+    probe = subprocess.run(
+        ["git", "-C", REPO_ROOT, "rev-parse", "HEAD"],
+        capture_output=True, text=True,
+    )
+    return probe.stdout.strip() or None if probe.returncode == 0 else None
+
+
 def capture_environment(config: Config, python: str) -> str:
-    """Run the environment report once per campaign (Law 6)."""
+    """Capture the environment report, refreshing it when the tree moved (Law 6).
+
+    Reusing a capture across code changes makes Law 6 describe a tree that did
+    not produce the numbers, which is the one thing that law exists to prevent.
+    """
     env_dir = os.path.join(config.work, "environment")
-    if os.path.isfile(os.path.join(env_dir, "runtime.json")):
-        print(f"=== environment already captured in {env_dir}")
-        return env_dir
+    runtime_path = os.path.join(env_dir, "runtime.json")
+    if os.path.isfile(runtime_path):
+        head = _repo_head()
+        recorded = None
+        try:
+            with open(runtime_path, encoding="utf-8") as handle:
+                recorded = json.load(handle).get("vllm_commit")
+        except (OSError, json.JSONDecodeError):
+            pass
+        if head and recorded and head == recorded:
+            print(f"=== environment already captured at {head[:12]}")
+            return env_dir
+        print(
+            f"=== recapturing environment: recorded {str(recorded)[:12]}, "
+            f"tree is at {str(head)[:12]}"
+        )
     script = os.path.join(REPO_ROOT, "scripts", "kld_env_report.sh")
     models = [
         p
@@ -773,8 +798,11 @@ def cmd_assemble(config: Config, python: str, force: bool = False) -> int:
         # redaction policy existed stops propagating into later model roots
         # instead of being cleaned up once per copy.
         _scrub_environment(env_src)
-        if os.path.isdir(env_src) and not os.path.isdir(env_dst):
-            shutil.copytree(env_src, env_dst)
+        # Refreshed on every assembly, not copied once. A model root that keeps
+        # the first environment it ever saw publishes numbers beside the stack of
+        # some earlier campaign.
+        if os.path.isdir(env_src):
+            shutil.copytree(env_src, env_dst, dirs_exist_ok=True)
         _scrub_environment(env_dst)
         # Law 12 reads the artifact directory, and each model root is published as
         # a self-contained repo, so the laws ship inside it as well as at the

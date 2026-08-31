@@ -154,6 +154,13 @@ Redaction applies at capture, again at rendering, and again as a refusal to uplo
 because
 a published credential cannot be unpublished.
 
+**Not reused across a moving tree.** The environment report is recaptured whenever
+the repository's HEAD differs from the commit it recorded, and republished into
+every model root on each assembly. A capture carried forward describes a stack that
+did not produce the numbers beside it, which is the failure this law exists to
+prevent and the one hardest to notice, because every field is populated and every
+check passes.
+
 **Check.** The artifact contains an environment report whose GPU, driver, torch,
 vLLM, and commit fields are populated, and whose recorded checkpoint hashes match
 those referenced by the reports. Publication additionally scans every text file in
