@@ -348,6 +348,23 @@ since the manifest binds a capture to the tokens and geometry rather than to the
 candidate — without that, a ladder would recapture identical reference tensors once
 per cell.
 
+## Assembly will not downgrade a published result
+
+Assembly overwrites a candidate's files before compliance runs on them, so a
+campaign pointed at the wrong config can replace a compliant result with a failing
+one. When the previously published receipt was compliant and the new one is not,
+the report, manifest, receipt, one-pager, and attribution are restored and the
+stage exits non-zero:
+
+```text
+REVERTED Qwen3.6-27B-FP8: the published result was law-compliant and this one is
+not, so the previous report, receipt, and one-pager were restored.
+```
+
+`--force` replaces them anyway, which is the right call when the new failure is
+the honest one — a law was added, or the old result was compliant under weaker
+rules.
+
 ## Overriding a law
 
 A deviation needs a named approver, a written justification, and a timestamp

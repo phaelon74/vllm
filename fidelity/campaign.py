@@ -683,6 +683,46 @@ def _publish_attribution(src: str, cand_dir: str) -> None:
         handle.write("\n")
 
 
+PUBLISHED_FILES = (
+    "report.json",
+    "manifest.json",
+    "compliance.json",
+    "report.md",
+    "attribution.json",
+)
+
+
+def _snapshot_candidate(cand_dir: str) -> dict[str, bytes] | None:
+    """Hold a compliant published result in memory, or None if there isn't one.
+
+    Assembly overwrites a candidate's files before compliance runs on the new
+    ones, so a campaign pointed at the wrong config can replace a compliant
+    result with a failing one and leave nothing to fall back to.
+    """
+    receipt = os.path.join(cand_dir, "compliance.json")
+    if not os.path.isfile(receipt):
+        return None
+    try:
+        with open(receipt, encoding="utf-8") as handle:
+            if not json.load(handle).get("compliant"):
+                return None
+    except (OSError, json.JSONDecodeError):
+        return None
+    held: dict[str, bytes] = {}
+    for name in PUBLISHED_FILES:
+        path = os.path.join(cand_dir, name)
+        if os.path.isfile(path):
+            with open(path, "rb") as handle:
+                held[name] = handle.read()
+    return held
+
+
+def _restore_candidate(cand_dir: str, held: dict[str, bytes]) -> None:
+    for name, data in held.items():
+        with open(os.path.join(cand_dir, name), "wb") as handle:
+            handle.write(data)
+
+
 def _scrub_environment(env_dir: str) -> None:
     """Strip credential values out of an assembled environment report."""
     path = os.path.join(env_dir, "runtime.json")
@@ -709,11 +749,13 @@ def _scrub_environment(env_dir: str) -> None:
     )
 
 
-def cmd_assemble(config: Config, python: str) -> int:
+def cmd_assemble(config: Config, python: str, force: bool = False) -> int:
     """Build the library tree, then checksums, then receipts, then documents."""
+    reverted: list[str] = []
     for model in config.models:
         model_root = os.path.join(config.library, model.name)
         os.makedirs(model_root, exist_ok=True)
+        preserved: dict[str, dict[str, bytes]] = {}
 
         env_src = os.path.join(config.work, "environment")
         env_dst = os.path.join(model_root, "environment")
@@ -762,6 +804,9 @@ def cmd_assemble(config: Config, python: str) -> int:
             _copy_reference(capture, os.path.join(model_root, "reference"))
             cand_dir = os.path.join(model_root, cand.name)
             os.makedirs(cand_dir, exist_ok=True)
+            held = _snapshot_candidate(cand_dir)
+            if held:
+                preserved[cand.name] = held
             shutil.copy2(report, os.path.join(cand_dir, "report.json"))
             manifest_src = os.path.join(capture, "manifest.json")
             if os.path.isfile(manifest_src):
@@ -806,6 +851,18 @@ def cmd_assemble(config: Config, python: str) -> int:
                 cmd += ["--approvals", config.approvals]
             if _run(cmd) != 0:
                 failures.append(cand.name)
+                held = preserved.get(cand.name)
+                if held and not force:
+                    _restore_candidate(cand_dir, held)
+                    reverted.append(f"{model.name}/{cand.name}")
+                    print(
+                        f"REVERTED {cand.name}: the published result was "
+                        f"law-compliant and this one is not, so the previous "
+                        f"report, receipt, and one-pager were restored. Fix the "
+                        f"campaign, or pass --force to replace them.",
+                        file=sys.stderr,
+                    )
+                    continue
 
             _run([
                 python, os.path.join(HERE, "artifact.py"), "onepager",
@@ -834,6 +891,13 @@ def cmd_assemble(config: Config, python: str) -> int:
         "--csv", os.path.join(config.library, "leaderboard.csv"),
     ])
     print(f"\nlibrary: {config.library}")
+    if reverted:
+        print(
+            f"reverted to the previously compliant result for: "
+            f"{', '.join(reverted)}",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
@@ -843,6 +907,12 @@ def main() -> int:
         "stage", choices=("download", "score", "assemble", "all")
     )
     parser.add_argument("--config", required=True)
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="allow assembly to replace a compliant published result with one "
+        "that fails a law",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -857,7 +927,7 @@ def main() -> int:
     if args.stage in ("score", "all"):
         cmd_score(config, python)
     if args.stage in ("assemble", "all"):
-        return cmd_assemble(config, python)
+        return cmd_assemble(config, python, force=args.force)
     return 0
 
 
