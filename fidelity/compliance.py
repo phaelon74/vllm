@@ -341,10 +341,15 @@ def law_9_tail_and_depth(c: Campaign) -> Finding:
 def comparability_key(c: Campaign) -> dict[str, Any]:
     """The tuple within which results may be ranked against each other."""
     runtime = c.manifest.get("runtime") or {}
+    # Suite identity comes from what the run recorded, never from the suite file
+    # handed to the audit. Reading it from the latter lets a run that tokenized at
+    # run time borrow the suite_id of a suite it never opened, and report a
+    # complete comparability key for tokens that came from somewhere else.
+    suite_used = c.manifest.get("token_suite") or {}
     return {
         "laws_version": LAWS_VERSION,
         "reference_config_sha256": c.manifest.get("reference_config_sha256"),
-        "suite_id": (c.suite or {}).get("suite_id"),
+        "suite_id": suite_used.get("suite_id"),
         "token_sha256": c.manifest.get("token_sha256"),
         "context_length": c.manifest.get("context_length"),
         "rows": c.manifest.get("rows"),

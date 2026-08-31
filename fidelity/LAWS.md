@@ -224,7 +224,10 @@ comparison is the single easiest way to publish a confident falsehood.
 
 **Check.** Each result records its suite ID, geometry, laws version, and runtime
 manifest hash. The leaderboard groups strictly by that tuple and refuses to place
-rows from differing tuples in one ranking.
+rows from differing tuples in one ranking. The suite identity is read from what the
+scoring run recorded, never from a suite manifest supplied to the audit, or a run
+that tokenized at run time reports a complete key by borrowing the identity of a
+suite it never opened.
 
 **Override.** Not permitted.
 
