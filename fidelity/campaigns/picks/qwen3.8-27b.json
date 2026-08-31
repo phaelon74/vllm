@@ -1,0 +1,19 @@
+{
+  "fp8": [
+    "Qwen/Qwen3.8-27B-FP8"
+  ],
+  "nvfp4": [
+    "unsloth/Qwen3.8-27B-NVFP4",
+    "RadixArk/Qwen3.8-27B-NVFP4",
+    "Inferact/Qwen3.8-27B-NVFP4",
+    "gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090",
+    "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead"
+  ],
+  "int4": [
+    "cyankiwi/Qwen3.8-27B-AWQ-INT4",
+    "philbert440/Qwen3.8-27B-W4A16-AWQ",
+    "RedHatAI/Qwen3.8-27B-INT4",
+    "dbirks/Qwen3.8-27B-W4A16-AutoRound",
+    "amd/Qwen3.8-27B-Quark-AWQ-INT4-W4A16"
+  ]
+}

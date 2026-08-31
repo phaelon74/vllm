@@ -1,0 +1,92 @@
+{
+  "name": "qwen3.8-27b-fidelity",
+  "library": "/media/fmodels2/Local-Inference-Lab/library",
+  "work": "/media/fmodels2/Local-Inference-Lab/work/qwen3.8-27b",
+  "suite_partition": "analysis",
+  "partition": "analysis",
+  "context_length": 2048,
+  "score_from": 0,
+  "runner_v2": false,
+  "storage": "hidden",
+  "max_num_seqs": 1,
+  "fetch": "lease",
+  "models": [
+    {
+      "name": "Qwen3.8-27B",
+      "reference": {
+        "path": "/media/fmodels2/Qwen/Qwen3.8-27B",
+        "hf_repo": "Qwen/Qwen3.8-27B",
+        "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+      },
+      "candidates": [
+        {
+          "name": "Qwen3.8-27B-FP8",
+          "path": "/media/fmodels2/Qwen/Qwen3.8-27B-FP8",
+          "hf_repo": "Qwen/Qwen3.8-27B-FP8",
+          "revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a"
+        },
+        {
+          "name": "Qwen3.8-27B-NVFP4",
+          "path": "/media/fmodels2/unsloth/Qwen3.8-27B-NVFP4",
+          "hf_repo": "unsloth/Qwen3.8-27B-NVFP4",
+          "revision": "57926baca9a82b4d6906b43f2750d55315f5b10f"
+        },
+        {
+          "name": "RadixArk-Qwen3.8-27B-NVFP4",
+          "path": "/media/fmodels2/RadixArk/Qwen3.8-27B-NVFP4",
+          "hf_repo": "RadixArk/Qwen3.8-27B-NVFP4",
+          "revision": "319f741cce68d7914884900c138a1fbb70a42f30"
+        },
+        {
+          "name": "Inferact-Qwen3.8-27B-NVFP4",
+          "path": "/media/fmodels2/Inferact/Qwen3.8-27B-NVFP4",
+          "hf_repo": "Inferact/Qwen3.8-27B-NVFP4",
+          "revision": "6128240ebaf4eaa7bad2b3d1c72c37d677c5f462"
+        },
+        {
+          "name": "Qwen3.8-27B-NVFP4-RTX5090",
+          "path": "/media/fmodels2/gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090",
+          "hf_repo": "gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090",
+          "revision": "0cc27958cefbbe231782ec8511de8c4eb5233348"
+        },
+        {
+          "name": "Qwen3.8-27B-NVFP4-BF16-LMHead",
+          "path": "/media/fmodels2/RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead",
+          "hf_repo": "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead",
+          "revision": "009632fef96dd349150baa780c984e62e70e91fe"
+        },
+        {
+          "name": "Qwen3.8-27B-AWQ-INT4",
+          "path": "/media/fmodels2/cyankiwi/Qwen3.8-27B-AWQ-INT4",
+          "hf_repo": "cyankiwi/Qwen3.8-27B-AWQ-INT4",
+          "revision": "63768c10df38c0395e12ef49edac1bd539eaeeea"
+        },
+        {
+          "name": "Qwen3.8-27B-W4A16-AWQ",
+          "path": "/media/fmodels2/philbert440/Qwen3.8-27B-W4A16-AWQ",
+          "hf_repo": "philbert440/Qwen3.8-27B-W4A16-AWQ",
+          "revision": "7908d42a71077a5e4dc458f273682b12dfe384a0"
+        },
+        {
+          "name": "Qwen3.8-27B-INT4",
+          "path": "/media/fmodels2/RedHatAI/Qwen3.8-27B-INT4",
+          "hf_repo": "RedHatAI/Qwen3.8-27B-INT4",
+          "revision": "2fb0debc365fb6c1683d7d3ad7722470919627a8"
+        },
+        {
+          "name": "Qwen3.8-27B-W4A16-AutoRound",
+          "path": "/media/fmodels2/dbirks/Qwen3.8-27B-W4A16-AutoRound",
+          "hf_repo": "dbirks/Qwen3.8-27B-W4A16-AutoRound",
+          "revision": "1f05c441c4e64ae0549de44fa9ea5a6d43610314"
+        },
+        {
+          "name": "Qwen3.8-27B-Quark-AWQ-INT4-W4A16",
+          "path": "/media/fmodels2/amd/Qwen3.8-27B-Quark-AWQ-INT4-W4A16",
+          "hf_repo": "amd/Qwen3.8-27B-Quark-AWQ-INT4-W4A16",
+          "revision": "0f7ee2559e8dbc25879e1fe1677b2b10708b91a9"
+        }
+      ]
+    }
+  ],
+  "suite_dir": "/media/fmodels2/Local-Inference-Lab/suites/qwen3.8-27b-1024x2048-v1"
+}

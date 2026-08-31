@@ -649,6 +649,11 @@ def main() -> int:
         help="report what a quantized checkpoint quantized, and exit",
     )
     parser.add_argument(
+        "--json-out",
+        default=None,
+        help="write the inspect report as JSON (with --inspect)",
+    )
+    parser.add_argument(
         "--block-size",
         type=int,
         default=None,
@@ -665,7 +670,16 @@ def main() -> int:
     if args.selftest:
         return selftest()
     if args.inspect:
-        print(render_inspection(inspect(args.inspect)))
+        report = inspect(args.inspect)
+        print(render_inspection(report))
+        if args.json_out:
+            os.makedirs(
+                os.path.dirname(os.path.abspath(args.json_out)) or ".",
+                exist_ok=True,
+            )
+            with open(args.json_out, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump(report, handle, indent=2)
+                handle.write("\n")
         return 0
     if not (args.model and args.out and args.components):
         parser.error("--model, --out, and --components are required")

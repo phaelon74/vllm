@@ -12,7 +12,16 @@ Subcommands:
     download   fetch any checkpoint that is named by repo but absent locally
     score      capture the environment, gate on the zero baseline, score candidates
     assemble   build the library tree, checksums, receipts, one-pagers, leaderboard
+    release    drop candidate weights this campaign leased and no longer needs
     all        score then assemble
+
+A candidate that fails provenance, download, or scoring is skipped; the rest of
+the sweep continues and the process exits non-zero. Law 1 still stops the model.
+
+With ``fetch: lease`` in the campaign JSON, ``score`` downloads one candidate at
+a time and deletes those weights after a successful score. The reference is never
+leased. Only a directory this campaign fetched (a lease file under ``work/leases``)
+is eligible for deletion.
 
 Ordering is enforced, not suggested: the zero baseline gates every candidate
 (Law 1), and checksums precede compliance (Law 12).
@@ -31,6 +40,7 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from redaction import redact_env  # noqa: E402 - sibling module
+import provenance as _provenance  # noqa: E402 - sibling module
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
@@ -47,6 +57,10 @@ KV_CACHE_GIB = 2
 # the weights and the cache.
 HEADROOM_GIB = 16
 TP_CANDIDATES = (1, 2, 4, 8)
+
+
+class CampaignError(Exception):
+    """One candidate failed; the campaign may continue with the rest."""
 
 
 @dataclass
@@ -90,6 +104,9 @@ class Config:
     )
     prune_variants: bool = True
     approvals: str | None = None
+    # "upfront" fetches every candidate during download. "lease" fetches one
+    # candidate at a time during score and deletes those weights afterwards.
+    fetch: str = "upfront"
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -212,8 +229,133 @@ def _run(cmd: list[str], log_path: str | None = None, env: dict | None = None) -
         return proc.wait()
 
 
-def cmd_download(config: Config) -> int:
-    """Fetch checkpoints named by repo that are not already on disk."""
+def inspect_record(work: str, name: str) -> str:
+    return os.path.join(work, "inspect", f"{name}.json")
+
+
+def inspect_checkpoint(
+    python: str, path: str, durable: str | None = None
+) -> str | None:
+    """Write inspect.json. Prefer a durable work-tree copy over the checkpoint.
+
+    The beside-checkpoint file is a cache: releasing leased weights deletes it,
+    so assembly and a re-download both need the work-tree record to survive.
+    """
+    cache = os.path.join(path, "inspect.json")
+    dest = durable or cache
+    if durable:
+        os.makedirs(os.path.dirname(os.path.abspath(durable)), exist_ok=True)
+        if os.path.isfile(durable):
+            print(f"=== inspect already at {durable}")
+            return durable
+        if os.path.isfile(cache):
+            shutil.copy2(cache, durable)
+            print(f"=== inspect copied {cache} -> {durable}")
+            return durable
+    elif os.path.isfile(cache):
+        print(f"=== inspect already at {cache}")
+        return cache
+    cmd = [
+        python, os.path.join(HERE, "qdq.py"),
+        "--inspect", path,
+        "--json-out", dest,
+    ]
+    print(f"=== inspecting {path}")
+    if _run(cmd) != 0:
+        print(f"WARNING  inspect failed for {path}", file=sys.stderr)
+        return None
+    if durable and dest != cache and os.path.isdir(path):
+        try:
+            shutil.copy2(dest, cache)
+        except OSError:
+            pass
+    return dest
+
+
+def fetch_checkpoint(repo: str, dest: str, revision: str | None) -> int:
+    cmd = ["hf", "download", repo, "--local-dir", dest]
+    if revision:
+        cmd += ["--revision", revision]
+    print(f"=== downloading {repo} -> {dest}")
+    return _run(cmd)
+
+
+def lease_file(work: str, name: str) -> str:
+    return os.path.join(work, "leases", f"{name}.json")
+
+
+def write_lease(work: str, cand: Candidate) -> str:
+    dest = lease_file(work, name=cand.name)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    payload = {
+        "name": cand.name,
+        "path": cand.path,
+        "hf_repo": cand.hf_repo,
+        "revision": cand.revision,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    with open(dest, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+    return dest
+
+
+def load_lease(work: str, name: str) -> dict[str, Any] | None:
+    path = lease_file(work, name)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def reference_paths(config: Config) -> set[str]:
+    return {os.path.abspath(model.reference_path) for model in config.models}
+
+
+def release_leased(
+    work: str, cand: Candidate, *, protected: set[str]
+) -> float | None:
+    """Delete leased weights. GiB reclaimed, 0 if already gone, None if refused.
+
+    No lease is a no-op. A path mismatch or a protected (reference) path is
+    refused: the directory is left untouched and the lease stays.
+    """
+    lease = load_lease(work, cand.name)
+    if lease is None:
+        return 0.0
+    dest = cand.path
+    if os.path.abspath(dest) != os.path.abspath(lease.get("path") or ""):
+        print(
+            f"WARNING  lease for {cand.name} points at {lease.get('path')}, "
+            f"not {dest}; refusing to delete",
+            file=sys.stderr,
+        )
+        return None
+    abs_dest = os.path.abspath(dest)
+    if abs_dest in protected:
+        print(
+            f"WARNING  refusing to release reference path {dest}",
+            file=sys.stderr,
+        )
+        return None
+    reclaimed = checkpoint_gib(dest) if os.path.isdir(dest) else 0.0
+    if os.path.isdir(dest):
+        print(f"=== releasing {cand.name} ({reclaimed:.2f} GiB) at {dest}")
+        shutil.rmtree(dest)
+    try:
+        os.remove(lease_file(work, cand.name))
+    except OSError:
+        pass
+    return reclaimed
+
+
+def cmd_download(config: Config, python: str | None = None) -> int:
+    """Fetch checkpoints named by repo that are not already on disk.
+
+    With fetch=lease the reference is fetched here and candidates wait for
+    score, which downloads, scores, and releases them one at a time.
+    """
     pending: list[tuple[str, str, str | None]] = []
     for model in config.models:
         if not os.path.isdir(model.reference_path) and model.reference_repo:
@@ -221,31 +363,56 @@ def cmd_download(config: Config) -> int:
                 (model.reference_repo, model.reference_path,
                  model.reference_revision)
             )
+        if config.fetch == "lease":
+            continue
         for cand in model.candidates:
             if not os.path.isdir(cand.path) and cand.hf_repo:
                 pending.append((cand.hf_repo, cand.path, cand.revision))
 
-    missing = [
+    required = [model.reference_path for model in config.models]
+    if config.fetch != "lease":
+        required.extend(
+            cand.path for model in config.models for cand in model.candidates
+        )
+    missing = [p for p in required if not os.path.isdir(p)]
+    missing_unfetchable = [
         p
-        for model in config.models
-        for p in [model.reference_path, *(c.path for c in model.candidates)]
-        if not os.path.isdir(p)
+        for p in missing
+        if p not in {dest for _, dest, _ in pending}
     ]
-    if not pending and missing:
+    if missing_unfetchable:
         raise SystemExit(
             "these checkpoints are absent and have no hf_repo to fetch them "
-            "from:\n  " + "\n  ".join(missing)
+            "from:\n  " + "\n  ".join(missing_unfetchable)
         )
+    if config.fetch == "lease":
+        print("fetch=lease: candidates will be downloaded during score")
 
+    failed: list[str] = []
     for repo, dest, revision in pending:
-        cmd = ["hf", "download", repo, "--local-dir", dest]
-        if revision:
-            cmd += ["--revision", revision]
-        print(f"=== downloading {repo} -> {dest}")
-        if _run(cmd) != 0:
-            raise SystemExit(f"download failed for {repo}")
+        if fetch_checkpoint(repo, dest, revision) != 0:
+            print(f"FAILED  download {repo}", file=sys.stderr)
+            failed.append(repo)
     if not pending:
-        print("every checkpoint is already local")
+        print("every checkpoint this stage needs is already local")
+
+    # Inspection is CPU-only and answers what each checkpoint actually
+    # quantized, which is worth knowing before a GPU-hour is spent.
+    if python:
+        for model in config.models:
+            for cand in model.candidates:
+                config_path = os.path.join(cand.path, "config.json")
+                if os.path.isdir(cand.path) and os.path.isfile(config_path):
+                    inspect_checkpoint(
+                        python, cand.path,
+                        inspect_record(config.work, cand.name),
+                    )
+    if failed:
+        print(
+            f"{len(failed)} download(s) failed: {', '.join(failed)}",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
@@ -430,7 +597,7 @@ def score_one(
         ),
     })
     if rc != 0:
-        raise SystemExit(f"scoring failed for {tag}; see {log}")
+        raise CampaignError(f"scoring failed for {tag}; see {log}")
     return report, capture
 
 
@@ -476,7 +643,7 @@ def build_variant(
     print(f"=== building variant {name}")
     rc = _run(cmd, log_path=os.path.join(config.work, "logs", f"{name}.log"))
     if rc != 0:
-        raise SystemExit(f"variant build failed for {name}")
+        raise CampaignError(f"variant build failed for {name}")
     return out
 
 
@@ -536,7 +703,7 @@ def attribute_model(
     inspection = qdq.inspect(deployed.path)
     deployed_scheme = inspection["detected_scheme"]
     if deployed_scheme is None:
-        raise SystemExit(
+        raise CampaignError(
             f"{deployed.name} carries no weight scales, so there is no deployed "
             f"scheme to attribute. Law 14 needs one; is this candidate actually "
             f"quantized?"
@@ -677,22 +844,145 @@ def qdq_routing(reference_path: str) -> dict[str, Any] | None:
     return None
 
 
+def _report_exists(config: Config, cand: Candidate) -> bool:
+    """True when a deployed report for this candidate is already on disk.
+
+    Tags are `{name}-v{runner}-tp...`, so the prefix is `name + "-v"` rather
+    than `name`, which would also match a longer sibling label.
+    """
+    root = os.path.join(config.work, "reports")
+    if not os.path.isdir(root):
+        return False
+    prefix = cand.name + "-v"
+    return any(
+        name.startswith(prefix) and name.endswith(".json")
+        for name in os.listdir(root)
+    )
+
+
+def _candidate_complete(config: Config, cand: Candidate, routed: bool) -> bool:
+    if not _report_exists(config, cand):
+        return False
+    if not routed:
+        return True
+    return os.path.isfile(
+        os.path.join(config.work, "attribution", f"{cand.name}.json")
+    )
+
+
+def ensure_candidate_weights(config: Config, cand: Candidate) -> None:
+    """Fetch a missing candidate. Raises CampaignError on a fetch fault.
+
+    A successful fetch under fetch=lease writes a lease file so the directory
+    is eligible for deletion after scoring. A directory that was already on
+    disk is never leased.
+    """
+    config_json = os.path.join(cand.path, "config.json")
+    if os.path.isdir(cand.path) and os.path.isfile(config_json):
+        return
+    if not cand.hf_repo:
+        raise CampaignError(
+            f"checkpoint absent at {cand.path} and has no hf_repo"
+        )
+    if fetch_checkpoint(cand.hf_repo, cand.path, cand.revision) != 0:
+        raise CampaignError(f"download failed for {cand.hf_repo}")
+    if not os.path.isfile(os.path.join(cand.path, "config.json")):
+        raise CampaignError(f"download produced no config.json at {cand.path}")
+    if config.fetch == "lease":
+        write_lease(config.work, cand)
+
+
+def maybe_release(config: Config, cand: Candidate) -> None:
+    if config.fetch != "lease":
+        return
+    release_leased(config.work, cand, protected=reference_paths(config))
+
+
+def _score_candidate(
+    config: Config,
+    python: str,
+    model: Model,
+    cand: Candidate,
+    routed: bool,
+) -> None:
+    """Provenance, score, attribute. Raises CampaignError on a candidate fault."""
+    prov_path = os.path.join(config.work, "provenance", f"{cand.name}.json")
+    try:
+        identity = _provenance.compare(model.reference_path, cand.path)
+    except (OSError, json.JSONDecodeError, KeyError) as exc:
+        raise CampaignError(f"provenance unreadable: {exc}") from exc
+    _provenance.write_report(identity, prov_path)
+    if not identity["ok"]:
+        fields = ", ".join(item["field"] for item in identity["differing"])
+        raise CampaignError(
+            f"architecture mismatch on {fields}; this is not a quantization of "
+            f"{model.name}"
+        )
+
+    inspect_checkpoint(
+        python, cand.path, inspect_record(config.work, cand.name)
+    )
+
+    report, capture = score_one(
+        config, python, cand.name, cand.path, model.reference_path,
+        config.rows, decompose=config.storage != "logits",
+        capture_label=f"{model.name}-ref",
+        measure_routing=routed,
+    )
+    try:
+        with open(report, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        payload["candidate_provenance"] = identity
+        with open(report, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CampaignError(f"could not record provenance in {report}: {exc}") from exc
+
+    attribute_model(config, python, model, cand, capture, report)
+
+
 def cmd_score(config: Config, python: str) -> int:
     """Gate on the zero baseline, then score candidates.
 
     The environment is captured by the first scoring run that actually executes.
+    With fetch=lease each candidate is downloaded just before it is scored and
+    released afterwards; the reference stays on disk.
     """
+    if config.fetch not in ("upfront", "lease"):
+        raise SystemExit(
+            f"unknown fetch={config.fetch!r}; want 'upfront' or 'lease'"
+        )
     os.makedirs(config.work, exist_ok=True)
+    failed: list[str] = []
 
     for model in config.models:
         print(f"\n##### {model.name}")
+        if not os.path.isdir(model.reference_path):
+            if not model.reference_repo:
+                raise SystemExit(
+                    f"reference absent at {model.reference_path} and has no "
+                    f"hf_repo to fetch it from"
+                )
+            if fetch_checkpoint(
+                model.reference_repo, model.reference_path,
+                model.reference_revision,
+            ) != 0:
+                raise SystemExit(
+                    f"LAW 1 STOP: could not download reference {model.name}"
+                )
         # Law 1: the reference must reproduce itself before anything else runs.
         # One row suffices, because the only acceptable answer is exact zero.
-        baseline_report, _ = score_one(
-            config, python, f"{model.name}-self", model.reference_path,
-            model.reference_path, 1, decompose=False,
-            suite_limit=1 if config.suite_dir else None,
-        )
+        try:
+            baseline_report, _ = score_one(
+                config, python, f"{model.name}-self", model.reference_path,
+                model.reference_path, 1, decompose=False,
+                suite_limit=1 if config.suite_dir else None,
+            )
+        except CampaignError as exc:
+            raise SystemExit(
+                f"LAW 1 STOP: {model.name} baseline scoring failed: {exc}"
+            ) from exc
         with open(baseline_report, encoding="utf-8") as handle:
             baseline = json.load(handle)
         mean = baseline.get("mean_kld")
@@ -710,16 +1000,24 @@ def cmd_score(config: Config, python: str) -> int:
         routed = bool(qdq_routing(model.reference_path))
 
         for cand in model.candidates:
-            report, capture = score_one(
-                config, python, cand.name, cand.path, model.reference_path,
-                config.rows, decompose=config.storage != "logits",
-                capture_label=f"{model.name}-ref",
-                measure_routing=routed,
-            )
-            # Law 14: a routed model's single mean is not publishable, so the
-            # component cells are scored here rather than left to whoever reads
-            # the artifact.
-            attribute_model(config, python, model, cand, capture, report)
+            if _candidate_complete(config, cand, routed):
+                print(f"=== {cand.name} already scored")
+                maybe_release(config, cand)
+                continue
+            try:
+                ensure_candidate_weights(config, cand)
+                _score_candidate(config, python, model, cand, routed)
+            except CampaignError as exc:
+                print(f"FAILED  {cand.name}: {exc}", file=sys.stderr)
+                failed.append(f"{model.name}/{cand.name}")
+                continue
+            maybe_release(config, cand)
+    if failed:
+        print(
+            f"\n{len(failed)} candidate(s) failed: {', '.join(failed)}",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
@@ -937,6 +1235,8 @@ PUBLISHED_FILES = (
     "attribution.json",
     "strata.json",
     "strata.md",
+    "provenance.json",
+    "inspect.json",
 )
 
 
@@ -1075,6 +1375,16 @@ def cmd_assemble(config: Config, python: str, force: bool = False) -> int:
             manifest_src = os.path.join(capture, "manifest.json")
             if os.path.isfile(manifest_src):
                 shutil.copy2(manifest_src, os.path.join(cand_dir, "manifest.json"))
+            inspect_src = inspect_record(config.work, cand.name)
+            if not os.path.isfile(inspect_src):
+                inspect_src = os.path.join(cand.path, "inspect.json")
+            if os.path.isfile(inspect_src):
+                shutil.copy2(inspect_src, os.path.join(cand_dir, "inspect.json"))
+            prov_src = os.path.join(
+                config.work, "provenance", f"{cand.name}.json"
+            )
+            if os.path.isfile(prov_src):
+                shutil.copy2(prov_src, os.path.join(cand_dir, "provenance.json"))
             attribution = os.path.join(
                 config.work, "attribution", f"{cand.name}.json"
             )
@@ -1174,34 +1484,138 @@ def cmd_assemble(config: Config, python: str, force: bool = False) -> int:
     return 0
 
 
+def cmd_release(config: Config) -> int:
+    """Drop candidate weights still under lease after an interrupted run."""
+    protected = reference_paths(config)
+    reclaimed = 0.0
+    released = 0
+    refused: list[str] = []
+    for model in config.models:
+        for cand in model.candidates:
+            if load_lease(config.work, cand.name) is None:
+                continue
+            gib = release_leased(config.work, cand, protected=protected)
+            if gib is None:
+                refused.append(cand.name)
+                continue
+            released += 1
+            reclaimed += gib
+    print(
+        f"released {released} leased checkpoint(s), {reclaimed:.2f} GiB reclaimed"
+    )
+    if refused:
+        print(
+            f"refused to release: {', '.join(refused)}",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+def selftest() -> int:
+    """Lease round-trip: leased dirs go, un-leased dirs and the reference stay."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = os.path.join(tmp, "work")
+        org = os.path.join(tmp, "org")
+        leased = os.path.join(org, "leased-model")
+        kept = os.path.join(org, "kept-model")
+        ref = os.path.join(org, "ref")
+        for path in (leased, kept, ref):
+            os.makedirs(path)
+            with open(os.path.join(path, "w.safetensors"), "wb") as handle:
+                handle.write(b"x" * 100)
+
+        leased_cand = Candidate(
+            "leased-model", leased, "org/leased-model", "abc"
+        )
+        kept_cand = Candidate("kept-model", kept, "org/kept-model", "def")
+        ref_cand = Candidate("ref", ref, "org/ref", "aaa")
+        write_lease(work, leased_cand)
+
+        protected = {os.path.abspath(ref)}
+        gone = release_leased(work, leased_cand, protected=protected)
+        assert gone is not None and gone > 0
+        assert not os.path.isdir(leased)
+        assert load_lease(work, leased_cand.name) is None
+
+        stayed = release_leased(work, kept_cand, protected=protected)
+        assert stayed == 0.0
+        assert os.path.isdir(kept)
+
+        write_lease(work, ref_cand)
+        refused = release_leased(work, ref_cand, protected=protected)
+        assert refused is None
+        assert os.path.isdir(ref)
+        assert load_lease(work, ref_cand.name) is not None
+
+        cache_dir = os.path.join(tmp, "ckpt")
+        os.makedirs(cache_dir)
+        cache = os.path.join(cache_dir, "inspect.json")
+        with open(cache, "w", encoding="utf-8") as handle:
+            handle.write('{"ok": true}\n')
+        durable = inspect_record(work, "ckpt")
+        copied = inspect_checkpoint("/no/such/python", cache_dir, durable)
+        assert copied == durable
+        assert os.path.isfile(durable)
+
+    print("selftest passed")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "stage", choices=("download", "score", "assemble", "all")
+        "stage",
+        nargs="?",
+        choices=("download", "score", "assemble", "all", "release"),
     )
-    parser.add_argument("--config", required=True)
+    parser.add_argument("--config")
     parser.add_argument(
         "--force",
         action="store_true",
         help="allow assembly to replace a compliant published result with one "
         "that fails a law",
     )
+    parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args()
+
+    if args.selftest:
+        return selftest()
+    if not args.stage or not args.config:
+        parser.error("stage and --config are required")
 
     config = load_config(args.config)
     started = datetime.now(timezone.utc).isoformat()
     print(f"campaign {config.name} ({config.partition}) started {started}")
 
-    if args.stage == "download":
-        return cmd_download(config)
+    if args.stage == "release":
+        return cmd_release(config)
 
-    python = resolve_python()
-    print(f"interpreter: {python}")
+    python = None
+    try:
+        python = resolve_python()
+        print(f"interpreter: {python}")
+    except SystemExit:
+        if args.stage != "download":
+            raise
+        print(
+            "WARNING  no vLLM interpreter; download will skip inspect",
+            file=sys.stderr,
+        )
+
+    if args.stage == "download":
+        return cmd_download(config, python)
+
+    assert python is not None
+    score_rc = 0
     if args.stage in ("score", "all"):
-        cmd_score(config, python)
+        score_rc = cmd_score(config, python)
     if args.stage in ("assemble", "all"):
-        return cmd_assemble(config, python, force=args.force)
-    return 0
+        assemble_rc = cmd_assemble(config, python, force=args.force)
+        return assemble_rc or score_rc
+    return score_rc
 
 
 if __name__ == "__main__":

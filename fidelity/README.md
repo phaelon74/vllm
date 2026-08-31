@@ -15,13 +15,15 @@ cannot publish a non-compliant result.
 | `suite.py` | Mints the frozen token suite; verifies one; self-tests offline |
 | `suites/recipe-v1.json` | The base recipe: sources, revisions, strata, benchmarks |
 | `bootstrap.sh` | Creates the venv, installs this branch, fetches checkpoints |
-| `campaign.py` | Orchestrates a campaign: score, gate, assemble, render |
+| `campaign.py` | Orchestrates a campaign: download, score, assemble, release, render |
 | `compliance.py` | Fail-closed law evaluation; emits the compliance receipt |
 | `artifact.py` | Renders the one-pager, the leaderboard, and `checksums.txt` |
 | `publish.py` | Uploads to the Hub; refuses anything non-compliant or tampered |
 | `redaction.py` | The one secret policy shared by capture, rendering, and publish |
 | `tails.py` | Whether a mean describes the distribution or a few hundred positions |
 | `qdq.py` | Builds single-component quantize-dequantize variants of a BF16 checkpoint, and inspects a quantized one for its scheme |
+| `curate.py` | Interactive or flag-driven Hub curator: picks candidates, pins revisions, emits a campaign JSON |
+| `provenance.py` | Refuses a candidate whose architecture is not the reference's |
 | `strata.py` | Attributes a mean to the kinds of text it was measured on (Law 15) |
 | `sweep.py` | Reports and reclaims scratch the published library does not use |
 | `campaigns/*.json` | Campaign definitions: suite, geometry, models, candidates |
@@ -127,7 +129,58 @@ it from is a hard error, listed by path.
 
 `campaign.py` runs the stages in the order the laws require, and each stage skips
 work whose output already exists, so an interrupted campaign resumes. Stages can
-also be run individually as `download`, `score`, or `assemble`.
+also be run individually as `download`, `score`, `assemble`, or `release`.
+
+A candidate that fails provenance, download, or scoring is recorded and skipped.
+The rest of the sweep continues, assembly publishes whoever produced a report,
+and the process exits non-zero so a partial campaign is not mistaken for a clean
+one. Law 1 is the exception: a non-zero self-KLD still stops the model.
+
+### Multi-candidate campaigns
+
+`curate.py` writes the campaign JSON. With no `--base` it asks, in order: what
+the base model is; whether you have one candidate, several, or want the pipeline
+to pull X from the Hub to review; where the weights should live (default
+`/media/fmodels2`, laid out as `author/modelname`); whether a local copy of the
+reference can be reused; and whether to delete each candidate after scoring.
+Flags pre-answer those prompts. `--picks` pins an explicit list; omitting it
+searches the Hub and fills `--slots` (default `fp8=1,nvfp4=5,int4=5`) after
+dropping GGUF, MLX, bnb, and derivative-weight name markers. Search also
+recognizes `int8` / `w8a8` / `w8a16`. Every repo is pinned to a commit sha.
+
+```bash
+python fidelity/curate.py
+python fidelity/curate.py --base Qwen/Qwen3.8-27B \
+  --picks fidelity/campaigns/picks/qwen3.8-27b.json \
+  --out fidelity/campaigns/qwen3.8-27b.json \
+  --suite-dir /path/to/suite
+```
+
+A generated config stores weights under `--models-root` (default
+`/media/fmodels2`) as `org/name`, and sets `"fetch": "lease"` unless you pass
+`--fetch upfront`. Lease means `score` downloads the BF16 reference once, then
+each candidate in turn: fetch, score, delete those weights. Peak disk is the
+reference plus one candidate. Only a directory this campaign fetched is
+eligible: `score` writes `work/leases/<name>.json` on a successful download, and
+will not touch a checkpoint that was already on disk or the reference itself. A
+candidate that fails keeps its weights so you can inspect the failure; drop them
+later with:
+
+```bash
+python fidelity/campaign.py release --config fidelity/campaigns/qwen3.8-27b.json
+```
+
+Published artifacts stay reproducible after the weights are gone: each candidate
+pins `hf_repo` and `revision`, and `inspect.json` is stored under
+`work/inspect/` (copied into the assembled tree) rather than only beside the
+checkpoint.
+
+Before a candidate is scored, `provenance.py` compares `architectures`,
+`hidden_size`, `num_hidden_layers`, `layer_types`, `vocab_size`,
+`intermediate_size`, and `head_dim` against the reference (unwrapping
+`text_config` when those fields are nested). A mismatch is a failed candidate,
+not a KLD number. The comparison is published as `provenance.json`. Scoring
+writes `inspect.json` so the format matrix is known before GPU time is spent.
 
 Every model in a campaign is ingested, scored, and assembled by the identical
 code path. That is the point: a comparison between two candidates means nothing
