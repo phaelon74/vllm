@@ -158,10 +158,16 @@ def quantize_dequantize(tensor: Any, scheme: str, block_size: int) -> Any:
         if float(amax) == 0.0:
             return tensor.clone()
         global_scale = (float8_max * nvfp4.FLOAT4_E2M1_MAX / amax).to(torch.float32)
-        if not current_platform.is_cuda_alike() and device.type != "cpu":
-            tensor = tensor.cpu()
-        converted = nvfp4.ref_nvfp4_quant_dequant(tensor, global_scale, block_size)
-        return converted.to(device)
+        # ref_nvfp4_quant_dequant dispatches on the platform, not on the tensor,
+        # so on a CUDA host it always enters a Triton kernel that cannot read a
+        # CPU pointer. Weights are loaded on the CPU here, so move them.
+        work = device
+        if current_platform.is_cuda_alike() and device.type == "cpu":
+            work = torch.device("cuda")
+        converted = nvfp4.ref_nvfp4_quant_dequant(
+            tensor.to(work), global_scale.to(work), block_size
+        )
+        return converted.to(device=device, dtype=tensor.dtype)
 
     if scheme == "mxfp8":
         # vLLM's reference implementation, not its fused kernel: this tool
