@@ -515,6 +515,58 @@ def _deployed_quantization(deployed: dict[str, Any]) -> list[str]:
     return out
 
 
+def _derived_terms(
+    deployed: Any, engine: Any, routing: dict[str, Any]
+) -> list[str]:
+    """The two terms no cell can hold, tabled beside the cells that imply them.
+
+    Both were prose under the cell table, which left the table looking like the
+    whole decomposition and left its emptiest row, the unquantized router, as the
+    last thing a reader saw about routing. Each row links to the section that
+    derives it.
+    """
+    def share(value: Any) -> str:
+        if not isinstance(value, (int, float)):
+            return ""
+        if not isinstance(deployed, (int, float)) or not deployed:
+            return ""
+        return f"{abs(float(value)) / float(deployed):.0%} of the deployed mean"
+
+    rows = []
+    if isinstance(engine, (int, float)):
+        rows.append(
+            (
+                "Beyond weight rounding",
+                f"{engine:+.8f}",
+                share(engine),
+                "activation quantization and kernel arithmetic",
+                "[Beyond weight rounding](#beyond-weight-rounding)",
+            )
+        )
+    excess = routing.get("routing_excess_mean")
+    if isinstance(excess, (int, float)):
+        rows.append(
+            (
+                "Routing, measured",
+                _kld(excess),
+                share(excess),
+                f"expert selection changed at "
+                f"{_pct(routing.get('selection_flip_rate'))} of choices",
+                "[Routing divergence](#routing-divergence)",
+            )
+        )
+    if not rows:
+        return []
+    return [
+        "",
+        "Two terms sit outside every cell above, because no cell can hold them. "
+        "They are the reason the deployed mean is not a precision measurement:",
+        "",
+    ] + _table(
+        rows, ("Term", "Value", "Share", "What it is", "Derived in")
+    )
+
+
 def _attribution(receipt: dict[str, Any]) -> list[str]:
     """Where a routed model's divergence came from, per Law 14."""
     attribution = receipt.get("attribution")
@@ -545,8 +597,9 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
         "No cell here holds expert selection fixed. Rounding any weight changes "
         "the residual stream, and every router downstream of that change sees "
         "different inputs, so each cell carries some routing movement of its "
-        "own. What routing costs is measured directly under Routing divergence "
-        "below, not inferred from these cells.",
+        "own. What routing costs is measured directly under "
+        "[Routing divergence](#routing-divergence), not inferred from these "
+        "cells.",
         "",
     ]
     out += _deployed_quantization(attribution.get("deployed") or {})
@@ -565,7 +618,12 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
             "router weight precision, not the routing term",
             "n/a — router ships unquantized" if router_na else _kld(router),
             "n/a" if router_na else _pct(router_cell.get("selection_flip_rate")),
-            _link(router_cell),
+            # A blank support cell on the row a reader is most likely to stop at
+            # invites the conclusion that routing went unmeasured. It points at
+            # the measurement instead.
+            "[routing divergence](#routing-divergence)"
+            if router_na
+            else _link(router_cell),
         ),
     ]
     if composite:
@@ -590,6 +648,7 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
     out += _table(
         rows, ("Cell", "What it isolates", "Mean KLD", "Selections changed", "Support")
     )
+    out += _derived_terms(deployed, engine, routing)
     measured_cells = [
         cell
         for cell in (expert_cell, router_cell, composite)
@@ -628,7 +687,9 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
             "arithmetic."
         )
         out += [
-            f"**Beyond weight rounding: {engine:+.8f}**{share}. Every cell above "
+            "### Beyond weight rounding",
+            "",
+            f"**{engine:+.8f}**{share}. Every cell above "
             f"rounds weights and runs on BF16 kernels. The deployed checkpoint "
             f"differs from the composite cell by this much. {cause} A weight-only "
             f"analysis, which is what any QDQ cell is, cannot see it.",
@@ -639,7 +700,8 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
             "The deployed checkpoint leaves the router in BF16, so router weight "
             "precision costs exactly nothing here. That is not the same as "
             "routing costing nothing: an identical router fed perturbed "
-            "activations selects different experts, which is measured below.",
+            "activations selects different experts, which is measured under "
+            "[Routing divergence](#routing-divergence).",
             "",
         ]
         evidence = router_cell.get("evidence")
