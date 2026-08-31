@@ -341,6 +341,7 @@ def load_token_suite(
         "limit": limit or None,
         "context_length": lengths.pop(),
         "contexts": len(windows),
+        "context_ids": selected,
         "suite_token_sha256": manifest.get("token_sha256"),
         "partition_token_sha256": actual,
         "tokenizer": manifest.get("tokenizer"),
@@ -394,6 +395,299 @@ def _dump_positions(chunks: Any, score_from: int, path: str) -> None:
         path,
     )
     print(f"Wrote {len(kld)} per-position values to {path}")
+
+
+ROUTING_MANIFEST = "routing-manifest.json"
+
+
+def _routing_filename(idx: int) -> str:
+    return f"routing_{idx:05d}.safetensors"
+
+
+def _capture_reference_routing(
+    reference_model_path: str,
+    windows: list[list[int]],
+    routing_dir: str,
+    llm_kwargs: dict[str, Any],
+    token_hash: str,
+) -> dict[str, Any]:
+    """Record which experts the reference selected, per token and per layer.
+
+    This is a separate pass over the reference rather than part of the
+    hidden-state capture, so an existing capture stays valid: expert IDs are a
+    few hundred megabytes against tens of gigabytes of hidden states, and a
+    campaign that already paid for Phase 1 should not pay again to learn what
+    the router did.
+
+    Returns:
+        The routing manifest, whether it was just written or already present.
+    """
+    from safetensors.numpy import save_file as save_numpy
+    from vllm.v1.sample.kld import read_json, sha256_file, write_json
+
+    os.makedirs(routing_dir, exist_ok=True)
+    manifest_path = os.path.join(routing_dir, ROUTING_MANIFEST)
+    if os.path.isfile(manifest_path):
+        manifest = read_json(manifest_path)
+        if manifest.get("token_sha256") == token_hash and manifest.get(
+            "rows"
+        ) == len(windows):
+            print(
+                f"Routing capture reused: {len(windows)} windows in "
+                f"{routing_dir}"
+            )
+            return manifest
+        raise ValueError(
+            f"{manifest_path} was captured for different tokens or row count; "
+            f"delete it to recapture"
+        )
+
+    print(f"Routing capture: reading reference selections from {routing_dir}")
+    llm = LLM(
+        model=reference_model_path,
+        enable_return_routed_experts=True,
+        **llm_kwargs,
+    )
+    shape: tuple[int, int] | None = None
+    try:
+        for idx, window_tokens in enumerate(windows):
+            prompt: TokensPrompt = {"prompt_token_ids": window_tokens}
+            out = llm.generate(
+                [prompt], sampling_params=SamplingParams(max_tokens=1)
+            )[0]
+            routing = out.outputs[0].routed_experts
+            if routing is None:
+                raise RuntimeError(
+                    "routed_experts is None; this build returned no routing "
+                    "for a prompt, so the routing term cannot be measured"
+                )
+            if routing.shape[0] != len(window_tokens):
+                raise RuntimeError(
+                    f"routing has {routing.shape[0]} rows for a "
+                    f"{len(window_tokens)}-token window"
+                )
+            shape = (int(routing.shape[1]), int(routing.shape[2]))
+            save_numpy(
+                {"routed_experts": routing},
+                os.path.join(routing_dir, _routing_filename(idx)),
+            )
+    finally:
+        del llm
+        gc.collect()
+        torch.accelerator.empty_cache()
+
+    assert shape is not None
+    names = [_routing_filename(i) for i in range(len(windows))]
+    manifest = {
+        "token_sha256": token_hash,
+        "rows": len(windows),
+        "num_layers": shape[0],
+        "num_experts_per_tok": shape[1],
+        "reference_model": os.path.abspath(reference_model_path),
+        "file_hashes": {
+            name: sha256_file(os.path.join(routing_dir, name)) for name in names
+        },
+    }
+    write_json(manifest_path, manifest)
+    print(
+        f"Saved routing for {len(windows)} windows "
+        f"({shape[0]} layers x {shape[1]} experts per token)"
+    )
+    return manifest
+
+
+class _RoutingDivergence:
+    """Accumulate how often the candidate chose different experts, and its cost.
+
+    The question this answers is the one a router-weight cell cannot: the
+    candidate's routers are bit-identical to the reference's, yet the
+    activations reaching them have already been perturbed, so selections change.
+    Nothing here perturbs anything; it compares two runs over the same frozen
+    tokens.
+    """
+
+    BUCKETS = ((0, 0), (1, 1), (2, 3), (4, 7), (8, 1 << 30))
+
+    def __init__(self, num_layers: int, num_experts_per_tok: int):
+        import numpy as np
+
+        self.np = np
+        self.num_layers = num_layers
+        self.topk = num_experts_per_tok
+        self.positions = 0
+        self.pairs = 0
+        self.flipped_pairs = 0
+        self.top1_changed = 0
+        self.slot_disagreements = 0
+        self.per_layer_flipped = np.zeros(num_layers, dtype=np.int64)
+        self.bucket_positions = [0] * len(self.BUCKETS)
+        self.bucket_kld = [0.0] * len(self.BUCKETS)
+        self.kld_total = 0.0
+
+    def update(self, reference, candidate, kld: list[float], score_from: int):
+        """Fold in one window, aligning selections with the positions scored.
+
+        Row ``p`` of the routing arrays is the routing used while predicting
+        token ``p + 1``, which is the position KLD index ``p - score_from``
+        scores, so the two are aligned by construction.
+        """
+        np = self.np
+        end = score_from + len(kld)
+        ref = reference[score_from:end]
+        cand = candidate[score_from:end]
+        if ref.shape != cand.shape:
+            raise ValueError(
+                f"routing shapes differ: reference {ref.shape}, candidate "
+                f"{cand.shape}"
+            )
+        values = np.asarray(kld, dtype=np.float64)
+
+        # Selection is a set, not a ranking: two runs that pick the same experts
+        # in a different order compute the same function.
+        ref_sorted = np.sort(ref.astype(np.int32), axis=-1)
+        cand_sorted = np.sort(cand.astype(np.int32), axis=-1)
+        same_slots = ref_sorted == cand_sorted
+        layer_flipped = ~same_slots.all(axis=-1)
+
+        self.positions += ref.shape[0]
+        self.pairs += ref.shape[0] * self.num_layers
+        self.flipped_pairs += int(layer_flipped.sum())
+        self.slot_disagreements += int((~same_slots).sum())
+        self.per_layer_flipped += layer_flipped.sum(axis=0).astype(np.int64)
+        # Rank 0 is the highest-weighted expert. This also moves when the same
+        # experts are chosen in a different order, which is not a selection
+        # change but does change the weight each expert's output carries.
+        self.top1_changed += int((ref[:, :, 0] != cand[:, :, 0]).sum())
+
+        flipped_layers = layer_flipped.sum(axis=-1)
+        self.kld_total += float(values.sum())
+        for index, (low, high) in enumerate(self.BUCKETS):
+            mask = (flipped_layers >= low) & (flipped_layers <= high)
+            self.bucket_positions[index] += int(mask.sum())
+            self.bucket_kld[index] += float(values[mask].sum())
+
+    def finalize(self) -> dict[str, Any]:
+        if not self.positions:
+            return {}
+        held = self.bucket_positions[0]
+        flipped = self.positions - held
+        mean_held = self.bucket_kld[0] / held if held else None
+        mean_flipped = (
+            (self.kld_total - self.bucket_kld[0]) / flipped if flipped else None
+        )
+        # What the mean would lose if flipped positions diverged no more than
+        # positions whose routing survived. This is the routing term.
+        excess = (
+            (flipped / self.positions) * (mean_flipped - mean_held)
+            if mean_held is not None and mean_flipped is not None
+            else None
+        )
+        return {
+            "num_layers": self.num_layers,
+            "num_experts_per_tok": self.topk,
+            "positions": self.positions,
+            "layer_selections": self.pairs,
+            "selection_flip_rate": self.flipped_pairs / self.pairs,
+            "slot_disagreement_rate": self.slot_disagreements
+            / (self.pairs * self.topk),
+            "top1_expert_change_rate": self.top1_changed / self.pairs,
+            "positions_with_any_flip": flipped,
+            "position_flip_rate": flipped / self.positions,
+            "mean_kld_routing_held": mean_held,
+            "mean_kld_routing_flipped": mean_flipped,
+            "flipped_share_of_total": (
+                (self.kld_total - self.bucket_kld[0]) / self.kld_total
+                if self.kld_total
+                else None
+            ),
+            "routing_excess_mean": excess,
+            "per_layer_flip_rate": [
+                float(count) / self.positions
+                for count in self.per_layer_flipped.tolist()
+            ],
+            "buckets": [
+                {
+                    "flipped_layers_min": low,
+                    "flipped_layers_max": None if high > self.num_layers else high,
+                    "positions": self.bucket_positions[index],
+                    "mean_kld": (
+                        self.bucket_kld[index] / self.bucket_positions[index]
+                        if self.bucket_positions[index]
+                        else None
+                    ),
+                }
+                for index, (low, high) in enumerate(self.BUCKETS)
+            ],
+        }
+
+
+def _compare_window_routing(
+    divergence: "_RoutingDivergence",
+    routing_dir: str,
+    idx: int,
+    out: Any,
+    kld_result: Any,
+    score_from: int,
+) -> None:
+    """Fold one window's candidate selections against the captured reference."""
+    from safetensors.numpy import load_file as load_numpy
+
+    candidate = out.outputs[0].routed_experts if out.outputs else None
+    if candidate is None:
+        raise RuntimeError(
+            "the candidate returned no routed_experts; routing divergence "
+            "cannot be measured without them"
+        )
+    reference = load_numpy(os.path.join(routing_dir, _routing_filename(idx)))[
+        "routed_experts"
+    ]
+    divergence.update(
+        reference, candidate, kld_result.kld_ref_to_model[score_from:], score_from
+    )
+
+
+def _per_context_summary(
+    chunks: Any, score_from: int, context_ids: list[int] | None
+) -> list[dict[str, Any]]:
+    """Reduce each row to a publishable record, keyed to its suite context.
+
+    The suite is stratified by domain, so a single mean answers "how far apart
+    are these two models" but not "on what kind of text". One record per context
+    is what Law 15 joins against the suite manifest, and 768 records cost less
+    than a kilobyte each while the per-position arrays cost tens of megabytes.
+    """
+    from vllm.v1.sample.kld import slice_kld_result
+
+    records: list[dict[str, Any]] = []
+    for index, chunk in enumerate(chunks):
+        sliced = slice_kld_result(chunk, score_from)
+        vals = sorted(sliced.kld_ref_to_model)
+        count = len(vals)
+        if not count:
+            continue
+        agree = sum(
+            1 for a, b in zip(sliced.model_top1, sliced.ref_top1) if a == b
+        )
+        records.append(
+            {
+                "row": index,
+                "context_id": (
+                    context_ids[index]
+                    if context_ids and index < len(context_ids)
+                    else None
+                ),
+                "positions": count,
+                "mean_kld": float(sum(vals) / count),
+                "median_kld": float(vals[count // 2]),
+                "p99_kld": float(vals[min(count - 1, int(0.99 * count))]),
+                "max_kld": float(vals[-1]),
+                "mean_ref_top1_prob": float(
+                    sum(sliced.ref_top1_prob) / count
+                ),
+                "top1_agreement": agree / count,
+            }
+        )
+    return records
 
 
 def _routing_info(model_path: str) -> dict[str, Any] | None:
@@ -509,6 +803,8 @@ def calculate_kld(
     suite_partition: str = "all",
     suite_limit: int | None = None,
     dump_positions: str | None = None,
+    measure_routing: bool = False,
+    routing_dir: str | None = None,
 ) -> dict[str, Any]:
     """Two-phase KLD: capture teacher references, then score the student."""
     from vllm.v1.sample.kld import (
@@ -883,6 +1179,22 @@ def calculate_kld(
             "Hidden-state LM-head replay requires enforce_eager=True"
         )
 
+    routing_manifest: dict[str, Any] | None = None
+    if measure_routing:
+        if reference_model_path is None:
+            raise ValueError(
+                "--measure-routing needs --reference-model: expert selections "
+                "have to be read from the reference itself"
+            )
+        routing_dir = routing_dir or os.path.join(reference_logits_path, "routing")
+        routing_manifest = _capture_reference_routing(
+            reference_model_path,
+            windows,
+            routing_dir,
+            llm_kwargs or {},
+            token_hash,
+        )
+
     if capture_only:
         print(f"Capture-only: skipping Phase 2. References at {reference_logits_path}")
         return {
@@ -896,8 +1208,11 @@ def calculate_kld(
     print(f"Student LM head (static): {student_head_static['state']}")
     print("Phase 2: Computing KLD...")
     print(f"Loading test model: {model_path}")
+    student_kwargs = dict(llm_kwargs or {})
+    if routing_manifest is not None:
+        student_kwargs["enable_return_routed_experts"] = True
     with _phase(timings, "student_load"):
-        llm = LLM(model=model_path, **(llm_kwargs or {}))
+        llm = LLM(model=model_path, **student_kwargs)
     student_uses_v2 = bool(
         llm.llm_engine.vllm_config.use_v2_model_runner
     )
@@ -954,6 +1269,13 @@ def calculate_kld(
             "hidden-state captures (shared teacher head for trunk KLD)"
         )
 
+    divergence: _RoutingDivergence | None = None
+    if routing_manifest is not None:
+        divergence = _RoutingDivergence(
+            int(routing_manifest["num_layers"]),
+            int(routing_manifest["num_experts_per_tok"]),
+        )
+
     chunks: list[KLDResult] = []
     for idx, window_tokens in enumerate(windows):
         if ref_is_directory:
@@ -979,6 +1301,16 @@ def calculate_kld(
         if out.kld_result is None:
             raise RuntimeError("kld_result is None; KLD plumbing is broken")
         chunks.append(out.kld_result)
+        if divergence is not None:
+            with _phase(timings, "routing_compare"):
+                _compare_window_routing(
+                    divergence,
+                    routing_dir,
+                    idx,
+                    out,
+                    out.kld_result,
+                    score_from,
+                )
 
     if dump_positions:
         _dump_positions(chunks, score_from, dump_positions)
@@ -999,6 +1331,11 @@ def calculate_kld(
             os.path.join(reference_logits_path, "manifest.json")
         )
     report["storage"] = capture_kind
+    report["per_context"] = _per_context_summary(
+        chunks, score_from, (suite_identity or {}).get("context_ids")
+    )
+    if divergence is not None:
+        report["routing"] = divergence.finalize()
     if decompose_head:
         with _phase(timings, "decompose_head"):
             extra = _decompose_head_kld(
@@ -1265,6 +1602,32 @@ def _print_kld_report(report: dict[str, Any]) -> None:
             f"    depth [{b['depth_lo']}, {b['depth_hi']}]: n={b['n']} "
             f"mean {b['mean_kld']:.6f}"
         )
+    routing = report.get("routing")
+    if routing:
+        held = routing.get("mean_kld_routing_held")
+        flipped = routing.get("mean_kld_routing_flipped")
+        print("  Routing divergence (identical routers, perturbed inputs):")
+        print(
+            f"    selections changed: "
+            f"{100 * routing['selection_flip_rate']:.3f}% of "
+            f"{routing['layer_selections']} (token, layer) choices"
+        )
+        print(
+            f"    positions with any flip: "
+            f"{100 * routing['position_flip_rate']:.2f}%, carrying "
+            f"{100 * (routing.get('flipped_share_of_total') or 0):.1f}% of the "
+            f"total KLD"
+        )
+        print(
+            f"    mean where routing held: "
+            f"{'n/a' if held is None else f'{held:.8f}'}; where it flipped: "
+            f"{'n/a' if flipped is None else f'{flipped:.8f}'}"
+        )
+        excess = routing.get("routing_excess_mean")
+        print(
+            f"    routing term: "
+            f"{'n/a' if excess is None else f'{excess:+.8f}'}"
+        )
     head = report.get("student_lm_head") or {}
     print(f"  Student LM head: {head.get('state', 'unknown')}")
     print(f"  Storage: {report.get('storage')}")
@@ -1346,6 +1709,21 @@ def main():
         help="Write per-position KLD, reference confidence, top-1 agreement, "
         "row, and depth to this safetensors file, for tail analysis by "
         "fidelity/tails.py",
+    )
+    parser.add_argument(
+        "--measure-routing",
+        action="store_true",
+        help="For a routed reference: record its expert selections in a "
+        "separate pass, then report how often the candidate selected "
+        "different experts and what that cost. Router weight precision is not "
+        "the mechanism; perturbed activations reaching an identical router are",
+    )
+    parser.add_argument(
+        "--routing-dir",
+        type=str,
+        default=None,
+        help="Where reference expert selections live (default: "
+        "<reference capture>/routing)",
     )
     parser.add_argument(
         "--dataset-config",
@@ -1595,6 +1973,8 @@ def main():
         suite_partition=args.suite_partition,
         suite_limit=args.suite_limit,
         dump_positions=args.dump_positions,
+        measure_routing=args.measure_routing,
+        routing_dir=args.routing_dir,
     )
     elapsed_time = time.time() - start_time
 

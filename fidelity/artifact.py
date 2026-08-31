@@ -23,7 +23,7 @@ from typing import Any
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from redaction import redact_env  # noqa: E402 - sibling module
 
-LAWS_VERSION = 2
+LAWS_VERSION = 4
 PROGRAM = "Local Inference Lab"
 
 
@@ -475,8 +475,8 @@ def _deployed_quantization(deployed: dict[str, Any]) -> list[str]:
     """What the shipped checkpoint actually quantized, and how finely.
 
     Rendered before the cells because it decides which cells exist: a checkpoint
-    that leaves its router in BF16 has no router cell to measure, and one that
-    quantizes only part of its attention is not described by "FP8".
+    that leaves its router in BF16 has no router weight cell to measure, and one
+    that quantizes only part of its attention is not described by "FP8".
     """
     inspection = deployed.get("inspection")
     if not isinstance(inspection, dict):
@@ -526,7 +526,6 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
     router_cell = attribution.get("router_cell") or {}
     router_na = router_cell.get("status") == "not_applicable"
     router = None if router_na else router_cell.get("mean_kld")
-    floor = receipt.get("ranking_floor")
 
     composite = attribution.get("composite_cell") or {}
     engine = attribution.get("engine_arithmetic")
@@ -543,20 +542,29 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
         "mean and are not meant to: once a token is routed elsewhere, degrading "
         "the expert it no longer uses costs nothing.",
         "",
+        "No cell here holds expert selection fixed. Rounding any weight changes "
+        "the residual stream, and every router downstream of that change sees "
+        "different inputs, so each cell carries some routing movement of its "
+        "own. What routing costs is measured directly under Routing divergence "
+        "below, not inferred from these cells.",
+        "",
     ]
     out += _deployed_quantization(attribution.get("deployed") or {})
     out += ["### Component cells", ""]
+    routing = receipt.get("routing") or {}
     rows = [
         (
             "Experts only",
-            "weight precision, reference routing",
+            "expert weight precision",
             _kld(expert),
+            _pct(expert_cell.get("selection_flip_rate")),
             _link(expert_cell),
         ),
         (
-            "Router only",
-            "routing flips, reference experts",
-            "n/a — router unquantized" if router_na else _kld(router),
+            "Router weights only",
+            "router weight precision, not the routing term",
+            "n/a — router ships unquantized" if router_na else _kld(router),
+            "n/a" if router_na else _pct(router_cell.get("selection_flip_rate")),
             _link(router_cell),
         ),
     ]
@@ -566,6 +574,7 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
                 "Every quantized component",
                 f"{', '.join(composite.get('components') or [])}, BF16 kernels",
                 _kld(composite.get("mean_kld")),
+                _pct(composite.get("selection_flip_rate")),
                 _link(composite),
             )
         )
@@ -574,10 +583,19 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
             "Deployed",
             "as shipped, quantized kernels",
             _kld(deployed),
+            _pct(routing.get("selection_flip_rate")),
             "[report.json](report.json)",
         )
     )
-    out += _table(rows, ("Cell", "What it isolates", "Mean KLD", "Support"))
+    out += _table(
+        rows, ("Cell", "What it isolates", "Mean KLD", "Selections changed", "Support")
+    )
+    out += [
+        "",
+        "The selections column is why none of these cells is routing-free: each "
+        "one reroutes some tokens purely as a consequence of rounding weights "
+        "upstream of a router it never touched.",
+    ]
     out.append("")
     if isinstance(engine, (int, float)):
         share = (
@@ -600,21 +618,12 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
             f"analysis, which is what any QDQ cell is, cannot see it.",
             "",
         ]
-    if isinstance(floor, (int, float)) and floor > 0:
+    if router_na:
         out += [
-            f"**Ranking floor {_kld(floor)}.** Routing cost saturates: a router "
-            f"perturbation changes an expert selection only when it crosses a "
-            f"near-tie, so schemes of very different precision pay almost the "
-            f"same router cost. Two candidates whose deployed means differ by "
-            f"less than this floor are not ranked by that difference. Rank them "
-            f"on the experts-only cell.",
-            "",
-        ]
-    elif router_na:
-        out += [
-            "The deployed checkpoint leaves the router in BF16, so there is no "
-            "saturating routing term and the deployed mean is attributable to "
-            "the quantized components.",
+            "The deployed checkpoint leaves the router in BF16, so router weight "
+            "precision costs exactly nothing here. That is not the same as "
+            "routing costing nothing: an identical router fed perturbed "
+            "activations selects different experts, which is measured below.",
             "",
         ]
         evidence = router_cell.get("evidence")
@@ -648,6 +657,236 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
         "[attribution.json](attribution.json).",
         "",
     ]
+    return out
+
+
+def _routing(receipt: dict[str, Any]) -> list[str]:
+    """What changing expert selection cost, measured rather than emulated."""
+    routing = receipt.get("routing")
+    if not isinstance(routing, dict) or not routing:
+        return []
+    held = routing.get("mean_kld_routing_held")
+    flipped = routing.get("mean_kld_routing_flipped")
+    excess = routing.get("routing_excess_mean")
+    share = routing.get("flipped_share_of_total")
+    deployed = receipt.get("mean_kld")
+
+    out = [
+        "## Routing divergence",
+        "",
+        f"Both runs saw the same tokens, and the candidate's routers are the "
+        f"reference's routers to the bit where the checkpoint leaves them "
+        f"unquantized. They still selected different experts, because the "
+        f"activations arriving at them were already perturbed. This section "
+        f"compares the two runs' recorded selections over "
+        f"{routing.get('num_layers')} routed layers, "
+        f"{routing.get('num_experts_per_tok')} experts per token.",
+        "",
+    ]
+    out += _table(
+        [
+            (
+                "Selections changed",
+                _pct(routing.get("selection_flip_rate")),
+                f"of {routing.get('layer_selections')} (token, layer) choices",
+            ),
+            (
+                "Expert slots changed",
+                _pct(routing.get("slot_disagreement_rate")),
+                "of individual expert slots",
+            ),
+            (
+                "Highest-weighted expert changed",
+                _pct(routing.get("top1_expert_change_rate")),
+                "includes reordering within an unchanged selection",
+            ),
+            (
+                "Positions with any flip",
+                _pct(routing.get("position_flip_rate")),
+                f"{routing.get('positions_with_any_flip')} of "
+                f"{routing.get('positions')} scored positions",
+            ),
+        ],
+        ("Measure", "Rate", "Of what"),
+    )
+    out.append("")
+    scored = routing.get("positions") or 0
+    any_flip = routing.get("positions_with_any_flip") or 0
+    out += _table(
+        [
+            (
+                "Routing held",
+                _kld(held),
+                str(scored - any_flip),
+            ),
+            (
+                "Routing flipped",
+                _kld(flipped),
+                str(routing.get("positions_with_any_flip")),
+            ),
+        ],
+        ("Positions where", "Mean KLD", "Count"),
+    )
+    out.append("")
+    if isinstance(excess, (int, float)):
+        ratio = (
+            f", {flipped / held:.1f}x the mean where routing held"
+            if isinstance(held, (int, float))
+            and isinstance(flipped, (int, float))
+            and held
+            else ""
+        )
+        pct_of_mean = (
+            f" ({excess / float(deployed):.0%} of the deployed mean)"
+            if isinstance(deployed, (int, float)) and deployed
+            else ""
+        )
+        out += [
+            f"**Ranking floor {_kld(excess)}**{pct_of_mean}. Positions whose "
+            f"expert selection changed diverge at {_kld(flipped)}{ratio}, and "
+            f"they carry "
+            f"{'n/a' if share is None else f'{float(share) * 100:.1f}%'} of the "
+            f"total. The floor is what the mean would give up if those "
+            f"positions diverged no more than the ones where routing survived. "
+            f"Two candidates whose deployed means differ by less than it are "
+            f"not ranked by that difference; rank them on the experts-only "
+            f"cell, which is a precision comparison.",
+            "",
+        ]
+    buckets = [b for b in routing.get("buckets") or [] if b.get("positions")]
+    if len(buckets) > 1:
+        out += [
+            "Divergence rises with how many layers rerouted, which is what "
+            "distinguishes a single reroute a later layer can absorb from a "
+            "token that took a different path through the model:",
+            "",
+        ]
+        out += _table(
+            [
+                (
+                    (
+                        f"{b['flipped_layers_min']}"
+                        if b.get("flipped_layers_max") == b["flipped_layers_min"]
+                        else f"{b['flipped_layers_min']}+"
+                        if b.get("flipped_layers_max") is None
+                        else f"{b['flipped_layers_min']}-{b['flipped_layers_max']}"
+                    ),
+                    str(b["positions"]),
+                    _kld(b.get("mean_kld")),
+                )
+                for b in buckets
+            ],
+            ("Layers rerouted", "Positions", "Mean KLD"),
+        )
+        out.append("")
+    rates = routing.get("per_layer_flip_rate") or []
+    if rates:
+        worst = max(range(len(rates)), key=lambda i: rates[i])
+        early = sum(rates[: max(1, len(rates) // 4)]) / max(1, len(rates) // 4)
+        late = sum(rates[-max(1, len(rates) // 4):]) / max(1, len(rates) // 4)
+        out += [
+            f"Per-layer selection change runs from {min(rates) * 100:.2f}% to "
+            f"{max(rates) * 100:.2f}% (worst at layer {worst}), averaging "
+            f"{early * 100:.2f}% across the first quarter of routed layers and "
+            f"{late * 100:.2f}% across the last. Rerouting that grows with "
+            f"depth is accumulated perturbation, not router precision.",
+            "",
+        ]
+    return out
+
+
+def _domains(receipt: dict[str, Any]) -> list[str]:
+    """Which kinds of text the divergence landed on, per Law 15."""
+    strata = receipt.get("strata")
+    if not isinstance(strata, dict):
+        return []
+    primary = strata.get("primary")
+    rows = strata.get("stratum") or []
+    overall = (strata.get("overall") or {}).get(primary) or {}
+    if not rows or not overall:
+        return []
+    ranked = sorted(
+        rows,
+        key=lambda r: float(
+            ((r.get("cells") or {}).get(primary) or {}).get("mean_kld") or 0.0
+        ),
+        reverse=True,
+    )
+    out = [
+        "## Fidelity by domain",
+        "",
+        "The suite is stratified, so the mean above is an average over kinds of "
+        "text that do not degrade equally. `x run` is a domain's mean divided by "
+        "the run's, so 1.00 degrades exactly as much as the model overall. The "
+        "reference's own top-1 probability is shown because a domain the "
+        "reference finds harder will diverge more for that reason alone.",
+        "",
+    ]
+    table = []
+    for row in ranked:
+        cell = (row.get("cells") or {}).get(primary) or {}
+        mean = cell.get("mean_kld")
+        base = overall.get("mean_kld")
+        table.append(
+            (
+                str(row.get("label") or row.get("key")),
+                str(cell.get("contexts") or ""),
+                f"{float(cell.get('mean_ref_top1_prob') or 0.0) * 100:.1f}%",
+                _kld(mean),
+                f"{float(mean) / float(base):.2f}" if base else "n/a",
+                _kld(cell.get("worst_context_kld")),
+            )
+        )
+    out += _table(
+        table,
+        (
+            "Domain",
+            "Contexts",
+            "Reference top-1",
+            "Mean KLD",
+            "x run",
+            "Worst context",
+        ),
+    )
+    out.append("")
+
+    cells = [name for name in (strata.get("cells") or []) if name != primary]
+    if cells:
+        out += [
+            "The same domains measured on the other attribution cells, which "
+            "shows whether a domain's weakness is a property of the model or of "
+            "the format:",
+            "",
+        ]
+        out += _table(
+            [
+                (
+                    str(row.get("label") or row.get("key")),
+                    *[
+                        _kld(((row.get("cells") or {}).get(name) or {}).get("mean_kld"))
+                        for name in [primary, *cells]
+                    ],
+                )
+                for row in ranked
+            ],
+            ("Domain", *[str(name) for name in [primary, *cells]]),
+        )
+        out.append("")
+
+    worst, best = ranked[0], ranked[-1]
+    worst_cell = (worst.get("cells") or {}).get(primary) or {}
+    best_cell = (best.get("cells") or {}).get(primary) or {}
+    if worst_cell.get("mean_kld") and best_cell.get("mean_kld"):
+        spread = float(worst_cell["mean_kld"]) / float(best_cell["mean_kld"])
+        out += [
+            f"**{worst.get('label')}** is this candidate's weakest domain and "
+            f"**{best.get('label')}** its strongest, a spread of "
+            f"{spread:.1f}x. A deployment weighted toward the weakest domain "
+            f"sees more divergence than the headline mean implies; the per-source "
+            f"breakdown and the reading are in "
+            f"[strata.md](strata.md) and [strata.json](strata.json).",
+            "",
+        ]
     return out
 
 
@@ -702,6 +941,8 @@ def render_onepager(
         ]
     parts += _identity(report, manifest, receipt, runtime_env)
     parts += _attribution(receipt)
+    parts += _routing(receipt)
+    parts += _domains(receipt)
     parts += _head_split(report, manifest)
     parts += _profiles(report)
     parts += _compliance(receipt, baseline)
@@ -738,6 +979,23 @@ def collect_results(results_root: str) -> list[dict[str, Any]]:
             }
         )
     return sorted(found, key=lambda item: item["label"])
+
+
+def _weakest_domain(receipt: dict[str, Any]) -> tuple[str | None, float | None]:
+    """The stratum with the highest mean, for the leaderboard's summary column."""
+    strata = receipt.get("strata")
+    if not isinstance(strata, dict):
+        return None, None
+    primary = strata.get("primary")
+    rows = strata.get("stratum") or []
+    best: tuple[str | None, float | None] = (None, None)
+    for row in rows:
+        mean = ((row.get("cells") or {}).get(primary) or {}).get("mean_kld")
+        if isinstance(mean, (int, float)) and (
+            best[1] is None or mean > best[1]
+        ):
+            best = (str(row.get("key")), float(mean))
+    return best
 
 
 def _grouping_key(receipt: dict[str, Any]) -> str:
@@ -785,11 +1043,14 @@ def render_leaderboard(results: list[dict[str, Any]]) -> tuple[str, list[list[An
             attribution = item["receipt"].get("attribution") or {}
             expert = (attribution.get("expert_cell") or {}).get("mean_kld")
             floor = item["receipt"].get("ranking_floor")
+            weakest, weakest_kld = _weakest_domain(item["receipt"])
             rows.append(
                 (
                     item["label"],
                     _kld(report.get("mean_kld")),
                     _kld(expert) if attribution else "n/a",
+                    _kld(floor) if floor is not None else "n/a",
+                    f"{weakest} {_kld(weakest_kld)}" if weakest else "n/a",
                     _kld(report.get("median_kld")),
                     _kld(report.get("p99_kld")),
                     _kld(report.get("max_kld")),
@@ -799,22 +1060,34 @@ def render_leaderboard(results: list[dict[str, Any]]) -> tuple[str, list[list[An
                 )
             )
             csv_rows.append([key[:12], item["label"], report.get("mean_kld"),
-                             expert, floor,
+                             expert, floor, weakest, weakest_kld,
                              report.get("median_kld"), report.get("p99_kld"),
                              report.get("max_kld"), report.get("top1_agreement"),
                              report.get("num_positions"), compliant])
         lines += _table(
             rows,
-            ("Candidate", "Mean KLD", "Experts only", "Median", "p99", "Max",
-             "Top-1", "Positions", "Law-compliant"),
+            ("Candidate", "Mean KLD", "Experts only", "Routing term",
+             "Weakest domain", "Median", "p99", "Max", "Top-1", "Positions",
+             "Law-compliant"),
         )
         lines.append("")
+        if any(_weakest_domain(m["receipt"])[0] for m in ranked):
+            lines += [
+                "The weakest-domain column is the stratum with the highest mean "
+                "for that candidate (Law 15). Two candidates with the same mean "
+                "are not interchangeable if they lose fidelity on different "
+                "kinds of text; each candidate's `strata.md` has the full table.",
+                "",
+            ]
         if any(m["receipt"].get("ranking_floor") for m in ranked):
             lines += [
-                "Rows for routed models are ranked on the deployed mean, but the "
-                "deployed mean of a checkpoint with a quantized router is "
-                "dominated by a saturating routing term (Law 14). Compare the "
-                "experts-only column to compare quantization schemes.",
+                "Rows for routed models are ranked on the deployed mean, but a "
+                "routed model's deployed mean carries a saturating routing term "
+                "(Law 14): tokens whose expert selection changed diverge far "
+                "more than tokens whose selection survived, and that term does "
+                "not scale with precision. The routing-term column is the floor "
+                "below which two deployed means do not rank anything; compare "
+                "the experts-only column to compare quantization schemes.",
                 "",
             ]
     return "\n".join(lines).rstrip() + "\n", csv_rows
@@ -884,9 +1157,10 @@ def _cmd_leaderboard(args: argparse.Namespace) -> int:
         with open(args.csv, "w", encoding="utf-8", newline="") as handle:
             writer = csv.writer(handle)
             writer.writerow(["group", "candidate", "mean_kld",
-                             "expert_cell_kld", "ranking_floor", "median_kld",
-                             "p99_kld", "max_kld", "top1_agreement", "positions",
-                             "law_compliant"])
+                             "expert_cell_kld", "routing_term",
+                             "weakest_domain", "weakest_domain_kld",
+                             "median_kld", "p99_kld", "max_kld",
+                             "top1_agreement", "positions", "law_compliant"])
             writer.writerows(csv_rows)
         print(f"wrote {args.csv}")
     return 0

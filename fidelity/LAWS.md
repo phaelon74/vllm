@@ -1,12 +1,26 @@
 # Local Inference Lab — Distribution Fidelity Laws
 
-**Laws version:** 2
+**Laws version:** 4
 **Status:** draft, pending coordination with `local-inference-lab` on the
 publication namespace and suite format.
 
 Version 2 adds Law 14. A receipt at version 1 says nothing about component
 attribution either way, so a version-1 result for a routed model is not a
 version-2 result and should be rescored rather than relabeled.
+
+Version 3 adds Law 15. A version-2 result reports one mean over a suite built
+from a dozen kinds of text and never says which of them the divergence landed
+on, so it cannot be rebadged as version 3; the per-context records Law 15 reads
+come from the scoring run itself.
+
+Version 4 changes what Law 14 means. Versions 2 and 3 took the router weight cell
+as the routing term and its ranking floor. That was wrong: routing changes because
+the activations reaching an identical router changed, so a checkpoint shipping a
+BF16 router reported a floor of zero while its routing term was not zero. Version
+4 requires the routing term to be measured from the run's own expert selections
+and makes that measurement the floor. A version-2 or version-3 receipt for a
+routed model overstates how comparable two candidates are and must be rescored,
+not relabeled.
 
 These laws govern every distribution-fidelity measurement this program
 publishes. They are not guidance. The pipeline refuses to produce or upload an
@@ -299,24 +313,50 @@ granularity:
 
 1. the **expert cell** — the reference with only its expert weights rounded
    through the deployed scheme;
-2. the **router cell** — the reference with only its router rounded, or
+2. the **measured routing divergence** — the candidate's own expert selections
+   compared against the reference's over the same frozen tokens;
+3. the **router weight cell** — the reference with only its router rounded, or
    `not_applicable` with inspection evidence when the deployed checkpoint leaves
    the router unquantized;
-3. the **deployed cell** — the candidate as it ships.
+4. the **deployed cell** — the candidate as it ships.
 
 **Why.** Routing cost saturates, and a saturating term cannot rank anything. A
-perturbation to a router logit changes an expert selection only when it crosses a
-near-tie, so the count of changed selections is governed by how many near-ties the
-model has, not by how large the perturbation was. An eight-bit router and a
-four-bit router therefore cost about the same. Measured on one MoE checkpoint,
-NVFP4 and MXFP8 expert weights differed by a factor of 36 (0.1065 against
-0.0030), while the deployed means differed by a factor of 1.2 (0.2534 against
-0.2119), because a router term near 0.20 dominated both. A reader given only the
-deployed means would conclude the two formats are nearly equivalent. They are not.
+perturbation changes an expert selection only when it crosses a near-tie, so the
+count of changed selections is governed by how many near-ties the model has, not
+by how large the perturbation was. Measured on one MoE checkpoint, NVFP4 and
+MXFP8 expert weights differed by a factor of 36 (0.1065 against 0.0030), while the
+deployed means differed by a factor of 1.2 (0.2534 against 0.2119), because a
+routing term near 0.20 dominated both. A reader given only the deployed means
+would conclude the two formats are nearly equivalent. They are not.
 
-**Floor.** The router cell is a floor in the sense Law 1's repeat spread is a
-floor. Two candidates whose deployed means differ by less than the router cell are
-not ranked by that difference, and an artifact that ranks them ranks them on the
+**Routing is not router precision.** The mechanism is the activations arriving at
+the router, not the router's own weights. A checkpoint that ships its router in
+BF16 has a bit-identical router and still selects different experts, because
+quantized attention and quantized experts upstream have already moved the
+residual stream. It follows that the router weight cell is not the routing term
+and cannot stand in for it: on such a checkpoint that cell is exactly zero while
+routing divergence is not. The cell is retained only as the evidence that router
+weight precision is a red herring.
+
+It also follows that no quantize-dequantize cell is routing-free. Rounding any
+weight moves the residual stream, so every router downstream of it sees different
+inputs. An artifact must not describe a cell as holding routing fixed; each cell
+reports the share of its own selections that changed, which is what makes the
+claim checkable rather than assumed.
+
+**Measurement, not emulation.** The routing term is measured by recording the
+reference's selected experts per token and per layer, then comparing the
+candidate's selections over the same tokens. The artifact reports the share of
+(token, layer) selections that changed, the share of scored positions where any
+layer rerouted, the mean divergence at positions where routing held against
+positions where it changed, and how divergence grows with the number of rerouted
+layers.
+
+**Floor.** The floor is the excess the mean carries because rerouted positions
+diverge more than positions whose selection survived: the flipped fraction times
+the difference of the two means. It is a floor in the sense Law 1's repeat spread
+is a floor. Two candidates whose deployed means differ by less than it are not
+ranked by that difference, and an artifact that ranks them ranks them on the
 expert cell and says so in the same sentence as the claim.
 
 **Naming.** Cells are named for the component that carries the error, never as
@@ -338,15 +378,67 @@ QDQ pass and a scoring run against a capture that already exists; the cost of no
 having it is a comparison nobody can make later without redoing the campaign.
 
 **Check.** For a reference whose capture manifest records declared experts, the
-compliance receipt requires an expert cell and a router cell, each naming the
-variant checkpoint and its QDQ manifest, and each carrying the same partition,
+compliance receipt requires an expert cell and a router weight cell, each naming
+the variant checkpoint and its QDQ manifest, and each carrying the same partition,
 token digest, and reference config digest as the deployed cell. A cell measured on
-other tokens is not a decomposition of this number and is rejected as one.
+other tokens is not a decomposition of this number and is rejected as one. The
+receipt also requires a measured routing term from the run itself; a routed
+candidate scored without one fails, and an unquantized router is not accepted as
+a reason to omit it.
 
 **Override.** Permitted under Law 13 for a dense checkpoint misdetected as routed,
 and for an exploratory result that is never published as a ranking. Not permitted
 for a published comparison between two quantization schemes, which is the case the
 law exists for.
+
+## Law 15 — Domain disclosure
+
+**Required.** When the suite is stratified, a result publishes its mean per
+stratum alongside the overall mean. Each stratum's row carries the number of
+contexts behind it, the position-weighted mean, the spread of per-context means
+within it, and the reference's own mean top-1 probability on it. Every stratum
+the run actually scored appears; a stratum is never dropped for being small or
+inconvenient.
+
+**Why.** A model does not lose fidelity uniformly across kinds of text. The suite
+is built from a dozen strata — encyclopedic reference, worked mathematics, source
+code, dialogue, Chinese, structured data and tool calls — precisely because a
+single corpus cannot represent a deployment. Averaging them back into one number
+throws away the only part of the measurement that answers the question a reader
+actually has, which is not "how far apart are these two models" but "how far
+apart are they on the work I am going to give them". Two candidates with the same
+mean are not interchangeable if one loses its fidelity on prose and the other on
+tool calls.
+
+**Confounding is disclosed, not resolved.** A stratum's KLD depends on how
+predictable its text is to begin with. The reference's top-1 probability is
+published beside every stratum mean so a reader can see the difference between a
+candidate that diverges most where the reference was already uncertain, which is
+weak evidence, and one that diverges most where the reference was confident,
+which is strong. The program does not normalize the means to hide this; it
+reports both numbers and says which case each stratum is.
+
+**Spread, because a stratum is tens of contexts.** A stratum holds tens of
+documents, not thousands, so one pathological document can carry it. The median
+and p90 of the per-context means, and the worst context's identity, are published
+with the mean. A stratum whose mean is four or more times its median is reported
+as driven by outlier contexts rather than as a weak domain.
+
+**Ladder.** Where Law 14 applies, the per-stratum table is also reported for the
+cells, so the artifact says whether a domain's weakness follows the model or the
+format. It is a different finding if NVFP4 is worst on code while FP8 is worst on
+mathematics than if both are worst on the same domain.
+
+**Check.** The compliance receipt requires per-context records in the report, one
+per scored row, each naming its suite context. Every scored context must be in
+the suite manifest, the published domain table must cover exactly the strata that
+were scored, and its per-stratum context counts must sum to the number of rows.
+A suite that declares fewer than two strata is `not_applicable`.
+
+**Override.** Permitted under Law 13 for an unstratified suite the manifest fails
+to describe, and for a zero-baseline or bounded-prefix run that is not published
+as a candidate measurement. Not permitted for a published candidate on a
+stratified suite.
 
 ## Numbering
 

@@ -309,6 +309,7 @@ def score_one(
     decompose: bool,
     suite_limit: int | None = None,
     capture_label: str | None = None,
+    measure_routing: bool = False,
 ) -> tuple[str, str]:
     """Score one pair. Returns (report_path, capture_dir).
 
@@ -370,6 +371,16 @@ def score_one(
                 "--dataset-config", config.dataset_config]
     if decompose:
         cmd.append("--decompose-head")
+    if measure_routing:
+        # Reference selections live beside the shared capture, so the extra
+        # reference pass is paid once per model rather than once per cell.
+        cmd += [
+            "--measure-routing",
+            "--routing-dir",
+            os.path.join(
+                config.work, "captures", f"{capture_label or label}{suffix}-routing"
+            ),
+        ]
 
     print(f"=== {tag} (TP={tp} util={util:.2f})")
     rc = _run(cmd, log_path=log, env={
@@ -439,8 +450,13 @@ def _cell(report_path: str, capture_manifest: dict[str, Any], config: Config,
     """One attribution cell, carrying the identity Law 14 compares against."""
     with open(report_path, encoding="utf-8") as handle:
         report = json.load(handle)
+    routing = report.get("routing") or {}
     return {
         "mean_kld": report.get("mean_kld"),
+        # Recorded per cell because it is the evidence that no weight-rounding
+        # cell holds expert selection fixed.
+        "selection_flip_rate": routing.get("selection_flip_rate"),
+        "routing_excess_mean": routing.get("routing_excess_mean"),
         "partition": config.partition,
         "token_sha256": capture_manifest.get("token_sha256"),
         "reference_config_sha256": capture_manifest.get("reference_config_sha256"),
@@ -502,6 +518,9 @@ def attribute_model(
         report, _ = score_one(
             config, python, label, variant, model.reference_path, config.rows,
             decompose=False, capture_label=f"{model.name}-ref",
+            # A cell that only rounds weights still reroutes tokens, and the
+            # cheapest way to show that is to measure it in the cell itself.
+            measure_routing=True,
         )
         cell = _cell(
             report, capture_manifest, config, variant, scheme or deployed_scheme
@@ -627,11 +646,16 @@ def cmd_score(config: Config, python: str) -> int:
             )
         print(f"Law 1 satisfied: {model.name} self-KLD is exactly 0.0")
 
+        # Law 14's routing term is measured, not emulated, so a routed
+        # reference needs its own expert selections recorded once.
+        routed = bool(qdq_routing(model.reference_path))
+
         for cand in model.candidates:
             report, capture = score_one(
                 config, python, cand.name, cand.path, model.reference_path,
                 config.rows, decompose=config.storage != "logits",
                 capture_label=f"{model.name}-ref",
+                measure_routing=routed,
             )
             # Law 14: a routed model's single mean is not publishable, so the
             # component cells are scored here rather than left to whoever reads
@@ -724,12 +748,91 @@ def _publish_attribution(src: str, cand_dir: str) -> None:
         handle.write("\n")
 
 
+def _has_per_context(path: str) -> bool:
+    """Whether a report can be attributed to a domain at all."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return bool(json.load(handle).get("per_context"))
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
+def _strata_cells(cand_dir: str) -> list[str]:
+    """Name every published report worth attributing to a domain.
+
+    The deployed result is the subject; the ladder rungs are what make the
+    per-domain table answer whether a domain's weakness follows the format or
+    the model. Paths are relative to ``cand_dir`` because that is how
+    ``_publish_attribution`` rewrote them.
+
+    A cell scored before per-context recording is left out rather than allowed to
+    fail the whole table; the deployed report is always the first cell, so its
+    own absence is reported by Law 15 instead of being hidden here.
+    """
+    cells = [f"deployed={os.path.join(cand_dir, 'report.json')}"]
+    path = os.path.join(cand_dir, "attribution.json")
+    if not os.path.isfile(path):
+        return cells
+    try:
+        with open(path, encoding="utf-8") as handle:
+            attribution = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return cells
+    optional = [
+        ((entry or {}).get("scheme"), (entry or {}).get("report"))
+        for entry in attribution.get("ladder") or []
+    ]
+    optional.append(
+        ("all_quantized", (attribution.get("composite_cell") or {}).get("report"))
+    )
+    for name, report in optional:
+        if not name or not report or os.path.isabs(report):
+            continue
+        path = os.path.join(cand_dir, report)
+        if os.path.isfile(path) and _has_per_context(path):
+            cells.append(f"{name}={path}")
+    return cells
+
+
+def _build_strata(
+    python: str, suite_manifest: str, cand_dir: str, label: str
+) -> None:
+    """Write the per-domain report Law 15 reads, or leave nothing behind.
+
+    A failure here is not fatal to assembly: Law 15 reports the absence with a
+    better message than a traceback would. Stale files are removed first so a
+    previous campaign's domains cannot stand in for this one's.
+    """
+    out_json = os.path.join(cand_dir, "strata.json")
+    out_md = os.path.join(cand_dir, "strata.md")
+    for path in (out_json, out_md):
+        if os.path.isfile(path):
+            os.remove(path)
+    cmd = [
+        python, os.path.join(HERE, "strata.py"),
+        "--suite", suite_manifest,
+        "--label", label,
+        "--out", out_md,
+        "--json", out_json,
+    ]
+    for spec in _strata_cells(cand_dir):
+        cmd += ["--cell", spec]
+    if _run(cmd) != 0:
+        print(
+            f"no per-domain report for {os.path.basename(cand_dir)}; Law 15 "
+            f"will record why",
+            file=sys.stderr,
+        )
+
+
 PUBLISHED_FILES = (
     "report.json",
     "manifest.json",
     "compliance.json",
     "report.md",
     "attribution.json",
+    "strata.json",
+    "strata.md",
 )
 
 
@@ -888,9 +991,18 @@ def cmd_assemble(config: Config, python: str, force: bool = False) -> int:
             ]
             if os.path.isfile(suite_manifest):
                 cmd += ["--suite", suite_manifest]
+                _build_strata(
+                    python,
+                    suite_manifest,
+                    cand_dir,
+                    f"{model.name} / {cand.name}",
+                )
             attribution = os.path.join(cand_dir, "attribution.json")
             if os.path.isfile(attribution):
                 cmd += ["--attribution", attribution]
+            strata = os.path.join(cand_dir, "strata.json")
+            if os.path.isfile(strata):
+                cmd += ["--strata", strata]
             if config.approvals and os.path.isfile(config.approvals):
                 cmd += ["--approvals", config.approvals]
             if _run(cmd) != 0:

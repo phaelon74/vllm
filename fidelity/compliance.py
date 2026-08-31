@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-LAWS_VERSION = 2
+LAWS_VERSION = 4
 
 PASS = "pass"
 FAIL = "fail"
@@ -75,6 +75,7 @@ class Campaign:
     freeze_receipt: dict[str, Any] | None = None
     repeat_study: dict[str, Any] | None = None
     attribution: dict[str, Any] | None = None
+    strata: dict[str, Any] | None = None
     approvals: dict[str, Any] = field(default_factory=dict)
 
 
@@ -479,6 +480,24 @@ def law_14_component_attribution(c: Campaign) -> Finding:
     if problem:
         return Finding(14, title, FAIL, f"expert_cell {problem}")
 
+    # Routing divergence is a measurement, not a cell: the candidate's routers
+    # can be bit-identical to the reference's and still select other experts,
+    # because the activations reaching them were perturbed upstream. No
+    # weight-rounding cell can produce this number, so it is required directly.
+    routing = c.report.get("routing")
+    if not routing or routing.get("routing_excess_mean") is None:
+        return Finding(
+            14,
+            title,
+            FAIL,
+            f"reference routes over {experts} experts but the run measured no "
+            f"routing divergence; rescore with --measure-routing. Router "
+            f"weight precision is not a substitute: an unquantized router "
+            f"still receives perturbed activations",
+        )
+    floor = float(routing["routing_excess_mean"])
+    flip_rate = float(routing.get("selection_flip_rate") or 0.0)
+
     router_cell = c.attribution.get("router_cell")
     if not isinstance(router_cell, dict):
         return Finding(14, title, FAIL, "attribution has no router_cell")
@@ -492,35 +511,154 @@ def law_14_component_attribution(c: Campaign) -> Finding:
                 "evidence that the deployed checkpoint leaves the router "
                 "unquantized",
             )
-        floor = 0.0
-        router_detail = "router unquantized in the deployed checkpoint"
+        router_detail = "router weights unquantized"
     else:
         problem = _cell_comparable(router_cell, c)
         if problem:
             return Finding(14, title, FAIL, f"router_cell {problem}")
-        floor = float(router_cell["mean_kld"])
-        router_detail = f"router {floor:.8f}"
+        router_detail = f"router weight rounding {float(router_cell['mean_kld']):.8f}"
 
     return Finding(
         14,
         title,
         PASS,
         f"experts {float(expert_cell['mean_kld']):.8f}, {router_detail}; "
-        f"ranking floor {floor:.8f}",
+        f"selections changed at {flip_rate * 100:.3f}% of (token, layer) "
+        f"choices; ranking floor {floor:.8f}",
     )
 
 
-def attribution_floor(attribution: dict[str, Any] | None) -> float | None:
-    """The router cell's mean, below which a difference does not rank anything."""
-    if not isinstance(attribution, dict):
+def _scored_strata(c: Campaign) -> tuple[set[str], int]:
+    """Strata the scored contexts actually came from, and how many carry an id.
+
+    Derived here rather than trusted from the strata report, so a report that
+    silently drops a domain cannot pass by declaring a smaller suite.
+    """
+    contexts = {
+        int(entry["context_id"]): entry
+        for entry in (c.suite or {}).get("contexts", [])
+    }
+    found: set[str] = set()
+    matched = 0
+    for record in c.report.get("per_context") or []:
+        context_id = record.get("context_id")
+        context = None if context_id is None else contexts.get(int(context_id))
+        if context is None:
+            continue
+        matched += 1
+        found.add(str(context.get("stratum")))
+    return found, matched
+
+
+def law_15_domain_disclosure(c: Campaign) -> Finding:
+    """A stratified suite is not reported as a single mean."""
+    title = "Domain disclosure"
+    strata = (c.suite or {}).get("strata") if c.suite else None
+    if not strata or len(strata) < 2:
+        return Finding(
+            15, title, NOT_APPLICABLE, "the suite declares no domain strata"
+        )
+    records = c.report.get("per_context")
+    if not records:
+        return Finding(
+            15,
+            title,
+            FAIL,
+            f"the suite is stratified over {len(strata)} domains but the report "
+            f"carries no per-context records, so the mean cannot be attributed "
+            f"to any of them; rescore with a build that records them",
+        )
+    rows = c.report.get("num_rows")
+    if rows is not None and len(records) != rows:
+        return Finding(
+            15,
+            title,
+            FAIL,
+            f"{len(records)} per-context records for {rows} scored rows",
+        )
+    found, matched = _scored_strata(c)
+    if matched != len(records):
+        return Finding(
+            15,
+            title,
+            FAIL,
+            f"{len(records) - matched} scored context(s) are not in the suite "
+            f"manifest, so the report and the suite disagree about what was "
+            f"measured",
+        )
+    if not c.strata:
+        return Finding(
+            15,
+            title,
+            FAIL,
+            f"no domain report supplied for {len(found)} scored domain(s); "
+            f"build it with fidelity/strata.py",
+        )
+    primary = c.strata.get("primary")
+    groups = (c.strata.get("groups") or {}).get("stratum") or []
+    published = {str(row.get("key")) for row in groups}
+    if published != found:
+        missing = sorted(found - published)
+        extra = sorted(published - found)
+        return Finding(
+            15,
+            title,
+            FAIL,
+            f"the domain report does not cover what was scored: missing "
+            f"{missing or 'none'}, unexpected {extra or 'none'}",
+        )
+    covered = sum(
+        int(((row.get("cells") or {}).get(primary) or {}).get("contexts") or 0)
+        for row in groups
+    )
+    if covered != len(records):
+        return Finding(
+            15,
+            title,
+            FAIL,
+            f"the domain report accounts for {covered} contexts of "
+            f"{len(records)} scored",
+        )
+    ranked = sorted(
+        groups,
+        key=lambda r: float(
+            ((r.get("cells") or {}).get(primary) or {}).get("mean_kld") or 0.0
+        ),
+    )
+    worst = (ranked[-1].get("cells") or {}).get(primary) or {}
+    best = (ranked[0].get("cells") or {}).get(primary) or {}
+    spread = (
+        float(worst.get("mean_kld") or 0.0) / float(best["mean_kld"])
+        if best.get("mean_kld")
+        else float("nan")
+    )
+    return Finding(
+        15,
+        title,
+        PASS,
+        f"{len(found)} domains disclosed; weakest {ranked[-1].get('key')} at "
+        f"{float(worst.get('mean_kld') or 0.0):.8f}, strongest "
+        f"{ranked[0].get('key')} at {float(best.get('mean_kld') or 0.0):.8f}, "
+        f"spread {spread:.1f}x",
+    )
+
+
+def routing_floor(report: dict[str, Any] | None) -> float | None:
+    """The measured routing term, below which a difference ranks nothing.
+
+    This is the excess the mean carries because flipped positions diverge more
+    than positions whose expert selection survived. It replaces the router-weight
+    cell as the floor: rounding a router's weights is not what changes routing in
+    a deployment, and on a checkpoint that ships a BF16 router that cell is
+    exactly zero while the routing term is not.
+    """
+    if not isinstance(report, dict):
         return None
-    cell = attribution.get("router_cell")
-    if not isinstance(cell, dict):
+    routing = report.get("routing")
+    if not isinstance(routing, dict):
         return None
-    if cell.get("status") == NOT_APPLICABLE:
-        return 0.0
-    mean = cell.get("mean_kld")
-    return float(mean) if isinstance(mean, (int, float)) else None
+    excess = routing.get("routing_excess_mean")
+    return float(excess) if isinstance(excess, (int, float)) else None
 
 
 # Registered after every check is defined. Numbering is append-only, so Law 14
@@ -539,6 +677,7 @@ LAWS: tuple[tuple[int, Callable[[Campaign], Finding]], ...] = (
     (11, law_11_freeze_before_qualification),
     (12, law_12_reusable_reference),
     (14, law_14_component_attribution),
+    (15, law_15_domain_disclosure),
 )
 
 
@@ -633,6 +772,18 @@ def evaluate(c: Campaign) -> list[Finding]:
     return findings
 
 
+def strata_summary(strata: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The domain table, without the per-source detail the report keeps."""
+    if not isinstance(strata, dict):
+        return None
+    return {
+        "primary": strata.get("primary"),
+        "cells": strata.get("cells"),
+        "overall": strata.get("overall"),
+        "stratum": (strata.get("groups") or {}).get("stratum"),
+    }
+
+
 def build_receipt(c: Campaign, findings: list[Finding]) -> dict[str, Any]:
     """Assemble the publishable compliance receipt."""
     failures = [f.law for f in findings if f.status == FAIL]
@@ -644,7 +795,9 @@ def build_receipt(c: Campaign, findings: list[Finding]) -> dict[str, Any]:
             repeat_spread(c.repeat_study) if baseline not in (0.0, None) else 0.0
         ),
         "attribution": c.attribution,
-        "ranking_floor": attribution_floor(c.attribution),
+        "ranking_floor": routing_floor(c.report),
+        "routing": c.report.get("routing"),
+        "strata": strata_summary(c.strata),
         "program": "Local Inference Lab — Distribution Fidelity",
         "laws_version": LAWS_VERSION,
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
@@ -690,6 +843,11 @@ def main() -> int:
         help="component cells and scheme ladder JSON, required for a routed "
         "reference (Law 14)",
     )
+    parser.add_argument(
+        "--strata",
+        help="per-domain report JSON from fidelity/strata.py, required for a "
+        "stratified suite (Law 15)",
+    )
     parser.add_argument("--approvals", help="recorded deviations JSON (Law 13)")
     parser.add_argument("--out", help="write the receipt here")
     args = parser.parse_args()
@@ -713,6 +871,7 @@ def main() -> int:
         freeze_receipt=_load(args.freeze_receipt),
         repeat_study=_load(args.repeat_study),
         attribution=_load(args.attribution),
+        strata=_load(args.strata),
         approvals=_load(args.approvals) or {},
     )
 

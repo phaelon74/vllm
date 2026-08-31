@@ -22,6 +22,7 @@ cannot publish a non-compliant result.
 | `redaction.py` | The one secret policy shared by capture, rendering, and publish |
 | `tails.py` | Whether a mean describes the distribution or a few hundred positions |
 | `qdq.py` | Builds single-component quantize-dequantize variants of a BF16 checkpoint, and inspects a quantized one for its scheme |
+| `strata.py` | Attributes a mean to the kinds of text it was measured on (Law 15) |
 | `campaigns/*.json` | Campaign definitions: suite, geometry, models, candidates |
 
 Scoring itself lives in `examples/offline_inference/score_mode_kld.py`, driven by
@@ -285,22 +286,53 @@ four-bit router cost about the same. On one MoE checkpoint:
 | Deployed | 0.211934 | 0.253426 | 1.2× |
 
 The expert weights differ by a factor of 36. The deployed means differ by 1.2,
-because a router term near 0.20 dominates both. A reader given only the deployed
+because a routing term near 0.20 dominates both. A reader given only the deployed
 column would conclude the formats are nearly equivalent, and would be wrong by an
 order of magnitude. Two engineering conclusions follow: never quantize a router,
 since the weights are a rounding error in the parameter count and the cost barely
-improves with precision; and never rank schemes on a deployed mean that includes
-one.
+improves with precision; and never rank schemes on a deployed mean.
+
+### Routing is not router precision
+
+The row labelled "Router only" above is a quantize-dequantize cell: it rounds the
+router's weights and measures what that costs. That is *not* the routing term, and
+reading it as one gets the mechanism backwards. Routing changes because the
+activations arriving at the router changed — quantized attention and quantized
+experts upstream have already moved the residual stream — so a checkpoint that
+ships its router in BF16 has a bit-identical router and still selects different
+experts. On such a checkpoint the router weight cell is exactly zero while the
+routing term is not.
+
+The same argument says no QDQ cell is routing-free. Rounding any weight moves the
+residual stream, and every router downstream of that change sees different inputs,
+so the experts-only cell reroutes tokens too. The artifact reports each cell's own
+selection-change rate rather than claiming any cell holds routing fixed.
+
+So the routing term is measured, not emulated. `--measure-routing` records the
+reference's selected experts per token and per layer in a separate pass over the
+reference — expert IDs are a few hundred megabytes against tens of gigabytes of
+hidden states, so an existing capture stays valid — and the candidate's selections
+are compared against them while it is scored. The report carries the share of
+(token, layer) selections that changed, the share of positions where any layer
+rerouted, the mean divergence where routing held against where it changed, how
+divergence grows with the number of rerouted layers, and the per-layer rate, which
+rises with depth exactly as accumulated perturbation predicts.
+
+The ranking floor is the excess that rerouting puts into the mean: the flipped
+fraction times the gap between the two conditional means. It answers "how much of
+this mean would disappear if rerouted tokens diverged no more than the rest", and
+two deployed means closer together than that do not rank anything.
 
 Law 14 makes the decomposition mandatory for any reference whose config declares
 experts. `campaign.py` detects that from the checkpoint, inspects the deployed
 candidate for its scheme and router coverage, builds the cells with `qdq.py`,
 scores them against the capture the deployed run already produced, and writes
-`attribution.json`. Compliance refuses a routed candidate that has none, and also
-refuses one whose capture manifest predates routing detection, so a routed model
-cannot exempt itself by omission. The one-pager prints the cells with the ranking
-floor beside them and links every supporting report and QDQ manifest; the
-leaderboard carries an experts-only column next to the deployed mean.
+`attribution.json`. Compliance refuses a routed candidate that has none, one whose
+capture manifest predates routing detection, and one scored without a measured
+routing term, so a routed model cannot exempt itself by omission. The one-pager
+prints the cells, the routing divergence, and the ranking floor, and links every
+supporting report and QDQ manifest; the leaderboard carries experts-only and
+routing-term columns next to the deployed mean.
 
 Cells are named for the component carrying the error rather than written as `B×Q`
 or `Q×B`. That notation leaves the order of the factors to the reader, and it is
@@ -315,11 +347,15 @@ by what each rung adds:
 | Rung | What it adds | Cell |
 |---|---|---|
 | 0 | Two implementations of the same high-precision weights | not measured — see below |
-| 1 | Weight rounding, reference routing | `expert_cell` |
-| 2 | Routing flips on top of weight rounding | `composite_cell` |
-| 3 | Quantized kernels, batch 1, deterministic, BF16 KV | deployed `report.json` |
+| 1 | Expert weight rounding, plus whatever rerouting it causes | `expert_cell` |
+| 2 | Rounding every quantized component, plus its rerouting | `composite_cell` |
+| 3 | Quantized kernels and activations, batch 1, deterministic, BF16 KV | deployed `report.json` |
 | 4 | A quantized KV cache | not measured |
 | 5 | Realistic batching and shapes | not measured |
+
+Rerouting is not a rung of its own, because it is not something a rung adds: every
+rung from 1 up carries it, and each cell reports its own selection-change rate. The
+routing term is measured across the deployed run and reported separately.
 
 Rung 3 minus rung 2 is published as the "beyond weight rounding" term. Where the
 checkpoint quantizes activations, that term carries activation quantization as well
@@ -351,6 +387,44 @@ reference on disk. Candidates of one model now share a single teacher capture,
 since the manifest binds a capture to the tokens and geometry rather than to the
 candidate — without that, a ladder would recapture identical reference tensors once
 per cell.
+
+## Which domains rated poorest
+
+The suite is stratified over a dozen kinds of text, so the headline mean is an
+average across encyclopedic prose, worked mathematics, source code, dialogue,
+Chinese, structured data, and the rest. Law 15 requires the artifact to say which
+of them the divergence landed on, because the useful question is not how far apart
+two models are but how far apart they are on the work a deployment will give them.
+
+The join is cheap and needs no extra model output. Every scoring run over a suite
+records one `per_context` entry per row — mean, median, p99, max, reference top-1
+probability, top-1 agreement — keyed to the suite `context_id` it came from.
+`strata.py` groups those entries by the suite manifest's `stratum` and
+`source_key` and writes `strata.md` and `strata.json` beside the report:
+
+```bash
+python fidelity/strata.py --suite /mnt/kld/suites/qwen3.6-1024x2048-v1 \
+    --cell deployed=library/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-FP8/report.json \
+    --cell nvfp4=library/.../attribution/experts-nvfp4.json \
+    --out strata.md --json strata.json
+```
+
+`campaign.py assemble` does this for every candidate automatically, adding one
+column per ladder rung so the table answers whether a domain's weakness follows
+the model or the format. The one-pager carries the domain table and the
+leaderboard carries each candidate's weakest domain.
+
+Two things are reported with every stratum mean rather than resolved silently.
+The reference's own top-1 probability on that stratum, because a domain the
+reference finds harder diverges more for that reason alone and the finding is
+weaker than one where the reference was confident. And the spread of per-context
+means within the stratum, because a stratum holds tens of documents and one
+pathological document can carry it; `strata.py` says so explicitly when a
+stratum's worst context is four or more times its median.
+
+Reports produced before per-context recording cannot be attributed after the
+fact. They carry no `per_context`, `strata.py` refuses to guess, and Law 15 fails
+with that reason — the fix is a rescore, which reuses the existing capture.
 
 ## Assembly will not downgrade a published result
 
