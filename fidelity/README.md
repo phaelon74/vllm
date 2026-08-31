@@ -455,6 +455,17 @@ record of whatever did produce the numbers:
 environment untouched
 ```
 
+The published reference is left in place across assemblies rather than rewritten,
+because it is tens of gigabytes and a hard link cannot be re-made cheaply. That is
+only sound while the file already there came from a capture bound to the same
+identity, so assembly compares the two manifests on the fields Law 5 binds and
+replaces the reference when they differ:
+
+```text
+REPLACING reference in .../Qwen3.6-27B/reference: the published reference is bound
+to a different identity than Qwen3.6-27B-ref-v0-tp1-analysis-c2048-s0 (rows)
+```
+
 ## Reclaiming scratch space
 
 The library is the index. `sweep.py` digests every published file and then asks of

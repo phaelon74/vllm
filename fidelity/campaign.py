@@ -735,6 +735,34 @@ def _find(work: str, pattern: str) -> str | None:
     return os.path.join(root, matches[0]) if matches else None
 
 
+def _reference_identity(path: str) -> dict[str, Any] | None:
+    """The manifest fields a capture is bound to, for comparing two captures.
+
+    The same list `kld.manifest_mismatches` requires, kept literal here so
+    assembly does not import torch to compare two JSON files.
+    """
+    try:
+        with open(os.path.join(path, "manifest.json"), encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return {
+        key: manifest.get(key)
+        for key in (
+            "token_sha256",
+            "tokenizer",
+            "context_length",
+            "stride",
+            "rows",
+            "score_from",
+            "kld_vocab_size",
+            "tensor_parallel_size",
+            "enforce_eager",
+            "runtime",
+        )
+    }
+
+
 def _copy_reference(capture: str, dest: str) -> None:
     """Publish the reusable reference: tensors, head, and its bound manifest.
 
@@ -749,6 +777,23 @@ def _copy_reference(capture: str, dest: str) -> None:
         # which Law 12 would then fail for a reason that points nowhere.
         print(f"WARNING  no capture directory at {capture}", file=sys.stderr)
         return
+    # Files already at the destination are left alone, which is only safe while
+    # they came from a capture bound to the same identity. When they did not, the
+    # first capture ever published would win forever and the artifact would carry
+    # a reference that its own manifest does not describe.
+    source_id = _reference_identity(capture)
+    published_id = _reference_identity(dest)
+    if source_id and published_id and source_id != published_id:
+        differing = sorted(k for k in source_id if source_id[k] != published_id[k])
+        print(
+            f"REPLACING reference in {dest}: the published reference is bound to a "
+            f"different identity than {os.path.basename(capture)} "
+            f"({', '.join(differing)})"
+        )
+        for name in sorted(os.listdir(dest)):
+            target = os.path.join(dest, name)
+            if os.path.isfile(target):
+                os.remove(target)
     for name in sorted(os.listdir(capture)):
         src = os.path.join(capture, name)
         dst = os.path.join(dest, name)
