@@ -260,8 +260,10 @@ def _repo_head() -> str | None:
 def capture_environment(config: Config, python: str) -> str:
     """Capture the environment report, refreshing it when the tree moved (Law 6).
 
-    Reusing a capture across code changes makes Law 6 describe a tree that did
-    not produce the numbers, which is the one thing that law exists to prevent.
+    Called when a scoring run is about to happen, never merely because a campaign
+    was invoked. Refreshing it for a campaign whose every report is already cached
+    would stamp the artifacts with a tree that scored nothing, which is the failure
+    Law 6 exists to prevent rather than a fix for it.
     """
     env_dir = os.path.join(config.work, "environment")
     runtime_path = os.path.join(env_dir, "runtime.json")
@@ -338,6 +340,8 @@ def score_one(
     if os.path.isfile(report):
         print(f"=== {tag} already scored")
         return report, capture
+
+    capture_environment(config, python)
 
     cmd = [
         python, SCORER,
@@ -596,9 +600,11 @@ def qdq_routing(reference_path: str) -> dict[str, Any] | None:
 
 
 def cmd_score(config: Config, python: str) -> int:
-    """Capture the environment, gate on the zero baseline, score candidates."""
+    """Gate on the zero baseline, then score candidates.
+
+    The environment is captured by the first scoring run that actually executes.
+    """
     os.makedirs(config.work, exist_ok=True)
-    capture_environment(config, python)
 
     for model in config.models:
         print(f"\n##### {model.name}")
