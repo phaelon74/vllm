@@ -23,7 +23,7 @@ from typing import Any
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from redaction import redact_env  # noqa: E402 - sibling module
 
-LAWS_VERSION = 4
+LAWS_VERSION = 5
 PROGRAM = "Local Inference Lab"
 
 

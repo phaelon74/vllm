@@ -1,6 +1,6 @@
 # Local Inference Lab — Distribution Fidelity Laws
 
-**Laws version:** 4
+**Laws version:** 5
 **Status:** draft, pending coordination with `local-inference-lab` on the
 publication namespace and suite format.
 
@@ -21,6 +21,15 @@ BF16 router reported a floor of zero while its routing term was not zero. Versio
 and makes that measurement the floor. A version-2 or version-3 receipt for a
 routed model overstates how comparable two candidates are and must be rescored,
 not relabeled.
+
+Version 5 tightens Law 12. Versions 1 through 4 checked that a reference was
+published, not that it was the reference the number came from, and an artifact
+shipped with reference tensors bound to different tokens and a different row count
+than the candidate beside them. Every other law passed, because they read the
+candidate's manifest and never the one published with the tensors. Unlike the
+earlier version changes this one is a relabeling, not a rescore: the measurement
+is unaffected, so a version-4 artifact becomes a version-5 artifact by
+reassembling it and passing the new check.
 
 These laws govern every distribution-fidelity measurement this program
 publishes. They are not guidance. The pipeline refuses to produce or upload an
@@ -276,12 +285,27 @@ score a new candidate without loading the reference checkpoint: the token suite,
 the reference distributions, the language-model head, every manifest, and the
 comparator configuration. File hashes are published for all of it.
 
+The published reference must be bound to the same identity the report was scored
+against, on every field Law 5 binds. Shipping the files is not enough; they have
+to be the files the number came from.
+
 **Why.** A fidelity claim that only its author can reproduce is an assertion, not
 evidence. Publishing the reference also removes the largest cost from anyone
 else's comparison, which is what makes independent replication realistic.
 
+The identity clause exists because presence and reusability are different
+properties, and an artifact once shipped with reference tensors describing
+different tokens and a different row count than the candidate beside them. Every
+other law passed, because they all read the candidate's manifest rather than the
+one published with the tensors. A reader reusing that reference gets an abort at
+best and needs the reference checkpoint after all, which is the one thing this law
+exists to prevent.
+
 **Check.** The artifact contains the suite, reference tensors, head, manifests,
-and a `checksums.txt` covering every file, and the checksums verify.
+and a `checksums.txt` covering every file, and the checksums verify. The manifest
+published under `reference/` agrees with the scored capture manifest on every
+bound field: token hash, tokenizer, context length, rows, start offset, comparator
+vocabulary size, tensor-parallel degree, eager mode, and runtime.
 
 **Override.** Permitted under Law 13 where redistribution of a derivative is
 restricted by the reference checkpoint's license, in which case the artifact

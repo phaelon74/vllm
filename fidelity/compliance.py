@@ -25,7 +25,22 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-LAWS_VERSION = 4
+LAWS_VERSION = 5
+
+# The identity a capture is bound to. Law 5 requires the scored report to carry
+# it; Law 12 requires the published reference to agree with it, so an artifact
+# cannot ship reference tensors that its own manifest does not describe.
+BOUND_FIELDS = (
+    "token_sha256",
+    "tokenizer",
+    "context_length",
+    "rows",
+    "score_from",
+    "kld_vocab_size",
+    "tensor_parallel_size",
+    "enforce_eager",
+    "runtime",
+)
 
 PASS = "pass"
 FAIL = "fail"
@@ -202,18 +217,7 @@ def law_4_real_vocabulary(c: Campaign) -> Finding:
 def law_5_manifest_binding(c: Campaign) -> Finding:
     """The report must be tied to the exact capture manifest it scored."""
     title = "Manifest binding"
-    bound = (
-        "token_sha256",
-        "tokenizer",
-        "context_length",
-        "rows",
-        "score_from",
-        "kld_vocab_size",
-        "tensor_parallel_size",
-        "enforce_eager",
-        "runtime",
-    )
-    absent = [key for key in bound if key not in c.manifest]
+    absent = [key for key in BOUND_FIELDS if key not in c.manifest]
     if absent:
         return Finding(
             5, title, FAIL, f"manifest is missing bound fields: {', '.join(absent)}"
@@ -420,7 +424,38 @@ def law_12_reusable_reference(c: Campaign) -> Finding:
     ]
     if gaps:
         return Finding(12, title, FAIL, f"artifact lacks: {', '.join(gaps)}")
-    return Finding(12, title, PASS, "suite, reference, head, and checksums present")
+
+    # Presence is not reusability. A reference published beside a manifest that
+    # describes different tokens or a different row count cannot score anything,
+    # and every other law still passes, because they all read the candidate's
+    # manifest rather than the one shipped with the tensors.
+    reference_manifest = os.path.join(c.artifact_dir, "reference", "manifest.json")
+    try:
+        with open(reference_manifest, encoding="utf-8") as handle:
+            published = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        return Finding(12, title, FAIL, f"reference manifest unreadable: {exc}")
+    differing = [
+        f"{key} is {published.get(key)!r}, scored against "
+        f"{c.manifest.get(key)!r}"
+        for key in BOUND_FIELDS
+        if published.get(key) != c.manifest.get(key)
+    ]
+    if differing:
+        return Finding(
+            12,
+            title,
+            FAIL,
+            "the published reference is bound to a different identity than the "
+            f"scored capture: {'; '.join(differing)}",
+        )
+    return Finding(
+        12,
+        title,
+        PASS,
+        "suite, reference, head, and checksums present; published reference "
+        "matches the scored capture on every bound field",
+    )
 
 
 def _cell_comparable(cell: dict[str, Any], c: Campaign) -> str | None:

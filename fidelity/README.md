@@ -159,7 +159,10 @@ failures because the checker verifies the assembled artifact:
 8. Publish.
 
 Steps 5 and 6 cannot be swapped. Law 12 verifies that `checksums.txt` and the
-reusable reference exist, so compliance is evaluated against a finished tree.
+reusable reference exist, so compliance is evaluated against a finished tree. It
+also verifies that the manifest published under `reference/` is bound to the same
+identity the report was scored against, which is why step 4 replaces a reference
+whose identity has moved rather than keeping whatever landed there first.
 
 ## Library layout
 
