@@ -25,6 +25,8 @@ from redaction import redact_env  # noqa: E402 - sibling module
 
 LAWS_VERSION = 5
 PROGRAM = "Local Inference Lab"
+# Vendor calibration on packed int4. QDQ still matches format only.
+_CALIBRATED_ALGORITHMS = frozenset({"awq", "gptq", "autoround"})
 
 
 def _load(path: str | None) -> dict[str, Any] | None:
@@ -482,11 +484,30 @@ def _deployed_quantization(deployed: dict[str, Any]) -> list[str]:
     if not isinstance(inspection, dict):
         return []
     out = ["### What the deployed checkpoint quantizes", ""]
+    declared = inspection.get("declared") or {}
+    if not isinstance(declared, dict):
+        declared = {}
+    algorithm = inspection.get("quant_algorithm")
     facts = [
         ("Scheme", str(inspection.get("detected_scheme") or "n/a")),
         ("Block", str(inspection.get("detected_block") or "n/a")),
-        ("Declared method", str(inspection.get("quant_method") or "n/a")),
-        ("Activation scheme", str(inspection.get("activation_scheme") or "n/a")),
+        (
+            "Declared method",
+            str(
+                inspection.get("quant_method")
+                or declared.get("quant_method")
+                or "n/a"
+            ),
+        ),
+        ("Algorithm", str(algorithm or "n/a")),
+        (
+            "Activation scheme",
+            str(
+                inspection.get("activation_scheme")
+                or declared.get("activation_scheme")
+                or "n/a"
+            ),
+        ),
     ]
     out += _table(facts, ("Property", "Value"))
     out.append("")
@@ -512,11 +533,42 @@ def _deployed_quantization(deployed: dict[str, Any]) -> list[str]:
             f"that cell an upper bound rather than a match.",
             "",
         ]
+    scheme = str(inspection.get("detected_scheme") or "")
+    if scheme.startswith("int4_"):
+        if algorithm in _CALIBRATED_ALGORITHMS:
+            out += [
+                f"QDQ cells matched this format ({scheme}) only, not "
+                f"{algorithm} calibration.",
+                "",
+            ]
+        else:
+            out += [
+                f"QDQ cells matched this format ({scheme}) only.",
+                "",
+            ]
     return out
 
 
+def _beyond_rounding_what(algorithm: str | None, engine: Any) -> str:
+    """Label for deployed minus composite: format match, not vendor method."""
+    if algorithm in _CALIBRATED_ALGORITHMS:
+        what = (
+            "calibration benefit, activation quantization, and kernel arithmetic"
+        )
+        if isinstance(engine, (int, float)) and engine < 0:
+            what += (
+                "; the deployed pack beat round-to-nearest at the same format"
+            )
+        return what
+    return "activation quantization and kernel arithmetic"
+
+
 def _derived_terms(
-    deployed: Any, engine: Any, routing: dict[str, Any]
+    deployed: Any,
+    engine: Any,
+    routing: dict[str, Any],
+    *,
+    algorithm: str | None = None,
 ) -> list[str]:
     """The two terms no cell can hold, tabled beside the cells that imply them.
 
@@ -539,7 +591,7 @@ def _derived_terms(
                 "Beyond weight rounding",
                 f"{engine:+.8f}",
                 share(engine),
-                "activation quantization and kernel arithmetic",
+                _beyond_rounding_what(algorithm, engine),
                 "[Beyond weight rounding](#beyond-weight-rounding)",
             )
         )
@@ -582,7 +634,16 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
     composite = attribution.get("composite_cell") or {}
     engine = attribution.get("engine_arithmetic")
     deployed_cell = attribution.get("deployed") or {}
-    activations = (deployed_cell.get("inspection") or {}).get("activation_scheme")
+    inspection = deployed_cell.get("inspection") or {}
+    declared = inspection.get("declared") or {}
+    if not isinstance(declared, dict):
+        declared = {}
+    activations = inspection.get("activation_scheme") or declared.get(
+        "activation_scheme"
+    )
+    algorithm = (
+        attribution.get("quant_algorithm") or inspection.get("quant_algorithm")
+    )
 
     out = [
         "## Component attribution",
@@ -648,7 +709,7 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
     out += _table(
         rows, ("Cell", "What it isolates", "Mean KLD", "Selections changed", "Support")
     )
-    out += _derived_terms(deployed, engine, routing)
+    out += _derived_terms(deployed, engine, routing, algorithm=algorithm)
     measured_cells = [
         cell
         for cell in (expert_cell, router_cell, composite)
@@ -678,14 +739,29 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
             if isinstance(deployed, (int, float)) and deployed
             else ""
         )
-        cause = (
-            f"The checkpoint quantizes activations ({activations}), so this term "
-            f"is activation quantization together with kernel arithmetic, not "
-            f"kernel arithmetic alone."
-            if activations in ("dynamic", "static")
-            else "The checkpoint quantizes weights only, so this term is kernel "
-            "arithmetic."
-        )
+        if algorithm in _CALIBRATED_ALGORITHMS:
+            cause = (
+                f"QDQ matched the format, not {algorithm} calibration, so this "
+                "term is calibration benefit together with activation "
+                "quantization and kernel arithmetic."
+            )
+            if engine < 0:
+                cause += (
+                    " The negative sign means the deployed pack beat "
+                    "round-to-nearest at the same bit width, group size, "
+                    "and symmetry."
+                )
+        elif activations in ("dynamic", "static"):
+            cause = (
+                f"The checkpoint quantizes activations ({activations}), so this "
+                "term is activation quantization together with kernel "
+                "arithmetic, not kernel arithmetic alone."
+            )
+        else:
+            cause = (
+                "The checkpoint quantizes weights only, so this term is kernel "
+                "arithmetic."
+            )
         out += [
             "### Beyond weight rounding",
             "",

@@ -1361,6 +1361,7 @@ def main() -> int:
             "model": matched["model"],
             "detected_scheme": matched["detected_scheme"],
             "detected_block": matched["detected_block"],
+            "quant_algorithm": matched.get("quant_algorithm"),
             "coverage": matched["coverage"],
         }
         with open(

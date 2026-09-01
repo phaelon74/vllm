@@ -854,6 +854,30 @@ def _cell(report_path: str, capture_manifest: dict[str, Any], config: Config,
     }
 
 
+def _append_deployed_ladder(
+    ladder: list[dict[str, Any]],
+    deployed_scheme: str | None,
+    expert: dict[str, Any],
+) -> None:
+    """Put the deployed format on the ladder without another scoring run.
+
+    Config.ladder is the shared FP8/NVFP4 rungs. An int4 candidate's expert
+    cell is already that format, so appending it costs nothing extra.
+    """
+    if not deployed_scheme:
+        return
+    if any(entry.get("scheme") == deployed_scheme for entry in ladder):
+        return
+    ladder.append(
+        {
+            "scheme": deployed_scheme,
+            "mean_kld": expert.get("mean_kld"),
+            "variant": expert.get("variant"),
+            "report": expert.get("report"),
+        }
+    )
+
+
 def attribute_model(
     config: Config,
     python: str,
@@ -973,6 +997,9 @@ def attribute_model(
             composite.get("mean_kld"), (int, float)
         ):
             attribution["engine_arithmetic"] = deployed_mean - composite["mean_kld"]
+    algorithm = inspection.get("quant_algorithm")
+    if algorithm:
+        attribution["quant_algorithm"] = algorithm
 
     ladder = []
     for scheme in config.ladder:
@@ -988,6 +1015,7 @@ def attribute_model(
                 "report": entry["report"],
             }
         )
+    _append_deployed_ladder(ladder, deployed_scheme, attribution["expert_cell"])
     attribution["ladder"] = ladder
 
     out = os.path.join(config.work, "attribution", f"{deployed.name}.json")
@@ -1044,6 +1072,23 @@ def _candidate_complete(config: Config, cand: Candidate, routed: bool) -> bool:
     )
 
 
+def _has_checkpoint_weights(path: str) -> bool:
+    """True when config.json and at least one safetensors shard are present.
+
+    A lease release can leave a directory with only config.json. Treating that
+    as "weights present" skips the re-fetch Law 14 needs for inspect and QDQ.
+    """
+    if not os.path.isdir(path):
+        return False
+    if not os.path.isfile(os.path.join(path, "config.json")):
+        return False
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return False
+    return any(name.endswith(".safetensors") for name in names)
+
+
 def ensure_candidate_weights(config: Config, cand: Candidate) -> None:
     """Fetch a missing candidate. Raises CampaignError on a fetch fault.
 
@@ -1051,8 +1096,7 @@ def ensure_candidate_weights(config: Config, cand: Candidate) -> None:
     is eligible for deletion after scoring. A directory that was already on
     disk is never leased.
     """
-    config_json = os.path.join(cand.path, "config.json")
-    if os.path.isdir(cand.path) and os.path.isfile(config_json):
+    if _has_checkpoint_weights(cand.path):
         return
     if not cand.hf_repo:
         raise CampaignError(
@@ -1060,8 +1104,8 @@ def ensure_candidate_weights(config: Config, cand: Candidate) -> None:
         )
     if fetch_checkpoint(cand.hf_repo, cand.path, cand.revision) != 0:
         raise CampaignError(f"download failed for {cand.hf_repo}")
-    if not os.path.isfile(os.path.join(cand.path, "config.json")):
-        raise CampaignError(f"download produced no config.json at {cand.path}")
+    if not _has_checkpoint_weights(cand.path):
+        raise CampaignError(f"download produced no weights at {cand.path}")
     if config.fetch == "lease":
         write_lease(config.work, cand)
 
@@ -1749,6 +1793,15 @@ def selftest() -> int:
         assert os.path.isdir(ref)
         assert load_lease(work, ref_cand.name) is not None
 
+        husk = os.path.join(tmp, "husk")
+        os.makedirs(husk)
+        with open(os.path.join(husk, "config.json"), "w", encoding="utf-8") as handle:
+            handle.write("{}\n")
+        assert not _has_checkpoint_weights(husk)
+        with open(os.path.join(husk, "model.safetensors"), "wb") as handle:
+            handle.write(b"x")
+        assert _has_checkpoint_weights(husk)
+
         cache_dir = os.path.join(tmp, "ckpt")
         os.makedirs(cache_dir)
         cache = os.path.join(cache_dir, "inspect.json")
@@ -1804,6 +1857,60 @@ def selftest() -> int:
     )
     assert pinned.tp == 2
     assert pinned.pinned is True
+
+    rungs = [
+        {"scheme": "fp8_block", "mean_kld": 0.1, "variant": "a", "report": "r"}
+    ]
+    expert = {
+        "mean_kld": 0.02,
+        "variant": "int4-cell",
+        "report": "int4.json",
+    }
+    _append_deployed_ladder(rungs, "int4_g32_asym", expert)
+    assert rungs[-1]["scheme"] == "int4_g32_asym"
+    assert rungs[-1]["mean_kld"] == 0.02
+    before = list(rungs)
+    _append_deployed_ladder(rungs, "int4_g32_asym", expert)
+    assert rungs == before
+    already = [
+        {"scheme": "fp8_block", "mean_kld": 0.05, "variant": "b", "report": "s"}
+    ]
+    _append_deployed_ladder(
+        already,
+        "fp8_block",
+        {"mean_kld": 0.05, "variant": "b", "report": "s"},
+    )
+    assert len(already) == 1
+
+    from artifact import (
+        _beyond_rounding_what,
+        _deployed_quantization,
+        _derived_terms,
+    )
+
+    assert "calibration benefit" in _beyond_rounding_what("awq", -0.01)
+    assert "beat round-to-nearest" in _beyond_rounding_what("awq", -0.01)
+    assert "beat round-to-nearest" not in _beyond_rounding_what("awq", 0.01)
+    md = "\n".join(
+        _deployed_quantization(
+            {
+                "inspection": {
+                    "detected_scheme": "int4_g32_asym",
+                    "detected_block": 32,
+                    "quant_algorithm": "awq",
+                    "coverage": {
+                        "experts": {"weights": 41, "quantized": 41}
+                    },
+                }
+            }
+        )
+    )
+    assert "Algorithm" in md and "awq" in md
+    assert "format (int4_g32_asym) only" in md
+    derived = "\n".join(
+        _derived_terms(0.02, -0.01, {}, algorithm="gptq")
+    )
+    assert "beat round-to-nearest" in derived
 
     print("selftest passed")
     return 0
