@@ -1,0 +1,18 @@
+{
+  "fp8": [
+    "Qwen/Qwen3.6-35B-A3B-FP8"
+  ],
+  "nvfp4": [
+    "nvidia/Qwen3.6-35B-A3B-NVFP4",
+    "unsloth/Qwen3.6-35B-A3B-NVFP4",
+    "RedHatAI/Qwen3.6-35B-A3B-NVFP4",
+    "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast",
+    "ykarout/Qwen3.6-35B-A3B-NVFP4"
+  ],
+  "int4": [
+    "cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit",
+    "QuantTrio/Qwen3.6-35B-A3B-AWQ",
+    "palmfuture/Qwen3.6-35B-A3B-GPTQ-Int4",
+    "Intel/Qwen3.6-35B-A3B-int4-mixed-AutoRound"
+  ]
+}

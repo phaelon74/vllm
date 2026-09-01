@@ -1,0 +1,18 @@
+{
+  "fp8": [
+    "Qwen/Qwen3.6-27B-FP8"
+  ],
+  "nvfp4": [
+    "unsloth/Qwen3.6-27B-NVFP4",
+    "nvidia/Qwen3.6-27B-NVFP4",
+    "rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm",
+    "sudo-0x2a/Qwen3.6-27B-NVFP4-GPTQ",
+    "mmangkad/Qwen3.6-27B-NVFP4"
+  ],
+  "int4": [
+    "cyankiwi/Qwen3.6-27B-AWQ-INT4",
+    "Lorbus/Qwen3.6-27B-int4-AutoRound",
+    "QuantTrio/Qwen3.6-27B-AWQ",
+    "groxaxo/Qwen3.6-27B-GPTQ-Pro-4bit"
+  ]
+}

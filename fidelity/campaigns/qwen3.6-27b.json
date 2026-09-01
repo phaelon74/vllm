@@ -1,0 +1,86 @@
+{
+  "name": "qwen3.6-27b-fidelity",
+  "library": "/media/fmodels2/Local-Inference-Lab/library",
+  "work": "/media/fmodels2/Local-Inference-Lab/work/qwen3.6-27b",
+  "suite_partition": "analysis",
+  "partition": "analysis",
+  "context_length": 2048,
+  "score_from": 0,
+  "runner_v2": false,
+  "storage": "hidden",
+  "max_num_seqs": 1,
+  "fetch": "lease",
+  "models": [
+    {
+      "name": "Qwen3.6-27B",
+      "reference": {
+        "path": "/media/fmodels2/Qwen/Qwen3.6-27B",
+        "hf_repo": "Qwen/Qwen3.6-27B",
+        "revision": "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9"
+      },
+      "candidates": [
+        {
+          "name": "Qwen3.6-27B-FP8",
+          "path": "/media/fmodels2/Qwen/Qwen3.6-27B-FP8",
+          "hf_repo": "Qwen/Qwen3.6-27B-FP8",
+          "revision": "e89b16ebf1988b3d6befa7de50abc2d76f26eb09"
+        },
+        {
+          "name": "Qwen3.6-27B-NVFP4",
+          "path": "/media/fmodels2/unsloth/Qwen3.6-27B-NVFP4",
+          "hf_repo": "unsloth/Qwen3.6-27B-NVFP4",
+          "revision": "ccdaab7e68af2409599b8949a8f2685703c9bae5"
+        },
+        {
+          "name": "nvidia-Qwen3.6-27B-NVFP4",
+          "path": "/media/fmodels2/nvidia/Qwen3.6-27B-NVFP4",
+          "hf_repo": "nvidia/Qwen3.6-27B-NVFP4",
+          "revision": "0893e1606ff3d5f97a441f405d5fc541a6bdf404"
+        },
+        {
+          "name": "Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm",
+          "path": "/media/fmodels2/rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm",
+          "hf_repo": "rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm",
+          "revision": "f40ffb6580ecfed1250199e9537d0ab1c9bc9fbd"
+        },
+        {
+          "name": "Qwen3.6-27B-NVFP4-GPTQ",
+          "path": "/media/fmodels2/sudo-0x2a/Qwen3.6-27B-NVFP4-GPTQ",
+          "hf_repo": "sudo-0x2a/Qwen3.6-27B-NVFP4-GPTQ",
+          "revision": "c58fa2998b54df0be888848d2261e61e6eee2a51"
+        },
+        {
+          "name": "mmangkad-Qwen3.6-27B-NVFP4",
+          "path": "/media/fmodels2/mmangkad/Qwen3.6-27B-NVFP4",
+          "hf_repo": "mmangkad/Qwen3.6-27B-NVFP4",
+          "revision": "67e4c690007f910704c01a02d8a7bcf039ee777a"
+        },
+        {
+          "name": "Qwen3.6-27B-AWQ-INT4",
+          "path": "/media/fmodels2/cyankiwi/Qwen3.6-27B-AWQ-INT4",
+          "hf_repo": "cyankiwi/Qwen3.6-27B-AWQ-INT4",
+          "revision": "e5cc0400fb2403c437c2c40a7c52fb5ae93fda18"
+        },
+        {
+          "name": "Qwen3.6-27B-int4-AutoRound",
+          "path": "/media/fmodels2/Lorbus/Qwen3.6-27B-int4-AutoRound",
+          "hf_repo": "Lorbus/Qwen3.6-27B-int4-AutoRound",
+          "revision": "c3aea2d531678621989e5e2db034e32b22536e79"
+        },
+        {
+          "name": "Qwen3.6-27B-AWQ",
+          "path": "/media/fmodels2/QuantTrio/Qwen3.6-27B-AWQ",
+          "hf_repo": "QuantTrio/Qwen3.6-27B-AWQ",
+          "revision": "9b507bdc9afafb87b7898700cc2a591aa6639461"
+        },
+        {
+          "name": "Qwen3.6-27B-GPTQ-Pro-4bit",
+          "path": "/media/fmodels2/groxaxo/Qwen3.6-27B-GPTQ-Pro-4bit",
+          "hf_repo": "groxaxo/Qwen3.6-27B-GPTQ-Pro-4bit",
+          "revision": "95bfcf97a51e53eb933ad58bf5623d6e32ecbd1b"
+        }
+      ]
+    }
+  ],
+  "suite_dir": "/media/fmodels2/Local-Inference-Lab/suites/qwen3.6-1024x2048-v1"
+}

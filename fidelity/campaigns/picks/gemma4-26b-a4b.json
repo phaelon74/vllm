@@ -1,0 +1,18 @@
+{
+  "fp8": [
+    "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
+  ],
+  "nvfp4": [
+    "RedHatAI/gemma-4-26B-A4B-it-NVFP4",
+    "bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4",
+    "unsloth/gemma-4-26B-A4B-it-NVFP4",
+    "cklaus/gemma-4-26B-A4B-it-NVFP4",
+    "Neural-ICE/Gemma-4-26B-A4B-it-NVFP4"
+  ],
+  "int4": [
+    "cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit",
+    "dhruvil237/gemma-4-26B-A4B-it-W4A16",
+    "Intel/gemma-4-26B-A4B-it-int4-AutoRound",
+    "lcu0312/gemma-4-26B-A4B-it-AWQ-4bit"
+  ]
+}

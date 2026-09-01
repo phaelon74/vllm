@@ -1,0 +1,86 @@
+{
+  "name": "qwen3.6-35b-a3b-fidelity",
+  "library": "/media/fmodels2/Local-Inference-Lab/library",
+  "work": "/media/fmodels2/Local-Inference-Lab/work/qwen3.6-35b-a3b",
+  "suite_partition": "analysis",
+  "partition": "analysis",
+  "context_length": 2048,
+  "score_from": 0,
+  "runner_v2": false,
+  "storage": "hidden",
+  "max_num_seqs": 1,
+  "fetch": "lease",
+  "models": [
+    {
+      "name": "Qwen3.6-35B-A3B",
+      "reference": {
+        "path": "/media/fmodels2/Qwen/Qwen3.6-35B-A3B",
+        "hf_repo": "Qwen/Qwen3.6-35B-A3B",
+        "revision": "995ad96eacd98c81ed38be0c5b274b04031597b0"
+      },
+      "candidates": [
+        {
+          "name": "Qwen3.6-35B-A3B-FP8",
+          "path": "/media/fmodels2/Qwen/Qwen3.6-35B-A3B-FP8",
+          "hf_repo": "Qwen/Qwen3.6-35B-A3B-FP8",
+          "revision": "95a723d08a9490559dae23d0cff1d9466213d989"
+        },
+        {
+          "name": "Qwen3.6-35B-A3B-NVFP4",
+          "path": "/media/fmodels2/nvidia/Qwen3.6-35B-A3B-NVFP4",
+          "hf_repo": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+          "revision": "1355db6a052410cfd62085d94b58866fd0f2c3c5"
+        },
+        {
+          "name": "unsloth-Qwen3.6-35B-A3B-NVFP4",
+          "path": "/media/fmodels2/unsloth/Qwen3.6-35B-A3B-NVFP4",
+          "hf_repo": "unsloth/Qwen3.6-35B-A3B-NVFP4",
+          "revision": "739af1e7aac320af1682ed1e0cce369af4c5265d"
+        },
+        {
+          "name": "RedHatAI-Qwen3.6-35B-A3B-NVFP4",
+          "path": "/media/fmodels2/RedHatAI/Qwen3.6-35B-A3B-NVFP4",
+          "hf_repo": "RedHatAI/Qwen3.6-35B-A3B-NVFP4",
+          "revision": "e94a930c8e9b8a7d3763e449289c261c9c7d3e5e"
+        },
+        {
+          "name": "Qwen3.6-35B-A3B-NVFP4-Fast",
+          "path": "/media/fmodels2/unsloth/Qwen3.6-35B-A3B-NVFP4-Fast",
+          "hf_repo": "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast",
+          "revision": "1c3f884bc99aac2524f6d49bcbac8c88401afd66"
+        },
+        {
+          "name": "ykarout-Qwen3.6-35B-A3B-NVFP4",
+          "path": "/media/fmodels2/ykarout/Qwen3.6-35B-A3B-NVFP4",
+          "hf_repo": "ykarout/Qwen3.6-35B-A3B-NVFP4",
+          "revision": "5093c2a1d4d263007b563753438caf75dadaec48"
+        },
+        {
+          "name": "Qwen3.6-35B-A3B-AWQ-4bit",
+          "path": "/media/fmodels2/cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit",
+          "hf_repo": "cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit",
+          "revision": "00fcea2d3bcf5389b518d4fc082e5590e0ba4844"
+        },
+        {
+          "name": "Qwen3.6-35B-A3B-AWQ",
+          "path": "/media/fmodels2/QuantTrio/Qwen3.6-35B-A3B-AWQ",
+          "hf_repo": "QuantTrio/Qwen3.6-35B-A3B-AWQ",
+          "revision": "119886a1072372348f73ef0df2d801cdcc0f455b"
+        },
+        {
+          "name": "Qwen3.6-35B-A3B-GPTQ-Int4",
+          "path": "/media/fmodels2/palmfuture/Qwen3.6-35B-A3B-GPTQ-Int4",
+          "hf_repo": "palmfuture/Qwen3.6-35B-A3B-GPTQ-Int4",
+          "revision": "00a66983516f8f8057741221277eed4141c9e431"
+        },
+        {
+          "name": "Qwen3.6-35B-A3B-int4-mixed-AutoRound",
+          "path": "/media/fmodels2/Intel/Qwen3.6-35B-A3B-int4-mixed-AutoRound",
+          "hf_repo": "Intel/Qwen3.6-35B-A3B-int4-mixed-AutoRound",
+          "revision": "65f69c73f17488236c85c85211f6ba28d7106157"
+        }
+      ]
+    }
+  ],
+  "suite_dir": "/media/fmodels2/Local-Inference-Lab/suites/qwen3.6-1024x2048-v1"
+}

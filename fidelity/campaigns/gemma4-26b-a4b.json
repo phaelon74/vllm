@@ -1,0 +1,86 @@
+{
+  "name": "gemma4-26b-a4b-fidelity",
+  "library": "/media/fmodels2/Local-Inference-Lab/library",
+  "work": "/media/fmodels2/Local-Inference-Lab/work/gemma4-26b-a4b",
+  "suite_partition": "analysis",
+  "partition": "analysis",
+  "context_length": 2048,
+  "score_from": 0,
+  "runner_v2": false,
+  "storage": "hidden",
+  "max_num_seqs": 1,
+  "fetch": "lease",
+  "models": [
+    {
+      "name": "gemma-4-26B-A4B-it",
+      "reference": {
+        "path": "/media/fmodels2/google/gemma-4-26B-A4B-it",
+        "hf_repo": "google/gemma-4-26B-A4B-it",
+        "revision": "4d7ae4984b7db7de8f8457170b3f1a419ee76d52"
+      },
+      "candidates": [
+        {
+          "name": "gemma-4-26B-A4B-it-FP8-dynamic",
+          "path": "/media/fmodels2/RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic",
+          "hf_repo": "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic",
+          "revision": "ed35d7abe5d940da41b4ff06eb482feb0be8cb44"
+        },
+        {
+          "name": "gemma-4-26B-A4B-it-NVFP4",
+          "path": "/media/fmodels2/RedHatAI/gemma-4-26B-A4B-it-NVFP4",
+          "hf_repo": "RedHatAI/gemma-4-26B-A4B-it-NVFP4",
+          "revision": "5557756b8dce33ac72f2bd702b11729fdba3b839"
+        },
+        {
+          "name": "Gemma-4-26B-A4B-it-NVFP4",
+          "path": "/media/fmodels2/bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4",
+          "hf_repo": "bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4",
+          "revision": "a15dd6f161881b62db952303a5bfb7be118ed15e"
+        },
+        {
+          "name": "unsloth-gemma-4-26B-A4B-it-NVFP4",
+          "path": "/media/fmodels2/unsloth/gemma-4-26B-A4B-it-NVFP4",
+          "hf_repo": "unsloth/gemma-4-26B-A4B-it-NVFP4",
+          "revision": "20df0542b1a86ce19f495ac2eca2c7c12bce82f9"
+        },
+        {
+          "name": "cklaus-gemma-4-26B-A4B-it-NVFP4",
+          "path": "/media/fmodels2/cklaus/gemma-4-26B-A4B-it-NVFP4",
+          "hf_repo": "cklaus/gemma-4-26B-A4B-it-NVFP4",
+          "revision": "54218eb0fd33da17632f0d91be841d09a7724a6c"
+        },
+        {
+          "name": "Neural-ICE-Gemma-4-26B-A4B-it-NVFP4",
+          "path": "/media/fmodels2/Neural-ICE/Gemma-4-26B-A4B-it-NVFP4",
+          "hf_repo": "Neural-ICE/Gemma-4-26B-A4B-it-NVFP4",
+          "revision": "659c96699c565f371094dd04f911858ca8e84789"
+        },
+        {
+          "name": "gemma-4-26B-A4B-it-AWQ-4bit",
+          "path": "/media/fmodels2/cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit",
+          "hf_repo": "cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit",
+          "revision": "0ef577a5710035bd2d3a3f27e4f5cb2e86a9a9ba"
+        },
+        {
+          "name": "gemma-4-26B-A4B-it-W4A16",
+          "path": "/media/fmodels2/dhruvil237/gemma-4-26B-A4B-it-W4A16",
+          "hf_repo": "dhruvil237/gemma-4-26B-A4B-it-W4A16",
+          "revision": "4fff0de2a4faae2882f28ca148a11181572ef995"
+        },
+        {
+          "name": "gemma-4-26B-A4B-it-int4-AutoRound",
+          "path": "/media/fmodels2/Intel/gemma-4-26B-A4B-it-int4-AutoRound",
+          "hf_repo": "Intel/gemma-4-26B-A4B-it-int4-AutoRound",
+          "revision": "edff62728a3c79ec541983b86a21674500e0f05b"
+        },
+        {
+          "name": "lcu0312-gemma-4-26B-A4B-it-AWQ-4bit",
+          "path": "/media/fmodels2/lcu0312/gemma-4-26B-A4B-it-AWQ-4bit",
+          "hf_repo": "lcu0312/gemma-4-26B-A4B-it-AWQ-4bit",
+          "revision": "f88123cf7fa9d270a92375e3904223136792992f"
+        }
+      ]
+    }
+  ],
+  "suite_dir": "/media/fmodels2/Local-Inference-Lab/suites/gemma4-26b-a4b-1024x2048-v1"
+}

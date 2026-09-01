@@ -1,0 +1,86 @@
+{
+  "name": "gemma4-31b-it-fidelity",
+  "library": "/media/fmodels2/Local-Inference-Lab/library",
+  "work": "/media/fmodels2/Local-Inference-Lab/work/gemma4-31b-it",
+  "suite_partition": "analysis",
+  "partition": "analysis",
+  "context_length": 2048,
+  "score_from": 0,
+  "runner_v2": false,
+  "storage": "hidden",
+  "max_num_seqs": 1,
+  "fetch": "lease",
+  "models": [
+    {
+      "name": "gemma-4-31B-it",
+      "reference": {
+        "path": "/media/fmodels2/google/gemma-4-31B-it",
+        "hf_repo": "google/gemma-4-31B-it",
+        "revision": "842da3794eaa0b77d5f08bae87a17459d91ff475"
+      },
+      "candidates": [
+        {
+          "name": "gemma-4-31B-it-FP8-block",
+          "path": "/media/fmodels2/RedHatAI/gemma-4-31B-it-FP8-block",
+          "hf_repo": "RedHatAI/gemma-4-31B-it-FP8-block",
+          "revision": "d7242548c457ab4b45bd3adb8937f2659af4739d"
+        },
+        {
+          "name": "Gemma-4-31B-IT-NVFP4",
+          "path": "/media/fmodels2/nvidia/Gemma-4-31B-IT-NVFP4",
+          "hf_repo": "nvidia/Gemma-4-31B-IT-NVFP4",
+          "revision": "4135a98a9b728a548947683219633b25682223ac"
+        },
+        {
+          "name": "gemma-4-31B-it-NVFP4-turbo",
+          "path": "/media/fmodels2/LilaRest/gemma-4-31B-it-NVFP4-turbo",
+          "hf_repo": "LilaRest/gemma-4-31B-it-NVFP4-turbo",
+          "revision": "782d58ea7f9cf3a148be86e153f5689a2d73238b"
+        },
+        {
+          "name": "gemma-4-31B-it-NVFP4",
+          "path": "/media/fmodels2/RedHatAI/gemma-4-31B-it-NVFP4",
+          "hf_repo": "RedHatAI/gemma-4-31B-it-NVFP4",
+          "revision": "5df75ccad9b74546f5be758a2a68acc2e16bbc9b"
+        },
+        {
+          "name": "unsloth-gemma-4-31B-it-NVFP4",
+          "path": "/media/fmodels2/unsloth/gemma-4-31B-it-NVFP4",
+          "hf_repo": "unsloth/gemma-4-31B-it-NVFP4",
+          "revision": "373c00b5ecb0a8ee43942b5ca08b93805de8eee4"
+        },
+        {
+          "name": "gemma-4-31B-it-NVFP4A16-GPTQ",
+          "path": "/media/fmodels2/YCWTG/gemma-4-31B-it-NVFP4A16-GPTQ",
+          "hf_repo": "YCWTG/gemma-4-31B-it-NVFP4A16-GPTQ",
+          "revision": "92a6c1c1d82a990031b53cbdfd3ced50b9521aff"
+        },
+        {
+          "name": "gemma-4-31B-it-AWQ-4bit",
+          "path": "/media/fmodels2/cyankiwi/gemma-4-31B-it-AWQ-4bit",
+          "hf_repo": "cyankiwi/gemma-4-31B-it-AWQ-4bit",
+          "revision": "6f1b616c64bca2a05d67fdd6437c5500a8509327"
+        },
+        {
+          "name": "gemma-4-31B-it-AWQ",
+          "path": "/media/fmodels2/QuantTrio/gemma-4-31B-it-AWQ",
+          "hf_repo": "QuantTrio/gemma-4-31B-it-AWQ",
+          "revision": "37cf6a076672592df03c8d941886a9d70d4338f0"
+        },
+        {
+          "name": "gemma-4-31B-it-4bit-W4A16-AWQ",
+          "path": "/media/fmodels2/ebircak/gemma-4-31B-it-4bit-W4A16-AWQ",
+          "hf_repo": "ebircak/gemma-4-31B-it-4bit-W4A16-AWQ",
+          "revision": "a3b96c7a8d07cc84cae0f0261ac2574310b12d37"
+        },
+        {
+          "name": "gemma-4-31B-it-int4-AutoRound",
+          "path": "/media/fmodels2/Intel/gemma-4-31B-it-int4-AutoRound",
+          "hf_repo": "Intel/gemma-4-31B-it-int4-AutoRound",
+          "revision": "a428c96a57976947b0f12735f0cf5fcae69019ad"
+        }
+      ]
+    }
+  ],
+  "suite_dir": "/media/fmodels2/Local-Inference-Lab/suites/gemma4-31b-it-1024x2048-v1"
+}
