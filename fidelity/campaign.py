@@ -776,11 +776,21 @@ def score_one(
 
 
 def variant_path(
-    config: Config, reference: str, components: str, scheme: str | None
+    config: Config,
+    reference: str,
+    components: str,
+    scheme: str | None,
+    match_digest: str | None = None,
 ) -> str:
-    """Where a QDQ variant lives, whether or not its weights are still there."""
+    """Where a QDQ variant lives, whether or not its weights are still there.
+
+    `match_digest` is the short per-tensor suffix. None keeps the path a
+    fully-covered conversion already used, so those reports stay reusable.
+    """
     slug = components.replace(",", "-")
     name = f"{os.path.basename(reference)}-qdq-{slug}-{scheme or 'matched'}"
+    if match_digest:
+        name += f"-m{match_digest}"
     return os.path.join(config.work, "variants", name)
 
 
@@ -791,6 +801,9 @@ def build_variant(
     match: str,
     components: str,
     scheme: str | None,
+    *,
+    per_tensor: bool = False,
+    expect_digest: str | None = None,
 ) -> str:
     """Build a QDQ variant if absent, and return its path.
 
@@ -798,7 +811,9 @@ def build_variant(
     scheme ladder is several checkpoint copies and the report plus the QDQ
     manifest are what an artifact publishes.
     """
-    out = variant_path(config, reference, components, scheme)
+    out = variant_path(
+        config, reference, components, scheme, match_digest=expect_digest
+    )
     name = os.path.basename(out)
     if os.path.isfile(os.path.join(out, "qdq-manifest.json")) and glob.glob(
         os.path.join(out, "*.safetensors")
@@ -814,6 +829,10 @@ def build_variant(
     ]
     if scheme:
         cmd += ["--scheme", scheme]
+    if per_tensor:
+        cmd += ["--per-tensor"]
+    if expect_digest:
+        cmd += ["--expect-match-digest", expect_digest]
     print(f"=== building variant {name}")
     rc = _run(cmd, log_path=os.path.join(config.work, "logs", f"{name}.log"))
     if rc != 0:
@@ -832,8 +851,14 @@ def _prune_variant(path: str) -> None:
     print(f"  pruned variant weights in {path}")
 
 
-def _cell(report_path: str, capture_manifest: dict[str, Any], config: Config,
-          variant: str, scheme: str) -> dict[str, Any]:
+def _cell(
+    report_path: str,
+    capture_manifest: dict[str, Any],
+    config: Config,
+    variant: str,
+    scheme: str,
+    match_mode: str,
+) -> dict[str, Any]:
     """One attribution cell, carrying the identity Law 14 compares against."""
     with open(report_path, encoding="utf-8") as handle:
         report = json.load(handle)
@@ -849,6 +874,7 @@ def _cell(report_path: str, capture_manifest: dict[str, Any], config: Config,
         "reference_config_sha256": capture_manifest.get("reference_config_sha256"),
         "variant": os.path.basename(variant),
         "scheme": scheme,
+        "match_mode": match_mode,
         "report": report_path,
         "qdq_manifest": os.path.join(variant, "qdq-manifest.json"),
     }
@@ -875,8 +901,9 @@ def _append_deployed_ladder(
 ) -> None:
     """Put the deployed format on the ladder without another scoring run.
 
-    Config.ladder is the shared FP8/NVFP4 rungs. An int4 candidate's expert
-    cell is already that format, so appending it costs nothing extra.
+    Config.ladder is the shared FP8/NVFP4 rungs. The rung is the
+    component-wide expert cell at the deployed scheme, not the per-tensor
+    expert cell that decomposes the deployed mean.
     """
     if not deployed_scheme:
         return
@@ -913,6 +940,7 @@ def attribute_model(
         return None
 
     inspection = qdq.inspect(deployed.path)
+    public_inspection = qdq.inspect_for_disk(inspection)
     deployed_scheme = inspection["detected_scheme"]
     if deployed_scheme is None:
         raise CampaignError(
@@ -935,9 +963,30 @@ def attribute_model(
         with open(manifest_path, encoding="utf-8") as handle:
             capture_manifest = json.load(handle)
 
-    def score_variant(components: str, scheme: str | None) -> dict[str, Any]:
-        label = f"{model.name}-qdq-{components.replace(',', '-')}-{scheme or 'matched'}"
-        variant = variant_path(config, model.reference_path, components, scheme)
+    def score_variant(
+        components: str, scheme: str | None, *, per_tensor: bool = False
+    ) -> dict[str, Any]:
+        parts = tuple(
+            part.strip() for part in components.split(",") if part.strip()
+        )
+        digest = (
+            qdq.match_digest(model.reference_path, inspection, parts)
+            if per_tensor
+            else None
+        )
+        label = (
+            f"{model.name}-qdq-{components.replace(',', '-')}-"
+            f"{scheme or 'matched'}"
+        )
+        if digest:
+            label += f"-m{digest}"
+        variant = variant_path(
+            config,
+            model.reference_path,
+            components,
+            scheme,
+            match_digest=digest,
+        )
         # `prune_variants` deletes a variant's weights once it is scored, so
         # rebuilding before checking for the report writes a full checkpoint
         # copy to disk only to discard it again.
@@ -949,6 +998,8 @@ def attribute_model(
             variant = build_variant(
                 config, python, model.reference_path, deployed.path,
                 components, scheme,
+                per_tensor=per_tensor,
+                expect_digest=digest,
             )
         report, _ = score_one(
             config, python, label, variant, model.reference_path, config.rows,
@@ -959,7 +1010,9 @@ def attribute_model(
             plan_from=model.reference_path,
         )
         cell = _cell(
-            report, capture_manifest, config, variant, scheme or deployed_scheme
+            report, capture_manifest, config, variant,
+            scheme or deployed_scheme,
+            "per_tensor" if per_tensor else "per_component",
         )
         if config.prune_variants and glob.glob(
             os.path.join(variant, "*.safetensors")
@@ -975,12 +1028,16 @@ def attribute_model(
             "scheme": deployed_scheme,
             "mean_kld": deployed_mean,
             "report": deployed_report,
-            "inspection": inspection,
+            "inspection": public_inspection,
         },
-        "expert_cell": score_variant("experts", deployed_scheme),
+        "expert_cell": score_variant(
+            "experts", deployed_scheme, per_tensor=True
+        ),
     }
     if router_quantized:
-        attribution["router_cell"] = score_variant("router", deployed_scheme)
+        attribution["router_cell"] = score_variant(
+            "router", deployed_scheme, per_tensor=True
+        )
     else:
         attribution["router_cell"] = {
             "status": "not_applicable",
@@ -1002,18 +1059,18 @@ def attribute_model(
     if quantized == ["experts"]:
         composite = dict(attribution["expert_cell"])
     elif quantized:
-        composite = score_variant(",".join(quantized), deployed_scheme)
+        composite = score_variant(
+            ",".join(quantized), deployed_scheme, per_tensor=True
+        )
     else:
         composite = {}
     if composite:
         attribution["composite_cell"] = dict(
             composite,
             components=quantized,
-            # A cell rounds every weight its pattern matches, so a partly
-            # quantized component makes the composite heavier than the
-            # deployment and can drive deployed - composite negative on its
-            # own. Naming those components keeps that from reading as a
-            # property of the deployed pack.
+            # Recorded so a per-component cell, or an attribution file that
+            # predates match_mode, can refuse a calibration claim. A
+            # per-tensor cell matched the names and ignores this list.
             partial_components=_partial_components(inspection, quantized),
         )
         if isinstance(deployed_mean, (int, float)) and isinstance(
@@ -1026,10 +1083,7 @@ def attribute_model(
 
     ladder = []
     for scheme in config.ladder:
-        if scheme == deployed_scheme:
-            entry = dict(attribution["expert_cell"])
-        else:
-            entry = score_variant("experts", scheme)
+        entry = score_variant("experts", scheme, per_tensor=False)
         ladder.append(
             {
                 "scheme": scheme,
@@ -1038,7 +1092,10 @@ def attribute_model(
                 "report": entry["report"],
             }
         )
-    _append_deployed_ladder(ladder, deployed_scheme, attribution["expert_cell"])
+    deployed_rung = score_variant(
+        "experts", deployed_scheme, per_tensor=False
+    )
+    _append_deployed_ladder(ladder, deployed_scheme, deployed_rung)
     attribution["ladder"] = ladder
 
     out = os.path.join(config.work, "attribution", f"{deployed.name}.json")
@@ -1920,6 +1977,11 @@ def selftest() -> int:
     confounded = _beyond_rounding_what("autoround", -0.01, ["attention"])
     assert "not attributable" in confounded
     assert "calibration benefit" not in confounded
+    exact = _beyond_rounding_what(
+        "autoround", -0.01, ["attention"], match_mode="per_tensor"
+    )
+    assert "calibration benefit" in exact
+    assert "not attributable" not in exact
     coverage = {
         "coverage": {
             "experts": {"weights": 31488, "quantized": 31488},
@@ -1948,6 +2010,22 @@ def selftest() -> int:
     )
     assert "Algorithm" in md and "awq" in md
     assert "format (int4_g32_asym) only" in md
+    partial_md = "\n".join(
+        _deployed_quantization(
+            {
+                "inspection": {
+                    "detected_scheme": "int4_g128_sym",
+                    "quant_algorithm": "autoround",
+                    "coverage": {
+                        "experts": {"weights": 10, "quantized": 10},
+                        "attention": {"weights": 44, "quantized": 4},
+                    },
+                }
+            }
+        )
+    )
+    assert "exactly the 14 tensors" in partial_md
+    assert "upper bound" not in partial_md
     derived = "\n".join(
         _derived_terms(0.02, -0.01, {}, algorithm="gptq")
     )
@@ -1959,6 +2037,25 @@ def selftest() -> int:
     )
     assert "not attributable" in guarded
     assert "beat round-to-nearest" not in guarded
+    exact_term = "\n".join(
+        _derived_terms(
+            0.02,
+            -0.01,
+            {},
+            algorithm="autoround",
+            partial=["attention"],
+            match_mode="per_tensor",
+        )
+    )
+    assert "calibration benefit" in exact_term
+    assert "not attributable" not in exact_term
+
+    path = variant_path(cfg, "/models/Ref", "experts", "int4_g128_asym")
+    assert path.endswith("Ref-qdq-experts-int4_g128_asym")
+    digested = variant_path(
+        cfg, "/models/Ref", "experts", "int4_g128_asym", match_digest="abc"
+    )
+    assert digested.endswith("Ref-qdq-experts-int4_g128_asym-mabc")
 
     print("selftest passed")
     return 0

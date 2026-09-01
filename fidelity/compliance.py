@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-LAWS_VERSION = 5
+LAWS_VERSION = 6
 
 # The identity a capture is bound to. Law 5 requires the scored report to carry
 # it; Law 12 requires the published reference to agree with it, so an artifact

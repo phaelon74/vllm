@@ -23,7 +23,7 @@ from typing import Any
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from redaction import redact_env  # noqa: E402 - sibling module
 
-LAWS_VERSION = 5
+LAWS_VERSION = 6
 PROGRAM = "Local Inference Lab"
 # Vendor calibration on packed int4. QDQ still matches format only.
 _CALIBRATED_ALGORITHMS = frozenset({"awq", "gptq", "autoround"})
@@ -525,12 +525,14 @@ def _deployed_quantization(deployed: dict[str, Any]) -> list[str]:
         out.append("")
     partial = [name for name, _, verdict in rows if verdict == "some"]
     if partial:
+        matched = sum(
+            (counts or {}).get("quantized") or 0
+            for counts in coverage.values()
+        )
         out += [
-            f"Partial coverage in {', '.join(partial)}, so the format name alone "
-            f"does not describe this checkpoint. A QDQ cell selects weights by "
-            f"name pattern and rounds every one it matches, which for a partly "
-            f"quantized component rounds more than the checkpoint does and makes "
-            f"that cell an upper bound rather than a match.",
+            f"Partial coverage in {', '.join(partial)}. Component cells round "
+            f"exactly the {matched} tensors the checkpoint quantizes, not every "
+            f"weight whose name matches a pattern.",
             "",
         ]
     scheme = str(inspection.get("detected_scheme") or "")
@@ -550,15 +552,19 @@ def _deployed_quantization(deployed: dict[str, Any]) -> list[str]:
 
 
 def _beyond_rounding_what(
-    algorithm: str | None, engine: Any, partial: list[str] | None = None
+    algorithm: str | None,
+    engine: Any,
+    partial: list[str] | None = None,
+    match_mode: str | None = None,
 ) -> str:
     """Label for deployed minus composite: format match, not vendor method.
 
-    `partial` names components the composite rounded in full and the checkpoint
-    quantized in part. That alone can make the term negative, so it is not
-    attributable to the deployed pack and no calibration claim is made.
+    `partial` names components the checkpoint quantized in part. A
+    per-component cell over-rounds those, so the term is not attributable.
+    A per-tensor cell matched the checkpoint's names and the claim stands.
+    Attribution files that predate `match_mode` are treated as per-component.
     """
-    if partial:
+    if partial and match_mode != "per_tensor":
         return (
             "not attributable: the composite cell over-rounds "
             + ", ".join(partial)
@@ -582,6 +588,7 @@ def _derived_terms(
     *,
     algorithm: str | None = None,
     partial: list[str] | None = None,
+    match_mode: str | None = None,
 ) -> list[str]:
     """The two terms no cell can hold, tabled beside the cells that imply them.
 
@@ -604,7 +611,9 @@ def _derived_terms(
                 "Beyond weight rounding",
                 f"{engine:+.8f}",
                 share(engine),
-                _beyond_rounding_what(algorithm, engine, partial),
+                _beyond_rounding_what(
+                    algorithm, engine, partial, match_mode
+                ),
                 "[Beyond weight rounding](#beyond-weight-rounding)",
             )
         )
@@ -657,6 +666,7 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
     algorithm = (
         attribution.get("quant_algorithm") or inspection.get("quant_algorithm")
     )
+    composite_mode = composite.get("match_mode")
     over_rounded = composite.get("partial_components")
     if not isinstance(over_rounded, list):
         over_rounded = []
@@ -726,7 +736,12 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
         rows, ("Cell", "What it isolates", "Mean KLD", "Selections changed", "Support")
     )
     out += _derived_terms(
-        deployed, engine, routing, algorithm=algorithm, partial=over_rounded
+        deployed,
+        engine,
+        routing,
+        algorithm=algorithm,
+        partial=over_rounded,
+        match_mode=composite_mode,
     )
     measured_cells = [
         cell
@@ -757,7 +772,8 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
             if isinstance(deployed, (int, float)) and deployed
             else ""
         )
-        if over_rounded:
+        confounded = bool(over_rounded) and composite_mode != "per_tensor"
+        if confounded:
             cause = (
                 f"This term is not attributable. The checkpoint quantizes "
                 f"{', '.join(over_rounded)} only in part, and the composite "
@@ -791,7 +807,7 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
             )
         closing = (
             ""
-            if over_rounded
+            if confounded
             else " A weight-only analysis, which is what any QDQ cell is, "
             "cannot see it."
         )
@@ -822,7 +838,10 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
             "### Scheme ladder",
             "",
             "The same expert weights rounded through each scheme, which is the "
-            "cell that discriminates between them.",
+            "cell that discriminates between them. Ladder rungs hold that "
+            "weight set fixed across schemes, so a deployed rung is not the "
+            "expert cell above it when the checkpoint quantizes only some of "
+            "those weights.",
             "",
         ]
         out += _table(

@@ -1,6 +1,6 @@
 # Local Inference Lab — Distribution Fidelity Laws
 
-**Laws version:** 5
+**Laws version:** 6
 **Status:** draft, pending coordination with `local-inference-lab` on the
 publication namespace and suite format.
 
@@ -30,6 +30,13 @@ candidate's manifest and never the one published with the tensors. Unlike the
 earlier version changes this one is a relabeling, not a rescore: the measurement
 is unaffected, so a version-4 artifact becomes a version-5 artifact by
 reassembling it and passing the new check.
+
+Version 6 changes what Law 14 cells match. Versions 2 through 5 selected
+weights by component name pattern and rounded every match, so a mixed-precision
+checkpoint that quantized only some attention or expert weights produced a
+composite cell heavier than the deployment it claimed to decompose. Version 6
+matches per tensor. A version-5 receipt for a partly quantized candidate is
+not a version-6 receipt and must be rescored, not relabeled.
 
 These laws govern every distribution-fidelity measurement this program
 publishes. They are not guidance. The pipeline refuses to produce or upload an
@@ -396,10 +403,14 @@ cell. On one FP8 MoE checkpoint that term was 40% of the deployed mean, which no
 arrangement of weight-only cells can see. A component decomposition that omits it
 attributes a deployment to weight precision alone and understates it.
 
-**Ladder.** A campaign on a routed reference also scores the expert cell at each
-scheme on its ladder, not only at the deployed one. The cost of one more cell is a
-QDQ pass and a scoring run against a capture that already exists; the cost of not
-having it is a comparison nobody can make later without redoing the campaign.
+**Ladder.** A campaign on a routed reference also scores the expert weights at
+each scheme on its ladder, not only at the deployed one. Ladder rungs are
+component-wide by construction: every expert weight is rounded, so the rungs
+differ only in format. The expert cell that decomposes the deployed mean matches
+per tensor and may therefore round a subset; it is not the deployed ladder rung.
+The cost of one more cell is a QDQ pass and a scoring run against a capture that
+already exists; the cost of not having it is a comparison nobody can make later
+without redoing the campaign.
 
 **Check.** For a reference whose capture manifest records declared experts, the
 compliance receipt requires an expert cell and a router weight cell, each naming

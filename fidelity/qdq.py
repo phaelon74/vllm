@@ -54,6 +54,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -101,6 +102,8 @@ NEVER = (
 )
 
 COMPONENTS = tuple(COMPONENT_PATTERNS)
+# Variant-path suffix; full hex lives on inspect.json and the QDQ manifest.
+MATCH_DIGEST_LEN = 12
 
 
 def _matches(name: str, patterns: tuple[str, ...]) -> bool:
@@ -539,6 +542,83 @@ def _scale_shapes(model: str) -> dict[str, tuple[int, ...]]:
     return found
 
 
+def names_sha256(names: list[str] | set[str]) -> str:
+    """Stable digest of a tensor-name set, independent of input order."""
+    return hashlib.sha256("\n".join(sorted(names)).encode("utf-8")).hexdigest()
+
+
+def inspect_for_disk(report: dict[str, Any]) -> dict[str, Any]:
+    """Inspect JSON without the name list, which is tens of thousands of strings.
+
+    `inspect.json` is copied into assembled artifacts. The digest lets a cell
+    prove it matched the same set without publishing every name.
+    """
+    out = {key: value for key, value in report.items() if key != "quantized_names"}
+    out["quantized_names_sha256"] = names_sha256(report.get("quantized_names") or [])
+    return out
+
+
+def _component_names(model: str, selected: tuple[str, ...]) -> set[str]:
+    """Canonical `.weight` names in `model` that classify into `selected`."""
+    from safetensors import safe_open
+
+    names: set[str] = set()
+    if not os.path.isdir(model):
+        return names
+    for fname in sorted(os.listdir(model)):
+        if not fname.endswith(".safetensors"):
+            continue
+        with safe_open(
+            os.path.join(model, fname), framework="pt", device="cpu"
+        ) as handle:
+            for key in handle.keys():
+                canonical = _as_weight_name(key) or key
+                if classify(canonical, selected) is not None:
+                    names.add(canonical)
+    return names
+
+
+def match_digest(
+    reference: str,
+    inspection: dict[str, Any],
+    components: tuple[str, ...] | list[str],
+) -> str | None:
+    """Short digest of the matched name set, or None when it equals the
+    reference's full set for those components.
+
+    Returning None is what keeps a fully-covered cell on the path (and the
+    report) a component-wide conversion already wrote.
+    """
+    selected = tuple(components)
+    matched = [
+        name
+        for name in inspection.get("quantized_names") or []
+        if classify(name, selected) is not None
+    ]
+    if set(matched) == _component_names(reference, selected):
+        return None
+    return names_sha256(matched)[:MATCH_DIGEST_LEN]
+
+
+def _refuse_name_drift(
+    model: str, selected: tuple[str, ...], only: set[str]
+) -> None:
+    """A matched name absent from the reference would round nothing silently."""
+    present = _component_names(model, selected)
+    missing = [
+        name
+        for name in sorted(only)
+        if classify(name, selected) is not None and name not in present
+    ]
+    if not missing:
+        return
+    extra = f" and {len(missing) - 1} more" if len(missing) > 1 else ""
+    raise SystemExit(
+        f"{len(missing)} matched weight(s) are absent from {model}: "
+        f"{missing[0]}{extra}"
+    )
+
+
 def inspect(model: str) -> dict[str, Any]:
     """Report what a quantized checkpoint actually quantized, and how finely.
 
@@ -610,11 +690,13 @@ def inspect(model: str) -> dict[str, Any]:
     coverage: dict[str, dict[str, int]] = {}
     for component in COMPONENTS:
         coverage[component] = {"weights": 0, "quantized": 0}
+    quantized_names: set[str] = set()
     for name in {_as_weight_name(key) or key for key in scales}:
         component = classify(name, COMPONENTS)
         if component is None:
             continue
         coverage[component]["quantized"] += 1
+        quantized_names.add(name)
     for name in operand_names:
         component = classify(name, COMPONENTS)
         if component is not None:
@@ -632,6 +714,7 @@ def inspect(model: str) -> dict[str, Any]:
         "detected_block": detected_block,
         "quant_algorithm": quant_algorithm,
         "coverage": coverage,
+        "quantized_names": sorted(quantized_names),
         "unloadable_reason": reason,
     }
 
@@ -705,13 +788,22 @@ def convert(
     scheme: str,
     block_size: int,
     device: str,
+    only: set[str] | None = None,
 ) -> dict[str, Any]:
-    """Copy a checkpoint, rounding the selected components through `scheme`."""
+    """Copy a checkpoint, rounding the selected components through `scheme`.
+
+    `only` restricts rounding to that name set (canonical `.weight` names).
+    A name in `only` that classifies into `selected` but is absent from
+    `model` is a hard error: the cell would otherwise look like a match
+    and round nothing.
+    """
     import torch
     from safetensors import safe_open
     from safetensors.torch import save_file
 
     _assert_unquantized(model)
+    if only is not None:
+        _refuse_name_drift(model, selected, only)
     os.makedirs(out, exist_ok=True)
 
     shards = sorted(
@@ -756,6 +848,10 @@ def convert(
                     tensors[name] = tensor
                     untouched += 1
                     continue
+                if only is not None and name not in only:
+                    tensors[name] = tensor
+                    untouched += 1
+                    continue
                 staged = tensor.to(device) if device != "cpu" else tensor
                 converted = quantize_dequantize(staged, scheme, block_size)
                 stats = _error_stats(staged, converted)
@@ -791,6 +887,7 @@ def convert(
             " This cell matched the int4 format (bit width, group size, "
             "symmetry), not a vendor calibration algorithm such as AWQ or GPTQ."
         )
+    tensors_rounded = sum(entry["tensors"] for entry in rollup.values())
     manifest = {
         "source_model": os.path.abspath(model),
         "scheme": scheme,
@@ -802,6 +899,11 @@ def convert(
         "components": list(selected),
         "device": device,
         "tensors_untouched": untouched,
+        "tensors_rounded": tensors_rounded,
+        "match_mode": "per_tensor" if only is not None else "per_component",
+        "quantized_names_sha256": (
+            names_sha256(only) if only is not None else None
+        ),
         "components_detail": rollup,
         "vllm_version": _vllm_version(),
         "note": note,
@@ -1228,9 +1330,128 @@ def selftest() -> int:
         rendered = render_inspection(report)
         assert "int4_g128_asym" in rendered
         assert "quant algorithm: awq" in rendered
+        assert report["quantized_names"] == [
+            "model.layers.0.self_attn.q_proj.weight"
+        ]
+        disk = inspect_for_disk(report)
+        assert "quantized_names" not in disk
+        assert disk["quantized_names_sha256"] == names_sha256(
+            report["quantized_names"]
+        )
     print("  inspect reads packed AWQ scales and coverage denominators")
+
+    from safetensors import safe_open
+
+    with tempfile.TemporaryDirectory() as root:
+        ref = os.path.join(root, "ref")
+        out = os.path.join(root, "out")
+        os.makedirs(ref)
+        kept = "model.layers.0.mlp.experts.0.gate_proj.weight"
+        rounded = "model.layers.0.mlp.experts.1.gate_proj.weight"
+        original_kept = torch.linspace(
+            -1, 1, 32 * 32, dtype=torch.bfloat16
+        ).reshape(32, 32)
+        original_rounded = torch.linspace(
+            -2, 2, 32 * 32, dtype=torch.bfloat16
+        ).reshape(32, 32)
+        save_file(
+            {
+                kept: original_kept.clone(),
+                rounded: original_rounded.clone(),
+                "lm_head.weight": torch.zeros(32, 32, dtype=torch.bfloat16),
+            },
+            os.path.join(ref, "model.safetensors"),
+        )
+        with open(
+            os.path.join(ref, "config.json"), "w", encoding="utf-8", newline="\n"
+        ) as handle:
+            json.dump({"hidden_size": 32}, handle)
+        manifest = convert(
+            ref, out, ("experts",), "fp8_per_tensor", 128, "cpu",
+            only={rounded},
+        )
+        assert manifest["match_mode"] == "per_tensor"
+        assert manifest["tensors_rounded"] == 1
+        with safe_open(
+            os.path.join(out, "model.safetensors"), framework="pt"
+        ) as handle:
+            assert torch.equal(handle.get_tensor(kept), original_kept)
+            assert not torch.equal(handle.get_tensor(rounded), original_rounded)
+        try:
+            convert(
+                ref,
+                os.path.join(root, "drift"),
+                ("experts",),
+                "fp8_per_tensor",
+                128,
+                "cpu",
+                only={"model.layers.0.mlp.experts.99.gate_proj.weight"},
+            )
+        except SystemExit as exc:
+            assert "absent" in str(exc)
+        else:
+            raise AssertionError("name drift must be refused")
+        full = {"quantized_names": [kept, rounded]}
+        assert match_digest(ref, full, ("experts",)) is None
+        part = {"quantized_names": [rounded]}
+        digest = match_digest(ref, part, ("experts",))
+        assert digest is not None and len(digest) == MATCH_DIGEST_LEN
+        assert digest == match_digest(ref, part, ("experts",))
+        match_dir = os.path.join(root, "match")
+        os.makedirs(match_dir)
+        save_file(
+            {
+                rounded.replace(".weight", ".qweight"): torch.zeros(
+                    32, 8, dtype=torch.int32
+                ),
+                rounded.replace(".weight", ".scales"): torch.zeros(
+                    32, 1, dtype=torch.float16
+                ),
+            },
+            os.path.join(match_dir, "model.safetensors"),
+        )
+        with open(
+            os.path.join(match_dir, "config.json"),
+            "w",
+            encoding="utf-8",
+            newline="\n",
+        ) as handle:
+            json.dump(
+                {
+                    "quantization_config": {
+                        "quant_method": "awq",
+                        "w_bit": 4,
+                        "q_group_size": 128,
+                        "zero_point": True,
+                    }
+                },
+                handle,
+            )
+        assert check_names(ref, match_dir) == 0
+    print("  per-tensor convert leaves excluded tensors bit-identical")
     print("selftest passed")
     return 0
+
+
+def check_names(reference: str, match: str) -> int:
+    """Refuse (exit 1) if MATCH quantized a name the reference does not have."""
+    inspection = inspect(match)
+    present = _component_names(reference, COMPONENTS)
+    missing = [
+        name
+        for name in inspection.get("quantized_names") or []
+        if classify(name, COMPONENTS) is not None and name not in present
+    ]
+    print(
+        f"{os.path.basename(match)}: "
+        f"{len(inspection.get('quantized_names') or [])} quantized, "
+        f"{len(missing)} absent from {os.path.basename(reference)}"
+    )
+    for name in missing[:20]:
+        print(f"  {name}")
+    if len(missing) > 20:
+        print(f"  ... and {len(missing) - 20} more")
+    return 1 if missing else 0
 
 
 def main() -> int:
@@ -1258,6 +1479,18 @@ def main() -> int:
         "component coverage this variant should imitate",
     )
     parser.add_argument(
+        "--per-tensor",
+        action="store_true",
+        help="round only the tensors --match actually quantized, not every "
+        "weight whose name matches a selected component",
+    )
+    parser.add_argument(
+        "--expect-match-digest",
+        default=None,
+        help="refuse if the per-tensor match digest of --match against "
+        "--model is not this value",
+    )
+    parser.add_argument(
         "--inspect",
         default=None,
         help="report what a quantized checkpoint quantized, and exit",
@@ -1280,10 +1513,19 @@ def main() -> int:
         help="where to round; defaults to cuda when available",
     )
     parser.add_argument("--selftest", action="store_true")
+    parser.add_argument(
+        "--check-names",
+        nargs=2,
+        metavar=("REFERENCE", "MATCH"),
+        help="exit non-zero if MATCH's quantized names are absent from "
+        "REFERENCE",
+    )
     args = parser.parse_args()
 
     if args.selftest:
         return selftest()
+    if args.check_names:
+        return check_names(args.check_names[0], args.check_names[1])
     if args.inspect:
         report = inspect(args.inspect)
         print(render_inspection(report))
@@ -1293,7 +1535,7 @@ def main() -> int:
                 exist_ok=True,
             )
             with open(args.json_out, "w", encoding="utf-8", newline="\n") as handle:
-                json.dump(report, handle, indent=2)
+                json.dump(inspect_for_disk(report), handle, indent=2)
                 handle.write("\n")
         return 0
     if not (args.model and args.out and args.components):
@@ -1338,7 +1580,29 @@ def main() -> int:
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    if matched:
+    if args.per_tensor and not args.match:
+        parser.error("--per-tensor requires --match")
+    if args.expect_match_digest and not args.match:
+        parser.error("--expect-match-digest requires --match")
+
+    only: set[str] | None = None
+    if args.per_tensor:
+        assert matched is not None
+        only = {
+            name
+            for name in matched.get("quantized_names") or []
+            if classify(name, selected) is not None
+        }
+        if not only:
+            raise SystemExit(
+                f"{os.path.basename(args.match)} quantizes none of "
+                f"{', '.join(selected)}"
+            )
+        print(
+            f"  matching {len(only)} tensors from "
+            f"{os.path.basename(args.match)}"
+        )
+    elif matched:
         for component in selected:
             counts = matched["coverage"].get(component) or {}
             if counts.get("weights") and not counts.get("quantized"):
@@ -1348,13 +1612,22 @@ def main() -> int:
                     f"checkpoint does not have"
                 )
 
+    if args.expect_match_digest:
+        assert matched is not None
+        computed = match_digest(args.model, matched, selected)
+        if computed != args.expect_match_digest:
+            raise SystemExit(
+                f"match digest {computed} != expected "
+                f"{args.expect_match_digest}"
+            )
+
     print(
         f"QDQ {scheme} on {', '.join(selected)} "
         f"({os.path.basename(args.model)} -> {os.path.basename(args.out)}) "
         f"on {device}"
     )
     manifest = convert(
-        args.model, args.out, selected, scheme, block_size, device
+        args.model, args.out, selected, scheme, block_size, device, only=only
     )
     if matched:
         manifest["matched"] = {
