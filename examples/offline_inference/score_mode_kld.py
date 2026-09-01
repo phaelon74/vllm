@@ -813,6 +813,7 @@ def calculate_kld(
         copy_lm_head_from_checkpoint,
         detect_lm_head_quantization,
         iter_eval_rows,
+        logits_processor_identity,
         manifest_mismatches,
         probe_replay_exactness_in_model,
         read_json,
@@ -1249,10 +1250,19 @@ def calculate_kld(
             )
         teacher_semantics = teacher_workers[0].get("logits_processor")
         student_semantics = student_workers[0].get("logits_processor")
-        if teacher_semantics != student_semantics:
+        teacher_id = logits_processor_identity(teacher_semantics)
+        student_id = logits_processor_identity(student_semantics)
+        if teacher_id != student_id:
             raise ValueError(
                 "Teacher and student logits-processor semantics differ: "
                 f"teacher={teacher_semantics!r}, student={student_semantics!r}"
+            )
+        if teacher_semantics != student_semantics:
+            print(
+                "  Note: logits-processor storage differs "
+                f"(teacher={teacher_semantics!r}, "
+                f"student={student_semantics!r}); "
+                "identity fields match, scoring the deployed student head."
             )
     if capture_kind == "hidden" and student_head["state"] == "quantized":
         print(

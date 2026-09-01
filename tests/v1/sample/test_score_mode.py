@@ -405,6 +405,26 @@ class TestLmHeadDetection:
         info = detect_lm_head_quantization(str(tmp_path))
         assert info["state"] == "quantized"
 
+    def test_fp16_head_dtype_is_not_a_semantics_mismatch(self):
+        from vllm.v1.sample.kld import logits_processor_identity
+
+        teacher = {
+            "type": "LogitsProcessor",
+            "scale": 1.0,
+            "soft_cap": None,
+            "vocab_size": 248320,
+            "org_vocab_size": 248320,
+            "head_dtype": "torch.bfloat16",
+        }
+        student = dict(teacher, head_dtype="torch.float16")
+        assert logits_processor_identity(teacher) == logits_processor_identity(
+            student
+        )
+        student_cap = dict(student, soft_cap=30.0)
+        assert logits_processor_identity(teacher) != logits_processor_identity(
+            student_cap
+        )
+
 
 class TestTokenizerVocab:
     def test_unpadded_prefers_actual_vocab_size(self):

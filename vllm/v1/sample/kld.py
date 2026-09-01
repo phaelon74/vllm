@@ -779,6 +779,29 @@ def inspect_model_lm_heads(model: torch.nn.Module) -> dict[str, Any]:
     }
 
 
+LOGITS_PROCESSOR_IDENTITY_KEYS = (
+    "type",
+    "scale",
+    "soft_cap",
+    "vocab_size",
+    "org_vocab_size",
+)
+
+
+def logits_processor_identity(
+    info: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """The hidden-to-vocab map, excluding head storage dtype.
+
+    AWQ exports commonly keep an unquantized FP16 lm_head on a BF16 teacher.
+    That dtype is deployed behavior (Law 8), not a different vocabulary or
+    logit transform.
+    """
+    if not info:
+        return {}
+    return {key: info.get(key) for key in LOGITS_PROCESSOR_IDENTITY_KEYS}
+
+
 def copy_lm_head_from_checkpoint(model_path: str, dest_path: str) -> str:
     """Copy the unquantized ``lm_head.weight`` (or tied embed) to ``dest_path``.
 
