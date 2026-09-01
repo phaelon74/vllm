@@ -242,6 +242,32 @@ def _fp8_quant_dequant(tensor: Any, scheme: str, block_size: int) -> Any:
 
 
 SCALE_SUFFIXES = ("weight_scale", "weight_scale_inv", "weight_scale_2", "scales")
+# Resolution prefers `.weight` when both names exist. Rewrite matches
+# longest suffix first so `.qweight` is not parsed as a `.weight` key.
+PACKED_WEIGHT_SUFFIXES = ("weight", "qweight", "weight_packed")
+_PACKED_REWRITE_SUFFIXES = ("weight_packed", "qweight", "weight")
+
+
+def _as_weight_name(key: str) -> str | None:
+    """Canonical `.weight` name for a packed or unpacked matmul operand."""
+    for suffix in _PACKED_REWRITE_SUFFIXES:
+        if key.endswith("." + suffix):
+            return key[: -len(suffix)] + "weight"
+    return None
+
+
+def _operand_from_scale_key(scale_key: str, keys: set[str]) -> str | None:
+    """The packed or unpacked weight a scale tensor belongs to, or None."""
+    for suffix in SCALE_SUFFIXES:
+        if not scale_key.endswith("." + suffix):
+            continue
+        base = scale_key[: -len(suffix)]
+        for packed in PACKED_WEIGHT_SUFFIXES:
+            candidate = base + packed
+            if candidate in keys:
+                return candidate
+        return None
+    return None
 
 
 def unloadable_reason(model: str) -> str | None:
@@ -306,21 +332,142 @@ def _quark_declared_scheme(quant: dict[str, Any]) -> str | None:
     return f"quark_{dtype}" + (f"_{qscheme}" if qscheme else "")
 
 
+def _as_int(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_present(mapping: dict[str, Any], names: tuple[str, ...]) -> Any:
+    for name in names:
+        if name in mapping and mapping[name] is not None:
+            return mapping[name]
+    return None
+
+
+def _int4_scheme_name(
+    group_size: int, symmetric: bool, desc_act: bool = False
+) -> str:
+    polarity = "sym" if symmetric else "asym"
+    name = f"int4_g{group_size}_{polarity}"
+    if desc_act:
+        name += "_desc_act"
+    return name
+
+
+def _int4_from_bits(
+    bits: Any,
+    group_size: Any,
+    *,
+    symmetric: bool,
+    algorithm: str,
+    desc_act: bool = False,
+) -> dict[str, Any] | None:
+    width = _as_int(bits)
+    group = _as_int(group_size)
+    if width != 4 or group is None:
+        return None
+    return {
+        "scheme": _int4_scheme_name(group, symmetric, desc_act),
+        "group_size": group,
+        "algorithm": algorithm,
+    }
+
+
+def _int4_from_compressed_tensors(quant: dict[str, Any]) -> dict[str, Any] | None:
+    groups = quant.get("config_groups")
+    if not isinstance(groups, dict):
+        return None
+    for group in groups.values():
+        if not isinstance(group, dict):
+            continue
+        weights = group.get("weights")
+        if not isinstance(weights, dict):
+            continue
+        kind = str(weights.get("type") or "int").lower()
+        if kind not in ("int", "integer"):
+            continue
+        found = _int4_from_bits(
+            weights.get("num_bits"),
+            weights.get("group_size"),
+            symmetric=bool(weights.get("symmetric", True)),
+            algorithm="round_to_nearest",
+        )
+        if found is not None:
+            return found
+    return None
+
+
+def _int4_declared_scheme(quant: dict[str, Any]) -> dict[str, Any] | None:
+    """Format name, group size, and algorithm from a packed int4 config.
+
+    Cells are named for the format (`int4_g128_asym`), not the vendor method.
+    `desc_act` permutes group boundaries along K, so that flag is kept in the
+    scheme name for the rounder to refuse rather than mislabel.
+    """
+    if not isinstance(quant, dict):
+        return None
+    method = str(quant.get("quant_method") or "").lower()
+    if method in ("awq", "awq_marlin"):
+        zero_point = _first_present(quant, ("zero_point",))
+        has_zero_point = True if zero_point is None else bool(zero_point)
+        return _int4_from_bits(
+            _first_present(quant, ("w_bit", "bits")),
+            _first_present(quant, ("q_group_size", "group_size")),
+            symmetric=not has_zero_point,
+            algorithm="awq",
+        )
+    if method in ("gptq", "gptq_marlin", "gptq_marlin_24"):
+        return _int4_from_bits(
+            quant.get("bits"),
+            quant.get("group_size"),
+            symmetric=bool(quant.get("sym", True)),
+            algorithm="gptq",
+            desc_act=bool(quant.get("desc_act", False)),
+        )
+    if method in ("auto-round", "auto_round"):
+        return _int4_from_bits(
+            quant.get("bits"),
+            quant.get("group_size"),
+            symmetric=bool(quant.get("sym", True)),
+            algorithm="autoround",
+            desc_act=bool(quant.get("desc_act", False)),
+        )
+    if method == "compressed-tensors":
+        return _int4_from_compressed_tensors(quant)
+    return None
+
+
 def _scale_shapes(model: str) -> dict[str, tuple[int, ...]]:
-    """Map each quantized weight to its scale's shape, reading headers only."""
+    """Map each quantized weight to its scale's shape, reading headers only.
+
+    Scale tensors and the packed operand they belong to can live in different
+    shards, so names are gathered across the checkpoint before resolving.
+    """
     from safetensors import safe_open
 
-    found: dict[str, tuple[int, ...]] = {}
+    all_keys: set[str] = set()
+    scale_shapes: dict[str, tuple[int, ...]] = {}
     for name in sorted(os.listdir(model)):
         if not name.endswith(".safetensors"):
             continue
         with safe_open(os.path.join(model, name), framework="pt", device="cpu") as f:
             for key in f.keys():
+                all_keys.add(key)
                 for suffix in SCALE_SUFFIXES:
                     if key.endswith("." + suffix):
-                        weight = key[: -len(suffix)] + "weight"
-                        found[weight] = tuple(f.get_slice(key).get_shape())
+                        scale_shapes[key] = tuple(f.get_slice(key).get_shape())
                         break
+    found: dict[str, tuple[int, ...]] = {}
+    for scale_key, shape in scale_shapes.items():
+        operand = _operand_from_scale_key(scale_key, all_keys)
+        if operand is not None:
+            found[operand] = shape
     return found
 
 
@@ -340,9 +487,15 @@ def inspect(model: str) -> dict[str, Any]:
     quant = config.get("quantization_config") or {}
     reason = unloadable_reason_from_config(config)
     quark_scheme = _quark_declared_scheme(quant)
+    int4 = _int4_declared_scheme(quant)
 
     scales = _scale_shapes(model)
+    packed_scales = any(
+        name.endswith(".qweight") or name.endswith(".weight_packed")
+        for name in scales
+    )
     weight_shapes: dict[str, tuple[int, ...]] = {}
+    operand_names: set[str] = set()
     for name in sorted(os.listdir(model)):
         if not name.endswith(".safetensors"):
             continue
@@ -350,44 +503,54 @@ def inspect(model: str) -> dict[str, Any]:
             for key in f.keys():
                 if key in scales:
                     weight_shapes[key] = tuple(f.get_slice(key).get_shape())
+                canonical = _as_weight_name(key)
+                if canonical is not None:
+                    operand_names.add(canonical)
 
     granularity: str | None = None
     block: int | None = None
-    for weight, scale_shape in scales.items():
-        shape = weight_shapes.get(weight)
-        if not shape or len(shape) < 2:
-            continue
-        elements = 1
-        for dim in scale_shape:
-            elements *= dim
-        if elements == 1:
-            granularity = "fp8_per_tensor"
-        elif elements == shape[0]:
-            granularity = "fp8_per_channel"
-        else:
-            granularity = "fp8_block"
-            if len(scale_shape) >= 2 and scale_shape[-1]:
-                block = max(1, round(shape[-1] / scale_shape[-1]))
-        break
+    # Packed int4 scale/weight shapes are not FP8 granularities. A qweight's
+    # packed last dim would otherwise look like a block scale.
+    if not packed_scales:
+        for weight, scale_shape in scales.items():
+            shape = weight_shapes.get(weight)
+            if not shape or len(shape) < 2:
+                continue
+            elements = 1
+            for dim in scale_shape:
+                elements *= dim
+            if elements == 1:
+                granularity = "fp8_per_tensor"
+            elif elements == shape[0]:
+                granularity = "fp8_per_channel"
+            else:
+                granularity = "fp8_block"
+                if len(scale_shape) >= 2 and scale_shape[-1]:
+                    block = max(1, round(shape[-1] / scale_shape[-1]))
+            break
+
+    detected_scheme = quark_scheme
+    detected_block = block
+    quant_algorithm: str | None = None
+    if detected_scheme is None and int4 is not None:
+        detected_scheme = int4["scheme"]
+        detected_block = int4["group_size"]
+        quant_algorithm = int4["algorithm"]
+    elif detected_scheme is None:
+        detected_scheme = granularity
 
     coverage: dict[str, dict[str, int]] = {}
     for component in COMPONENTS:
         coverage[component] = {"weights": 0, "quantized": 0}
-    for name in sorted(set(weight_shapes) | set(scales)):
+    for name in {_as_weight_name(key) or key for key in scales}:
         component = classify(name, COMPONENTS)
         if component is None:
             continue
         coverage[component]["quantized"] += 1
-    for name in sorted(os.listdir(model)):
-        if not name.endswith(".safetensors"):
-            continue
-        with safe_open(os.path.join(model, name), framework="pt", device="cpu") as f:
-            for key in f.keys():
-                if not key.endswith(".weight"):
-                    continue
-                component = classify(key, COMPONENTS)
-                if component is not None:
-                    coverage[component]["weights"] += 1
+    for name in operand_names:
+        component = classify(name, COMPONENTS)
+        if component is not None:
+            coverage[component]["weights"] += 1
 
     return {
         "model": os.path.abspath(model),
@@ -397,8 +560,9 @@ def inspect(model: str) -> dict[str, Any]:
             for key in ("fmt", "activation_scheme", "weight_block_size", "strategy")
             if quant.get(key) is not None
         },
-        "detected_scheme": quark_scheme or granularity,
-        "detected_block": block,
+        "detected_scheme": detected_scheme,
+        "detected_block": detected_block,
+        "quant_algorithm": quant_algorithm,
         "coverage": coverage,
         "unloadable_reason": reason,
     }
@@ -412,8 +576,10 @@ def render_inspection(report: dict[str, Any]) -> str:
     for key, value in (report["declared"] or {}).items():
         lines.append(f"  {key}: {value}")
     lines.append(f"  detected scheme: {report['detected_scheme'] or 'unquantized'}")
-    if report["detected_block"]:
+    if report.get("detected_block") is not None:
         lines.append(f"  detected block: {report['detected_block']}")
+    if report.get("quant_algorithm"):
+        lines.append(f"  quant algorithm: {report['quant_algorithm']}")
     lines.append("  component coverage (quantized / total weights):")
     for component, counts in report["coverage"].items():
         if not counts["weights"] and not counts["quantized"]:
@@ -607,6 +773,125 @@ def selftest() -> int:
         }
     }
     assert unloadable_reason_from_config(fp8_quark) is None
+
+    awq_cfg = {
+        "quant_method": "awq",
+        "bits": 4,
+        "group_size": 128,
+        "zero_point": True,
+    }
+    awq = _int4_declared_scheme(awq_cfg)
+    assert awq is not None
+    assert awq["scheme"] == "int4_g128_asym", awq
+    assert awq["group_size"] == 128
+    assert awq["algorithm"] == "awq"
+    awq_sym = _int4_declared_scheme({**awq_cfg, "zero_point": False})
+    assert awq_sym is not None and awq_sym["scheme"] == "int4_g128_sym"
+    gptq = _int4_declared_scheme(
+        {
+            "quant_method": "gptq",
+            "bits": 4,
+            "group_size": 128,
+            "sym": True,
+            "desc_act": False,
+        }
+    )
+    assert gptq is not None and gptq["scheme"] == "int4_g128_sym"
+    assert gptq["algorithm"] == "gptq"
+    gptq_act = _int4_declared_scheme(
+        {
+            "quant_method": "gptq",
+            "bits": 4,
+            "group_size": 64,
+            "sym": True,
+            "desc_act": True,
+        }
+    )
+    assert gptq_act is not None
+    assert gptq_act["scheme"] == "int4_g64_sym_desc_act"
+    ct_int4 = _int4_declared_scheme(
+        {
+            "quant_method": "compressed-tensors",
+            "config_groups": {
+                "group_0": {
+                    "weights": {
+                        "num_bits": 4,
+                        "group_size": 128,
+                        "symmetric": False,
+                        "type": "int",
+                    }
+                }
+            },
+        }
+    )
+    assert ct_int4 is not None
+    assert ct_int4["scheme"] == "int4_g128_asym"
+    assert ct_int4["algorithm"] == "round_to_nearest"
+    ct_fp8 = _int4_declared_scheme(
+        {
+            "quant_method": "compressed-tensors",
+            "config_groups": {
+                "group_0": {
+                    "weights": {
+                        "num_bits": 8,
+                        "strategy": "tensor",
+                        "type": "float",
+                    }
+                }
+            },
+        }
+    )
+    assert ct_fp8 is None
+    autoround = _int4_declared_scheme(
+        {
+            "quant_method": "auto-round",
+            "bits": 4,
+            "group_size": 128,
+            "sym": True,
+        }
+    )
+    assert autoround is not None and autoround["algorithm"] == "autoround"
+    eight_bit = {"quant_method": "awq", "bits": 8, "group_size": 128}
+    assert _int4_declared_scheme(eight_bit) is None
+    print("  declared int4 schemes: awq/gptq/ct/autoround")
+
+    keys = {
+        "model.layers.0.self_attn.q_proj.qweight",
+        "model.layers.0.self_attn.q_proj.qzeros",
+        "model.layers.0.self_attn.q_proj.scales",
+    }
+    assert (
+        _operand_from_scale_key(
+            "model.layers.0.self_attn.q_proj.scales", keys
+        )
+        == "model.layers.0.self_attn.q_proj.qweight"
+    )
+    packed = {
+        "model.layers.0.mlp.experts.0.down_proj.weight_packed",
+        "model.layers.0.mlp.experts.0.down_proj.weight_scale",
+    }
+    assert (
+        _operand_from_scale_key(
+            "model.layers.0.mlp.experts.0.down_proj.weight_scale", packed
+        )
+        == "model.layers.0.mlp.experts.0.down_proj.weight_packed"
+    )
+    fp8_keys = {
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.q_proj.weight_scale_inv",
+    }
+    assert (
+        _operand_from_scale_key(
+            "model.layers.0.self_attn.q_proj.weight_scale_inv", fp8_keys
+        )
+        == "model.layers.0.self_attn.q_proj.weight"
+    )
+    assert (
+        _as_weight_name("model.layers.0.self_attn.q_proj.qweight")
+        == "model.layers.0.self_attn.q_proj.weight"
+    )
+    print("  packed scale operands resolve to qweight/weight_packed")
+
     import torch
 
     torch.manual_seed(0)
@@ -703,7 +988,62 @@ def selftest() -> int:
     expert_gate = "model.layers.0.mlp.experts.0.gate_proj.weight"
     assert classify(expert_gate, ("router",)) is None
     assert classify("model.layers.0.mlp.gate.weight", ("experts",)) is None
+    packed_names = {
+        "model.layers.0.self_attn.q_proj.qweight": "attention",
+        "model.layers.0.mlp.experts.0.down_proj.qweight": "experts",
+        "model.layers.0.mlp.gate.qweight": "router",
+        "model.layers.0.mlp.gate_proj.weight_packed": "dense_mlp",
+    }
+    for name, expected in packed_names.items():
+        actual = classify(_as_weight_name(name), COMPONENTS)
+        assert actual == expected, f"{name}: classified {actual}, expected {expected}"
     print("  router and gate_proj do not alias; components are disjoint")
+
+    import tempfile
+    from safetensors.torch import save_file
+
+    with tempfile.TemporaryDirectory() as root:
+        save_file(
+            {
+                "model.layers.0.self_attn.q_proj.qweight": torch.zeros(
+                    64, 8, dtype=torch.int32
+                ),
+                "model.layers.0.self_attn.q_proj.scales": torch.zeros(
+                    64, 8, dtype=torch.float16
+                ),
+                "model.layers.0.mlp.gate.weight": torch.zeros(
+                    32, 32, dtype=torch.bfloat16
+                ),
+                "lm_head.weight": torch.zeros(32, 32, dtype=torch.bfloat16),
+            },
+            os.path.join(root, "model.safetensors"),
+        )
+        with open(
+            os.path.join(root, "config.json"), "w", encoding="utf-8", newline="\n"
+        ) as handle:
+            json.dump(
+                {
+                    "quantization_config": {
+                        "quant_method": "awq",
+                        "w_bit": 4,
+                        "q_group_size": 128,
+                        "zero_point": True,
+                    }
+                },
+                handle,
+            )
+        report = inspect(root)
+        assert report["detected_scheme"] == "int4_g128_asym", report
+        assert report["detected_block"] == 128
+        assert report["quant_algorithm"] == "awq"
+        attn = report["coverage"]["attention"]
+        assert attn["weights"] == 1 and attn["quantized"] == 1, attn
+        router = report["coverage"]["router"]
+        assert router["weights"] == 1 and router["quantized"] == 0, router
+        rendered = render_inspection(report)
+        assert "int4_g128_asym" in rendered
+        assert "quant algorithm: awq" in rendered
+    print("  inspect reads packed AWQ scales and coverage denominators")
     print("selftest passed")
     return 0
 
