@@ -122,6 +122,69 @@ def classify(name: str, selected: tuple[str, ...]) -> str | None:
     return None
 
 
+INT4_SCHEME_RE = re.compile(r"^int4_g(-1|\d+)_(sym|asym)(_desc_act)?$")
+KNOWN_SCHEMES = (
+    "fp8_per_tensor",
+    "fp8_per_channel",
+    "fp8_block",
+    "mxfp8",
+    "nvfp4",
+)
+
+
+def parse_int4_scheme(scheme: str) -> tuple[int, bool] | None:
+    """Group size and symmetry, or None if `scheme` is not an int4 format name.
+
+    `desc_act` is a scheme name the rounder refuses: those group boundaries
+    permute along K, so a contiguous-group round is a different format.
+    """
+    match = INT4_SCHEME_RE.fullmatch(scheme)
+    if match is None:
+        return None
+    if match.group(3):
+        raise ValueError(
+            f"{scheme} uses act-order (desc_act): group boundaries permute "
+            "along K, so a contiguous-group round is not that format"
+        )
+    return int(match.group(1)), match.group(2) == "sym"
+
+
+def scheme_arg(value: str) -> str:
+    """Accept the named FP8/NVFP4 schemes or an `int4_g<G>_(sym|asym)` format."""
+    if value in KNOWN_SCHEMES or INT4_SCHEME_RE.fullmatch(value):
+        return value
+    known = ", ".join(KNOWN_SCHEMES)
+    raise argparse.ArgumentTypeError(
+        f"unknown scheme {value!r}; want {known} or int4_g<G>_(sym|asym)"
+    )
+
+
+def _int4_quant_dequant(tensor: Any, group_size: int, symmetric: bool) -> Any:
+    """Round a 2-D HF weight [out, in] through grouped int4, return as-stored."""
+    import torch
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        quantize_weights,
+    )
+    from vllm.scalar_type import scalar_types
+
+    size_k = tensor.shape[-1]
+    if group_size != -1 and size_k % group_size:
+        raise ValueError(
+            f"last dimension {size_k} is not a multiple of the "
+            f"{group_size}-element group; a real int4 quantizer pads "
+            "here, and padding changes the scales, so refusing to guess"
+        )
+    # quantize_weights groups along dim 0 and expects [size_k, size_n].
+    transposed = tensor.t().to(torch.float32).contiguous()
+    w_ref, _, _, _ = quantize_weights(
+        transposed,
+        scalar_types.uint4b8 if symmetric else scalar_types.uint4,
+        group_size,
+        zero_points=not symmetric,
+    )
+    return w_ref.t().contiguous().to(tensor.dtype)
+
+
 def quantize_dequantize(tensor: Any, scheme: str, block_size: int) -> Any:
     """Round a weight through `scheme` and return it in its original dtype.
 
@@ -193,6 +256,11 @@ def quantize_dequantize(tensor: Any, scheme: str, block_size: int) -> Any:
 
     if scheme.startswith("fp8"):
         return _fp8_quant_dequant(tensor, scheme, block_size)
+
+    int4 = parse_int4_scheme(scheme)
+    if int4 is not None:
+        group_size, symmetric = int4
+        return _int4_quant_dequant(tensor, group_size, symmetric)
 
     raise ValueError(f"unknown scheme {scheme!r}")
 
@@ -712,21 +780,31 @@ def convert(
                 f"quantized nothing."
             )
 
+    note = (
+        "Quantize-dequantize variant stored in the source dtype. Weights are "
+        "numerically what the quantized model would use; arithmetic is not. "
+        "Comparing this against the real quantized checkpoint isolates the "
+        "kernel's contribution."
+    )
+    if scheme.startswith("int4_"):
+        note += (
+            " This cell matched the int4 format (bit width, group size, "
+            "symmetry), not a vendor calibration algorithm such as AWQ or GPTQ."
+        )
     manifest = {
         "source_model": os.path.abspath(model),
         "scheme": scheme,
-        "block_size": block_size if scheme in ("nvfp4", "fp8_block") else None,
+        "block_size": (
+            block_size
+            if scheme in ("nvfp4", "fp8_block") or scheme.startswith("int4_")
+            else None
+        ),
         "components": list(selected),
         "device": device,
         "tensors_untouched": untouched,
         "components_detail": rollup,
         "vllm_version": _vllm_version(),
-        "note": (
-            "Quantize-dequantize variant stored in the source dtype. Weights are "
-            "numerically what the quantized model would use; arithmetic is not. "
-            "Comparing this against the real quantized checkpoint isolates the "
-            "kernel's contribution."
-        ),
+        "note": note,
     }
     with open(
         os.path.join(out, "qdq-manifest.json"), "w", encoding="utf-8", newline="\n"
@@ -892,9 +970,31 @@ def selftest() -> int:
     )
     print("  packed scale operands resolve to qweight/weight_packed")
 
+    assert parse_int4_scheme("int4_g32_asym") == (32, False)
+    assert parse_int4_scheme("int4_g128_sym") == (128, True)
+    assert parse_int4_scheme("int4_g-1_sym") == (-1, True)
+    assert parse_int4_scheme("fp8_block") is None
+    assert scheme_arg("int4_g32_asym") == "int4_g32_asym"
+    try:
+        parse_int4_scheme("int4_g32_sym_desc_act")
+    except ValueError as exc:
+        assert "desc_act" in str(exc)
+    else:
+        raise AssertionError("desc_act must be refused, not rounded")
+    print("  int4 scheme names parse; desc_act is refused")
+
     import torch
 
     torch.manual_seed(0)
+    try:
+        quantize_dequantize(
+            torch.zeros(8, 30, dtype=torch.bfloat16), "int4_g32_asym", 32
+        )
+    except ValueError as exc:
+        assert "multiple" in str(exc)
+    else:
+        raise AssertionError("non-multiple K must be refused")
+
     weight = torch.randn(64, 256, dtype=torch.bfloat16)
 
     schemes = ("fp8_per_tensor", "fp8_per_channel", "fp8_block", "mxfp8", "nvfp4")
@@ -1060,15 +1160,11 @@ def main() -> int:
     parser.add_argument(
         "--scheme",
         default=None,
-        choices=(
-            "fp8_per_tensor",
-            "fp8_per_channel",
-            "fp8_block",
-            "mxfp8",
-            "nvfp4",
-        ),
-        help="rounding scheme; omit and pass --match to copy it from a "
-        "quantized checkpoint",
+        type=scheme_arg,
+        help="rounding scheme: "
+        + ", ".join(KNOWN_SCHEMES)
+        + ", or int4_g<G>_(sym|asym); omit and pass --match to copy it "
+        "from a quantized checkpoint",
     )
     parser.add_argument(
         "--match",
@@ -1090,7 +1186,8 @@ def main() -> int:
         "--block-size",
         type=int,
         default=None,
-        help="block edge; defaults to 128 for fp8_block and 16 for nvfp4",
+        help="block or group edge; defaults to 128 for fp8_block, 16 for "
+        "nvfp4, and the group size in an int4_g<G> scheme name",
     )
     parser.add_argument(
         "--device",
@@ -1137,12 +1234,18 @@ def main() -> int:
                     f"scheme to match; pass --scheme explicitly"
                 )
             print(f"matched scheme {scheme} from {os.path.basename(args.match)}")
-        if block_size is None and matched["detected_block"]:
+        if block_size is None and matched.get("detected_block") is not None:
             block_size = matched["detected_block"]
     if scheme is None:
         parser.error("pass --scheme, or --match a quantized checkpoint")
     if block_size is None:
-        block_size = 16 if scheme == "nvfp4" else 128
+        int4 = INT4_SCHEME_RE.fullmatch(scheme)
+        if int4 is not None:
+            block_size = int(int4.group(1))
+        elif scheme == "nvfp4":
+            block_size = 16
+        else:
+            block_size = 128
 
     device = args.device
     if device is None:
