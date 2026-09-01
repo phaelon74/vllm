@@ -58,6 +58,9 @@ ACTIVATION_GIB = 2.0
 BLOCK_SIZE = 16
 # Floor so vLLM never receives a cache too small to hold one block.
 KV_FLOOR_GIB = 0.25
+# score_mode_kld.py sets max_model_len = context_length * 2. The KV
+# reservation has to cover that engine length, not the scored window.
+ENGINE_LEN_FACTOR = 2
 # Two .float() copies plus their log_softmax outputs in compute_kld_chunk.
 FP32_COPIES = 4
 # Peak vs live tensors; expandable_segments keeps this from growing further.
@@ -249,13 +252,18 @@ def gpu_inventory() -> tuple[int, float, float]:
     return len(rows), total, free
 
 
+def engine_max_model_len(context_length: int) -> int:
+    """The max_model_len score_mode_kld.py will pass to vLLM."""
+    return context_length * ENGINE_LEN_FACTOR
+
+
 def kv_cache_gib(
     geometry: dict[str, Any],
     context_length: int,
     max_num_seqs: int,
     tp: int,
 ) -> float:
-    """KV reservation for the scored window, replicated heads included."""
+    """KV reservation for the engine's max_model_len, replicated heads included."""
     tokens = math.ceil(context_length / BLOCK_SIZE) * BLOCK_SIZE
     heads = math.ceil(geometry["num_key_value_heads"] / tp)
     nbytes = (
@@ -324,6 +332,7 @@ def plan_gpus(
     geom = geometry if geometry is not None else _load_geometry(paths)
     count, total, free = inventory if inventory is not None else gpu_inventory()
     usable = free - CONTEXT_GIB
+    kv_len = engine_max_model_len(config.context_length)
     logits = logits_headroom_gib(geom, config.context_length, config.max_num_seqs)
     pinned = config.tensor_parallel_size is not None
     if pinned:
@@ -340,20 +349,21 @@ def plan_gpus(
                 if candidate <= count
                 and weights / candidate
                 + kv_cache_gib(
-                    geom, config.context_length, config.max_num_seqs, candidate
+                    geom, kv_len, config.max_num_seqs, candidate
                 )
                 + logits
                 <= usable
             ),
             count,
         )
-    kv = kv_cache_gib(geom, config.context_length, config.max_num_seqs, tp)
+    kv = kv_cache_gib(geom, kv_len, config.max_num_seqs, tp)
     util = (weights / tp + kv + ACTIVATION_GIB) / total
     util = min(max(util, UTIL_FLOOR), UTIL_CEILING)
     pin_note = " (pinned)" if pinned else ""
     print(
-        f"plan: weights {weights:.2f} GiB, kv {kv:.2f} GiB, "
-        f"logits {logits:.2f} GiB, {count} x {total:.2f} free {free:.2f}"
+        f"plan: weights {weights:.2f} GiB, kv {kv:.2f} GiB "
+        f"(max_model_len={kv_len}), logits {logits:.2f} GiB, "
+        f"{count} x {total:.2f} free {free:.2f}"
         f"\n      -> TP={tp} util={util:.2f}{pin_note}"
     )
     return GpuPlan(tp, util, weights, kv, logits, pinned)
@@ -1768,8 +1778,10 @@ def selftest() -> int:
     }
     logits = logits_headroom_gib(geom, 2048, 1)
     assert abs(logits - 12.5) < 1e-6
-    kv = kv_cache_gib(geom, 2048, 1, 1)
-    assert 1.0 < kv < 2.5
+    kv_window = kv_cache_gib(geom, 2048, 1, 1)
+    assert 1.0 < kv_window < 2.5
+    kv_engine = kv_cache_gib(geom, engine_max_model_len(2048), 1, 1)
+    assert abs(kv_engine - 3.75) < 1e-6
     cfg = Config(name="t", library="l", work="w", models=[])
     plan = plan_gpus(
         [],
@@ -1780,6 +1792,7 @@ def selftest() -> int:
     )
     assert plan.tp == 1
     assert plan.pinned is False
+    assert abs(plan.kv_gib - kv_engine) < 1e-9
     assert plan.util <= UTIL_CEILING
     cfg.tensor_parallel_size = 2
     pinned = plan_gpus(
