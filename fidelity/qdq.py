@@ -1023,6 +1023,77 @@ def selftest() -> int:
     print(f"  ladder is ordered: nvfp4 {error['nvfp4']:.4f} > mxfp8 "
           f"{error['mxfp8']:.4f}")
 
+    def _bf16_ulp(values: Any) -> Any:
+        # bfloat16: 8 exponent bits, 7 mantissa bits. Subnormals are treated
+        # as the min-normal ulp so the bound is not tighter than the format.
+        mag = values.float().abs().clamp(min=2 ** -14)
+        return torch.ldexp(torch.ones_like(mag), torch.floor(torch.log2(mag)) - 7)
+
+    def _assert_int4_rung(source: Any, scheme: str) -> float:
+        parsed = parse_int4_scheme(scheme)
+        assert parsed is not None, scheme
+        group, _ = parsed
+        once = quantize_dequantize(source, scheme, group)
+        twice = quantize_dequantize(once, scheme, group)
+        assert once.dtype == source.dtype, f"{scheme} changed dtype"
+        assert not torch.equal(once, source), f"{scheme} was a no-op"
+        if not torch.equal(once, twice):
+            moved = (twice.float() - once.float()).abs()
+            ulp = _bf16_ulp(once)
+            assert scheme.endswith("_asym"), (
+                f"{scheme} is not a bf16 fixed point; only asymmetric int4 "
+                "may snap off the f32 dequant grid when stored as bf16"
+            )
+            assert torch.all(moved <= ulp), (
+                f"{scheme} second pass moved {float(moved.max()):.6g}, more "
+                f"than one bf16 ulp; the variant is not a format fixed point"
+            )
+            print(
+                f"  {scheme}: second pass within one bf16 ulp "
+                "(asymmetric dequant is f32, then stored as bf16)"
+            )
+        relative = _error_stats(source, once)["relative_rms"]
+        assert relative < 0.5, f"{scheme} relative rms {relative} is implausible"
+        print(f"  {scheme}: idempotent, relative rms {relative:.4f}")
+        return relative
+
+    for scheme in ("int4_g32_asym", "int4_g128_asym", "int4_g128_sym"):
+        _assert_int4_rung(weight, scheme)
+
+    # Groups run along K (the last dim of an HF weight). A loud 32-wide
+    # slice poisons a 128-wide scale and leaves a 32-wide scale untouched.
+    along_k = weight.clone()
+    along_k[:, :32] *= 1e6
+    quiet_k = slice(32, 128)
+    g32 = _error_stats(
+        along_k[:, quiet_k],
+        quantize_dequantize(along_k, "int4_g32_asym", 32)[:, quiet_k],
+    )["relative_rms"]
+    g128 = _error_stats(
+        along_k[:, quiet_k],
+        quantize_dequantize(along_k, "int4_g128_asym", 128)[:, quiet_k],
+    )["relative_rms"]
+    assert g32 < 0.5 * g128, (
+        f"on the quiet K-slice beside a loud group, g32 {g32} did not "
+        f"clearly beat g128 {g128}, which is the case group size exists for"
+    )
+    print(f"  int4 group size: quiet K-slice g32 {g32:.4f} vs g128 {g128:.4f}")
+
+    # A zero-point exists to represent a shifted range. A strictly positive
+    # group wastes half of a symmetric codebook on unused negatives.
+    biased = weight.abs() + 1.0
+    asym = _error_stats(
+        biased, quantize_dequantize(biased, "int4_g128_asym", 128)
+    )["relative_rms"]
+    sym = _error_stats(
+        biased, quantize_dequantize(biased, "int4_g128_sym", 128)
+    )["relative_rms"]
+    assert asym < 0.5 * sym, (
+        f"on a strictly positive matrix, asymmetric {asym} did not clearly "
+        f"beat symmetric {sym}, which is the case a zero point exists for"
+    )
+    print(f"  int4 zero point: positive matrix asym {asym:.4f} vs sym {sym:.4f}")
+
     # FP8 granularity is nearly free on a well-conditioned matrix, because E4M3
     # carries an exponent per element: the relative step follows the mantissa,
     # not the scale, so a finer scale buys almost nothing and the small residual
