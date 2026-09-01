@@ -1076,11 +1076,18 @@ def selftest() -> int:
     )
     print(f"  int4 group size: quiet K-slice g32 {g32:.4f} vs g128 {g128:.4f}")
 
-    # Zero-point in this reference is round(|min|/scale), i.e. a negative
-    # min whose magnitude is not the amax. Each 128-wide K-group is the
-    # interval [-1, 10], so symmetric must scale by 10 while asymmetric
-    # spans 11. Random draws were ~2x but missed 0.5*sym because a group
-    # rarely hits both endpoints.
+    # A zero point buys a step, and the size of that win is bounded by the
+    # codebooks. On a group spanning [min, max] with min < 0 < max,
+    # asymmetric (uint4) spreads 15 codes across max-min, while symmetric
+    # (uint4b8, levels -8..7) must fit max into 7 positive codes:
+    #
+    #   asym step = (max - min) / 15      sym step = max(max/7, |min|/8)
+    #
+    # The best possible ratio is therefore 7/15 ~ 0.47, approached only as
+    # min -> 0-. A [-1, 10] ramp predicts (11/15)/(10/7) = 0.513, which is
+    # what this measures - so a 0.5 bar would be demanding the format's
+    # ceiling rather than testing the zero point. 0.7 is a clear win with
+    # room for bf16 storage and endpoint effects.
     group_k = 128
     ramp = torch.linspace(-1.0, 10.0, group_k, dtype=weight.dtype)
     shifted = ramp.repeat(weight.shape[-1] // group_k).unsqueeze(0)
@@ -1091,11 +1098,15 @@ def selftest() -> int:
     sym = _error_stats(
         shifted, quantize_dequantize(shifted, "int4_g128_sym", 128)
     )["relative_rms"]
-    assert asym < 0.5 * sym, (
+    assert asym < 0.7 * sym, (
         f"on a [-1, 10] range, asymmetric {asym} did not clearly beat "
-        f"symmetric {sym}, which is the case a zero point exists for"
+        f"symmetric {sym}; the zero point should buy a step near the "
+        f"7/15 codebook ratio"
     )
-    print(f"  int4 zero point: [-1, 10] asym {asym:.4f} vs sym {sym:.4f}")
+    print(
+        f"  int4 zero point: [-1, 10] asym {asym:.4f} vs sym {sym:.4f} "
+        f"(ratio {asym / sym:.3f}, codebook predicts 0.513)"
+    )
 
     # FP8 granularity is nearly free on a well-conditioned matrix, because E4M3
     # carries an exponent per element: the relative step follows the mantissa,
