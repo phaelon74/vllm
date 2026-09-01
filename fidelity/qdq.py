@@ -630,7 +630,10 @@ def inspect(model: str) -> dict[str, Any]:
     """
     from safetensors import safe_open
 
-    with open(os.path.join(model, "config.json"), encoding="utf-8") as handle:
+    config_path = os.path.join(model, "config.json")
+    if not os.path.isfile(config_path):
+        raise SystemExit(f"no config.json at {model}")
+    with open(config_path, encoding="utf-8") as handle:
         config = json.load(handle)
     quant = config.get("quantization_config") or {}
     reason = unloadable_reason_from_config(config)
