@@ -1076,20 +1076,23 @@ def selftest() -> int:
     )
     print(f"  int4 group size: quiet K-slice g32 {g32:.4f} vs g128 {g128:.4f}")
 
-    # A zero-point exists to represent a shifted range. A strictly positive
-    # group wastes half of a symmetric codebook on unused negatives.
-    biased = weight.abs() + 1.0
+    # Zero-point in this reference is round(|min|/scale), i.e. a negative
+    # min whose magnitude is not the amax. [-1, 10] forces symmetric to
+    # scale by 10 while asymmetric spans the 11-wide interval. Strictly
+    # positive data is the wrong case: abs(min) then adds to an already
+    # positive round(w/scale) and clips.
+    shifted = torch.rand_like(weight) * 11.0 - 1.0
     asym = _error_stats(
-        biased, quantize_dequantize(biased, "int4_g128_asym", 128)
+        shifted, quantize_dequantize(shifted, "int4_g128_asym", 128)
     )["relative_rms"]
     sym = _error_stats(
-        biased, quantize_dequantize(biased, "int4_g128_sym", 128)
+        shifted, quantize_dequantize(shifted, "int4_g128_sym", 128)
     )["relative_rms"]
     assert asym < 0.5 * sym, (
-        f"on a strictly positive matrix, asymmetric {asym} did not clearly "
-        f"beat symmetric {sym}, which is the case a zero point exists for"
+        f"on a [-1, 10] range, asymmetric {asym} did not clearly beat "
+        f"symmetric {sym}, which is the case a zero point exists for"
     )
-    print(f"  int4 zero point: positive matrix asym {asym:.4f} vs sym {sym:.4f}")
+    print(f"  int4 zero point: [-1, 10] asym {asym:.4f} vs sym {sym:.4f}")
 
     # FP8 granularity is nearly free on a well-conditioned matrix, because E4M3
     # carries an exponent per element: the relative step follows the mantissa,
