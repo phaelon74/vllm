@@ -1077,11 +1077,14 @@ def selftest() -> int:
     print(f"  int4 group size: quiet K-slice g32 {g32:.4f} vs g128 {g128:.4f}")
 
     # Zero-point in this reference is round(|min|/scale), i.e. a negative
-    # min whose magnitude is not the amax. [-1, 10] forces symmetric to
-    # scale by 10 while asymmetric spans the 11-wide interval. Strictly
-    # positive data is the wrong case: abs(min) then adds to an already
-    # positive round(w/scale) and clips.
-    shifted = torch.rand_like(weight) * 11.0 - 1.0
+    # min whose magnitude is not the amax. Each 128-wide K-group is the
+    # interval [-1, 10], so symmetric must scale by 10 while asymmetric
+    # spans 11. Random draws were ~2x but missed 0.5*sym because a group
+    # rarely hits both endpoints.
+    group_k = 128
+    ramp = torch.linspace(-1.0, 10.0, group_k, dtype=weight.dtype)
+    shifted = ramp.repeat(weight.shape[-1] // group_k).unsqueeze(0)
+    shifted = shifted.expand_as(weight).contiguous()
     asym = _error_stats(
         shifted, quantize_dequantize(shifted, "int4_g128_asym", 128)
     )["relative_rms"]
