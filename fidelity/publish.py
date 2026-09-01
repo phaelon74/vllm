@@ -32,6 +32,7 @@ import tempfile
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from artifact import candidate_identity  # noqa: E402 - sibling module
 from redaction import scan_tree  # noqa: E402 - sibling module
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -200,16 +201,31 @@ def build_index(library: str, plans: list[dict[str, Any]], namespace: str) -> st
             f"Artifact: [`{dataset}`](https://huggingface.co/datasets/{dataset})",
             "",
         ]
-        for name, receipt in plan["candidates"]:
+        ranked = sorted(
+            plan["candidates"],
+            key=lambda pair: (
+                float("inf")
+                if pair[1].get("mean_kld") is None
+                else float(pair[1]["mean_kld"])
+            ),
+        )
+        for name, receipt in ranked:
             src = os.path.join(plan["root"], name, "report.md")
             dst = os.path.join(staging, "models", plan["model"], f"{name}.md")
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             if os.path.isfile(src):
                 shutil.copy2(src, dst)
+            report = _load(os.path.join(plan["root"], name, "report.json")) or {}
+            _family, author, quant = candidate_identity(
+                f"{plan['model']}/{name}", report.get("student_model")
+            )
             mean = receipt.get("mean_kld")
             rel = f"models/{plan['model']}/{name}.md"
             mean_text = "n/a" if mean is None else f"{float(mean):.8f}"
-            lines.append(f"- [{name}]({rel}) — mean KLD {mean_text}")
+            who = f"{author} " if author else ""
+            lines.append(
+                f"- {who}[{quant}]({rel}) — mean KLD {mean_text}"
+            )
         if plan["excluded"]:
             lines += [
                 "",

@@ -1131,7 +1131,16 @@ def render_leaderboard(results: list[dict[str, Any]]) -> tuple[str, list[list[An
 
     lines = [f"# {PROGRAM}: distribution-fidelity leaderboard", ""]
     csv_rows: list[list[Any]] = []
-    for key, members in sorted(groups.items()):
+    ordered = sorted(
+        groups.items(),
+        key=lambda kv: (
+            candidate_identity(
+                kv[1][0]["label"], kv[1][0]["report"].get("student_model")
+            )[0],
+            kv[0],
+        ),
+    )
+    for key, members in ordered:
         caps = members[0]["receipt"].get("comparability_key") or {}
         lines.append(f"## Comparability group `{key[:12]}`")
         lines.append("")
