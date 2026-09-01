@@ -854,6 +854,20 @@ def _cell(report_path: str, capture_manifest: dict[str, Any], config: Config,
     }
 
 
+def _partial_components(
+    inspection: dict[str, Any], components: list[str]
+) -> list[str]:
+    """Components the checkpoint quantizes only in part, of those given."""
+    partial = []
+    for component in components:
+        counts = inspection.get("coverage", {}).get(component) or {}
+        done = counts.get("quantized") or 0
+        total = counts.get("weights") or 0
+        if done and total and done < total:
+            partial.append(component)
+    return partial
+
+
 def _append_deployed_ladder(
     ladder: list[dict[str, Any]],
     deployed_scheme: str | None,
@@ -992,7 +1006,16 @@ def attribute_model(
     else:
         composite = {}
     if composite:
-        attribution["composite_cell"] = dict(composite, components=quantized)
+        attribution["composite_cell"] = dict(
+            composite,
+            components=quantized,
+            # A cell rounds every weight its pattern matches, so a partly
+            # quantized component makes the composite heavier than the
+            # deployment and can drive deployed - composite negative on its
+            # own. Naming those components keeps that from reading as a
+            # property of the deployed pack.
+            partial_components=_partial_components(inspection, quantized),
+        )
         if isinstance(deployed_mean, (int, float)) and isinstance(
             composite.get("mean_kld"), (int, float)
         ):
@@ -1891,6 +1914,24 @@ def selftest() -> int:
     assert "calibration benefit" in _beyond_rounding_what("awq", -0.01)
     assert "beat round-to-nearest" in _beyond_rounding_what("awq", -0.01)
     assert "beat round-to-nearest" not in _beyond_rounding_what("awq", 0.01)
+
+    # A composite that rounds more than the checkpoint does cannot support a
+    # calibration claim, whatever the algorithm or the sign.
+    confounded = _beyond_rounding_what("autoround", -0.01, ["attention"])
+    assert "not attributable" in confounded
+    assert "calibration benefit" not in confounded
+    coverage = {
+        "coverage": {
+            "experts": {"weights": 31488, "quantized": 31488},
+            "shared_expert": {"weights": 123, "quantized": 3},
+            "attention": {"weights": 44, "quantized": 4},
+            "router": {"weights": 41, "quantized": 0},
+        }
+    }
+    assert _partial_components(
+        coverage, ["experts", "shared_expert", "attention"]
+    ) == ["shared_expert", "attention"]
+    assert _partial_components(coverage, ["experts"]) == []
     md = "\n".join(
         _deployed_quantization(
             {
@@ -1911,6 +1952,13 @@ def selftest() -> int:
         _derived_terms(0.02, -0.01, {}, algorithm="gptq")
     )
     assert "beat round-to-nearest" in derived
+    guarded = "\n".join(
+        _derived_terms(
+            0.02, -0.01, {}, algorithm="autoround", partial=["attention"]
+        )
+    )
+    assert "not attributable" in guarded
+    assert "beat round-to-nearest" not in guarded
 
     print("selftest passed")
     return 0

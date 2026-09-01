@@ -549,8 +549,20 @@ def _deployed_quantization(deployed: dict[str, Any]) -> list[str]:
     return out
 
 
-def _beyond_rounding_what(algorithm: str | None, engine: Any) -> str:
-    """Label for deployed minus composite: format match, not vendor method."""
+def _beyond_rounding_what(
+    algorithm: str | None, engine: Any, partial: list[str] | None = None
+) -> str:
+    """Label for deployed minus composite: format match, not vendor method.
+
+    `partial` names components the composite rounded in full and the checkpoint
+    quantized in part. That alone can make the term negative, so it is not
+    attributable to the deployed pack and no calibration claim is made.
+    """
+    if partial:
+        return (
+            "not attributable: the composite cell over-rounds "
+            + ", ".join(partial)
+        )
     if algorithm in _CALIBRATED_ALGORITHMS:
         what = (
             "calibration benefit, activation quantization, and kernel arithmetic"
@@ -569,6 +581,7 @@ def _derived_terms(
     routing: dict[str, Any],
     *,
     algorithm: str | None = None,
+    partial: list[str] | None = None,
 ) -> list[str]:
     """The two terms no cell can hold, tabled beside the cells that imply them.
 
@@ -591,7 +604,7 @@ def _derived_terms(
                 "Beyond weight rounding",
                 f"{engine:+.8f}",
                 share(engine),
-                _beyond_rounding_what(algorithm, engine),
+                _beyond_rounding_what(algorithm, engine, partial),
                 "[Beyond weight rounding](#beyond-weight-rounding)",
             )
         )
@@ -644,6 +657,9 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
     algorithm = (
         attribution.get("quant_algorithm") or inspection.get("quant_algorithm")
     )
+    over_rounded = composite.get("partial_components")
+    if not isinstance(over_rounded, list):
+        over_rounded = []
 
     out = [
         "## Component attribution",
@@ -709,7 +725,9 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
     out += _table(
         rows, ("Cell", "What it isolates", "Mean KLD", "Selections changed", "Support")
     )
-    out += _derived_terms(deployed, engine, routing, algorithm=algorithm)
+    out += _derived_terms(
+        deployed, engine, routing, algorithm=algorithm, partial=over_rounded
+    )
     measured_cells = [
         cell
         for cell in (expert_cell, router_cell, composite)
@@ -739,7 +757,16 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
             if isinstance(deployed, (int, float)) and deployed
             else ""
         )
-        if algorithm in _CALIBRATED_ALGORITHMS:
+        if over_rounded:
+            cause = (
+                f"This term is not attributable. The checkpoint quantizes "
+                f"{', '.join(over_rounded)} only in part, and the composite "
+                f"cell rounds every weight its pattern matches, so the cell is "
+                f"heavier than the deployment by an amount this measurement "
+                f"does not separate. A negative value here is that gap, not "
+                f"evidence about the deployed pack."
+            )
+        elif algorithm in _CALIBRATED_ALGORITHMS:
             cause = (
                 f"QDQ matched the format, not {algorithm} calibration, so this "
                 "term is calibration benefit together with activation "
@@ -762,13 +789,18 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
                 "The checkpoint quantizes weights only, so this term is kernel "
                 "arithmetic."
             )
+        closing = (
+            ""
+            if over_rounded
+            else " A weight-only analysis, which is what any QDQ cell is, "
+            "cannot see it."
+        )
         out += [
             "### Beyond weight rounding",
             "",
             f"**{engine:+.8f}**{share}. Every cell above "
             f"rounds weights and runs on BF16 kernels. The deployed checkpoint "
-            f"differs from the composite cell by this much. {cause} A weight-only "
-            f"analysis, which is what any QDQ cell is, cannot see it.",
+            f"differs from the composite cell by this much. {cause}{closing}",
             "",
         ]
     if router_na:
