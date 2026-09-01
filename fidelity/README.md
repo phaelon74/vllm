@@ -251,10 +251,12 @@ baseline, the environment — lives once at the model root.
     ...
 ```
 
-`artifact.py leaderboard` walks this tree at any depth, so a result's label is
-its `<model>/<candidate>` path. Rankings are grouped by comparability key, which
-includes the reference checkpoint, so candidates of different models never share
-a table.
+`artifact.py leaderboard` walks this tree at any depth. Rankings are grouped
+by comparability key, which includes the reference checkpoint, so candidates of
+different models never share a table. Each row splits the campaign path into
+**family** (the reference), **author** (the Hub org), and **quant** (the Hub
+basename with the family prefix stripped), so `unsloth/Qwen3.8-27B-NVFP4` and
+`RadixArk/Qwen3.8-27B-NVFP4` stay distinct in the published index.
 
 One-pagers are also mirrored to a central index so a reader can find a model's
 mean KLD without downloading tens of gigabytes of reference tensors.

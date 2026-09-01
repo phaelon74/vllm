@@ -1083,6 +1083,46 @@ def _grouping_key(receipt: dict[str, Any]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def candidate_identity(
+    label: str, student_model: str | None = None
+) -> tuple[str, str, str]:
+    """Split a library label into family, Hub author, and quant name.
+
+    The campaign folder is ``{family}/{label}``. ``label`` is the Hub basename,
+    or ``{org}-{basename}`` when two orgs ship the same basename. The author is
+    the Hub org, which lives in the checkpoint path (``.../{org}/{basename}``),
+    not in the campaign label — the first ``Qwen3.8-27B-NVFP4`` would otherwise
+    lose ``unsloth``. The quant name is that basename with the family prefix
+    stripped, so ``Qwen/Qwen3.8-27B-FP8`` becomes family ``Qwen3.8-27B``,
+    author ``Qwen``, quant ``FP8``.
+    """
+    family, _, rest = label.partition("/")
+    if not rest:
+        rest = family
+        family = ""
+    author = ""
+    quant = rest
+    if student_model:
+        path = student_model.rstrip("/\\")
+        hub_name = os.path.basename(path)
+        parent = os.path.basename(os.path.dirname(path))
+        if parent and parent not in (".",):
+            author = parent
+        if hub_name:
+            quant = hub_name
+    elif family:
+        marker = f"-{family}-"
+        if marker in rest:
+            author, _, after = rest.partition(marker)
+            quant = f"{family}-{after}" if after else rest
+    prefix = f"{family}-"
+    if family and quant.startswith(prefix):
+        stripped = quant[len(prefix):]
+        if stripped:
+            quant = stripped
+    return family, author, quant
+
+
 def render_leaderboard(results: list[dict[str, Any]]) -> tuple[str, list[list[Any]]]:
     """Rank compliant results, one table per comparability key (Law 10)."""
     groups: dict[str, list[dict[str, Any]]] = {}
@@ -1122,9 +1162,14 @@ def render_leaderboard(results: list[dict[str, Any]]) -> tuple[str, list[list[An
             expert = (attribution.get("expert_cell") or {}).get("mean_kld")
             floor = item["receipt"].get("ranking_floor")
             weakest, weakest_kld = _weakest_domain(item["receipt"])
+            family, author, quant = candidate_identity(
+                item["label"], item["report"].get("student_model")
+            )
             rows.append(
                 (
-                    item["label"],
+                    family,
+                    author or "n/a",
+                    quant,
                     _kld(report.get("mean_kld")),
                     _kld(expert) if attribution else "n/a",
                     _kld(floor) if floor is not None else "n/a",
@@ -1137,16 +1182,19 @@ def render_leaderboard(results: list[dict[str, Any]]) -> tuple[str, list[list[An
                     status,
                 )
             )
-            csv_rows.append([key[:12], item["label"], report.get("mean_kld"),
-                             expert, floor, weakest, weakest_kld,
-                             report.get("median_kld"), report.get("p99_kld"),
-                             report.get("max_kld"), report.get("top1_agreement"),
-                             report.get("num_positions"), compliant])
+            csv_rows.append([
+                key[:12], family, author, quant, item["label"],
+                report.get("mean_kld"),
+                expert, floor, weakest, weakest_kld,
+                report.get("median_kld"), report.get("p99_kld"),
+                report.get("max_kld"), report.get("top1_agreement"),
+                report.get("num_positions"), compliant,
+            ])
         lines += _table(
             rows,
-            ("Candidate", "Mean KLD", "Experts only", "Routing term",
-             "Weakest domain", "Median", "p99", "Max", "Top-1", "Positions",
-             "Law-compliant"),
+            ("Family", "Author", "Quant", "Mean KLD", "Experts only",
+             "Routing term", "Weakest domain", "Median", "p99", "Max", "Top-1",
+             "Positions", "Law-compliant"),
         )
         lines.append("")
         if any(_weakest_domain(m["receipt"])[0] for m in ranked):
@@ -1234,7 +1282,8 @@ def _cmd_leaderboard(args: argparse.Namespace) -> int:
         os.makedirs(os.path.dirname(os.path.abspath(args.csv)), exist_ok=True)
         with open(args.csv, "w", encoding="utf-8", newline="") as handle:
             writer = csv.writer(handle)
-            writer.writerow(["group", "candidate", "mean_kld",
+            writer.writerow(["group", "family", "author", "quant", "candidate",
+                             "mean_kld",
                              "expert_cell_kld", "routing_term",
                              "weakest_domain", "weakest_domain_kld",
                              "median_kld", "p99_kld", "max_kld",
