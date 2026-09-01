@@ -1,0 +1,69 @@
+{
+  "name": "gemma4-31b-it-qat-fidelity",
+  "library": "/media/fmodels2/Local-Inference-Lab/library",
+  "work": "/media/fmodels2/Local-Inference-Lab/work/gemma4-31b-it-qat",
+  "suite_partition": "analysis",
+  "partition": "analysis",
+  "context_length": 2048,
+  "score_from": 0,
+  "runner_v2": false,
+  "storage": "hidden",
+  "max_num_seqs": 1,
+  "fetch": "lease",
+  "tensor_parallel_size": 1,
+  "models": [
+    {
+      "name": "gemma-4-31B-it-qat-q4_0-unquantized",
+      "reference": {
+        "path": "/media/fmodels2/google/gemma-4-31B-it-qat-q4_0-unquantized",
+        "hf_repo": "google/gemma-4-31B-it-qat-q4_0-unquantized",
+        "revision": "1e4d8beecacb8b7590c1d8bedd7335f687bf311f"
+      },
+      "candidates": [
+        {
+          "name": "gemma-4-31B-it-qat-w4a16-ct",
+          "path": "/media/fmodels2/google/gemma-4-31B-it-qat-w4a16-ct",
+          "hf_repo": "google/gemma-4-31B-it-qat-w4a16-ct",
+          "revision": "52f3f65bc7a02d555763bc923bd1d9094898219d"
+        },
+        {
+          "name": "gemma-4-31B-it-qat-AWQ-INT4",
+          "path": "/media/fmodels2/cyankiwi/gemma-4-31B-it-qat-AWQ-INT4",
+          "hf_repo": "cyankiwi/gemma-4-31B-it-qat-AWQ-INT4",
+          "revision": "e0814036cbe43ee2315aafaede0c3454c74b71d3"
+        },
+        {
+          "name": "gemma-4-31B-it-qat-w4a16",
+          "path": "/media/fmodels2/unsloth/gemma-4-31B-it-qat-w4a16",
+          "hf_repo": "unsloth/gemma-4-31B-it-qat-w4a16",
+          "revision": "dbce31ac7d2f13cac1ac97996086f90f2ccbda53"
+        },
+        {
+          "name": "gemma-4-31B-it-qat-NVFP4",
+          "path": "/media/fmodels2/yasu-oh/gemma-4-31B-it-qat-NVFP4",
+          "hf_repo": "yasu-oh/gemma-4-31B-it-qat-NVFP4",
+          "revision": "65da8e315a537f8ee898d413b4c7d13a7448f91e"
+        },
+        {
+          "name": "gemma-4-31B-it-qat-NVFP4-mse-Blackwell",
+          "path": "/media/fmodels2/melcheikh/gemma-4-31B-it-qat-NVFP4-mse-Blackwell",
+          "hf_repo": "melcheikh/gemma-4-31B-it-qat-NVFP4-mse-Blackwell",
+          "revision": "23864a8a9a15e24ef28ef5a95c0626fb8b3af0a2"
+        },
+        {
+          "name": "gemma-4-31B-it-qat-NVFP4-Blackwell",
+          "path": "/media/fmodels2/melcheikh/gemma-4-31B-it-qat-NVFP4-Blackwell",
+          "hf_repo": "melcheikh/gemma-4-31B-it-qat-NVFP4-Blackwell",
+          "revision": "4c1e5117a7627ef697406d5361faf9666e6e1852"
+        },
+        {
+          "name": "gemma-4-31B-it-qat-FP8",
+          "path": "/media/fmodels2/prithivMLmods/gemma-4-31B-it-qat-FP8",
+          "hf_repo": "prithivMLmods/gemma-4-31B-it-qat-FP8",
+          "revision": "1245be0199c1b792597ed7ea1ac5897269e66a89"
+        }
+      ]
+    }
+  ],
+  "suite_dir": "/media/fmodels2/Local-Inference-Lab/suites/gemma4-31b-it-1024x2048-v1"
+}

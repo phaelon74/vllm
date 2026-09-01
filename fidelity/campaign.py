@@ -30,13 +30,14 @@ Ordering is enforced, not suggested: the zero baseline gates every candidate
 import argparse
 import glob
 import json
+import math
 import os
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NamedTuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from redaction import redact_env  # noqa: E402 - sibling module
@@ -46,16 +47,21 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
 SCORER = os.path.join(REPO_ROOT, "examples", "offline_inference", "score_mode_kld.py")
 
-# Scoring needs a full padded-vocabulary FP32 logits row per position, several
-# GiB per request, which vLLM's memory profiler does not account for. These
-# leave room for it rather than letting the KV cache claim the card.
-WEIGHT_FRACTION = 0.60
-# One sequence of at most a few thousand tokens needs a trivial KV cache, and
-# every GiB reserved for it is a GiB the head-decomposition logits cannot use.
-KV_CACHE_GIB = 2
-# Room for a chunk of vocabulary-wide logits and their float copies, on top of
-# the weights and the cache.
-HEADROOM_GIB = 16
+# Last-resort cap so vLLM is never told it can claim the CUDA context.
+UTIL_CEILING = 0.93
+UTIL_FLOOR = 0.15
+# CUDA context and cuBLAS workspaces reserved on every card.
+CONTEXT_GIB = 2.0
+# Residual activations inside the engine, not the scoring buffers.
+ACTIVATION_GIB = 2.0
+# vLLM's default cache block size (vllm.config.cache.CacheConfig.DEFAULT_BLOCK_SIZE).
+BLOCK_SIZE = 16
+# Floor so vLLM never receives a cache too small to hold one block.
+KV_FLOOR_GIB = 0.25
+# Two .float() copies plus their log_softmax outputs in compute_kld_chunk.
+FP32_COPIES = 4
+# Peak vs live tensors; expandable_segments keeps this from growing further.
+ALLOCATOR_SLACK = 1.25
 TP_CANDIDATES = (1, 2, 4, 8)
 
 
@@ -107,6 +113,7 @@ class Config:
     # "upfront" fetches every candidate during download. "lease" fetches one
     # candidate at a time during score and deletes those weights afterwards.
     fetch: str = "upfront"
+    tensor_parallel_size: int | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -174,40 +181,182 @@ def checkpoint_gib(path: str) -> float:
     return total / (1 << 30)
 
 
-def gpu_inventory() -> tuple[int, float]:
-    """Visible GPU count and per-GPU total memory in GiB."""
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+def _parse_smi_rows(text: str) -> list[tuple[int, str, float, float]]:
+    """Parse nvidia-smi csv: index, uuid, total MiB, free MiB."""
+    rows: list[tuple[int, str, float, float]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 4:
+            raise SystemExit(f"unreadable nvidia-smi row: {line}")
+        try:
+            rows.append((int(parts[0]), parts[1], float(parts[2]), float(parts[3])))
+        except ValueError as exc:
+            raise SystemExit(f"unreadable nvidia-smi row: {line}") from exc
+    return rows
+
+
+def _select_visible(
+    rows: list[tuple[int, str, float, float]], visible: str | None
+) -> list[tuple[int, str, float, float]]:
+    """Map CUDA_VISIBLE_DEVICES onto nvidia-smi rows by index or UUID."""
+    if not visible or not visible.strip():
+        return rows
+    by_index = {row[0]: row for row in rows}
+    selected: list[tuple[int, str, float, float]] = []
+    for tok in visible.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if tok.isdigit():
+            row = by_index.get(int(tok))
+        else:
+            row = next((r for r in rows if r[1] == tok), None)
+            if row is None:
+                row = next((r for r in rows if r[1].endswith(tok)), None)
+        if row is None:
+            raise SystemExit(
+                f"CUDA_VISIBLE_DEVICES token {tok!r} matches no GPU"
+            )
+        selected.append(row)
+    return selected
+
+
+def gpu_inventory() -> tuple[int, float, float]:
+    """Visible GPU count, per-GPU total GiB, and minimum free GiB."""
     try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.total",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, check=True,
-        ).stdout.split()
+        text = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,uuid,memory.total,memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
     except (OSError, subprocess.CalledProcessError) as exc:
         raise SystemExit(f"cannot query GPUs via nvidia-smi: {exc}") from exc
-    count = len(visible.split(",")) if visible else len(out)
-    per_gpu = float(out[0]) / 1024.0
-    return max(count, 1), per_gpu
+    rows = _select_visible(
+        _parse_smi_rows(text), os.environ.get("CUDA_VISIBLE_DEVICES")
+    )
+    if not rows:
+        raise SystemExit("nvidia-smi reported no GPUs")
+    total = min(row[2] for row in rows) / 1024.0
+    free = min(row[3] for row in rows) / 1024.0
+    return len(rows), total, free
 
 
-def plan_gpus(paths: list[str]) -> tuple[int, float, float]:
+def kv_cache_gib(
+    geometry: dict[str, Any],
+    context_length: int,
+    max_num_seqs: int,
+    tp: int,
+) -> float:
+    """KV reservation for the scored window, replicated heads included."""
+    tokens = math.ceil(context_length / BLOCK_SIZE) * BLOCK_SIZE
+    heads = math.ceil(geometry["num_key_value_heads"] / tp)
+    nbytes = (
+        2
+        * geometry["num_hidden_layers"]
+        * heads
+        * geometry["head_dim"]
+        * tokens
+        * max_num_seqs
+        * geometry["elem_bytes"]
+    )
+    return max(nbytes / (1 << 30), KV_FLOOR_GIB)
+
+
+def logits_headroom_gib(
+    geometry: dict[str, Any],
+    context_length: int,
+    max_num_seqs: int,
+) -> float:
+    """Peak FP32 scoring buffers over the unpadded vocabulary."""
+    positions = context_length * max_num_seqs
+    nbytes = positions * geometry["vocab_size"] * (
+        FP32_COPIES * 4 + 2 * geometry["elem_bytes"]
+    )
+    return ALLOCATOR_SLACK * nbytes / (1 << 30)
+
+
+class GpuPlan(NamedTuple):
+    tp: int
+    util: float
+    weight_gib: float
+    kv_gib: float
+    logits_gib: float
+    pinned: bool
+
+
+def _load_geometry(paths: list[str]) -> dict[str, Any]:
+    for path in reversed(paths):
+        if os.path.isfile(os.path.join(path, "config.json")):
+            return _provenance.scoring_geometry(_provenance.load_config(path))
+    raise SystemExit(
+        "cannot plan GPUs: no config.json among " + ", ".join(paths)
+    )
+
+
+def plan_gpus(
+    paths: list[str],
+    config: Config,
+    *,
+    geometry: dict[str, Any] | None = None,
+    inventory: tuple[int, float, float] | None = None,
+    weight_gib: float | None = None,
+) -> GpuPlan:
     """Smallest tensor-parallel size that leaves room for scoring buffers.
 
-    Returns (tensor_parallel_size, gpu_memory_utilization, weight_gib).
+    TP is chosen so weights, KV, and logits fit in free memory. Utilization
+    describes only what the vLLM engine claims: the FP32 copies are ordinary
+    torch allocations, so that room has to be memory vLLM was never told it
+    could take.
     """
-    weights = max((checkpoint_gib(p) for p in paths), default=0.0)
-    count, per_gpu = gpu_inventory()
-    budget = per_gpu * WEIGHT_FRACTION
-    tp = next(
-        (c for c in TP_CANDIDATES if c <= count and weights / c <= budget), count
+    weights = (
+        weight_gib
+        if weight_gib is not None
+        else max((checkpoint_gib(p) for p in paths), default=0.0)
     )
-    util = (weights / tp + KV_CACHE_GIB + HEADROOM_GIB) / per_gpu
-    util = min(max(util, 0.15), 0.95)
+    geom = geometry if geometry is not None else _load_geometry(paths)
+    count, total, free = inventory if inventory is not None else gpu_inventory()
+    usable = free - CONTEXT_GIB
+    logits = logits_headroom_gib(geom, config.context_length, config.max_num_seqs)
+    pinned = config.tensor_parallel_size is not None
+    if pinned:
+        tp = int(config.tensor_parallel_size)
+        if tp < 1:
+            raise SystemExit(f"tensor_parallel_size must be >= 1, got {tp}")
+        if tp > count:
+            raise SystemExit(f"pinned TP={tp} but only {count} GPU(s) visible")
+    else:
+        tp = next(
+            (
+                candidate
+                for candidate in TP_CANDIDATES
+                if candidate <= count
+                and weights / candidate
+                + kv_cache_gib(
+                    geom, config.context_length, config.max_num_seqs, candidate
+                )
+                + logits
+                <= usable
+            ),
+            count,
+        )
+    kv = kv_cache_gib(geom, config.context_length, config.max_num_seqs, tp)
+    util = (weights / tp + kv + ACTIVATION_GIB) / total
+    util = min(max(util, UTIL_FLOOR), UTIL_CEILING)
+    pin_note = " (pinned)" if pinned else ""
     print(
-        f"plan: weights {weights:.2f} GiB, {count} x {per_gpu:.2f} GiB visible "
-        f"-> TP={tp} util={util:.2f} kv={KV_CACHE_GIB} GiB"
+        f"plan: weights {weights:.2f} GiB, kv {kv:.2f} GiB, "
+        f"logits {logits:.2f} GiB, {count} x {total:.2f} free {free:.2f}"
+        f"\n      -> TP={tp} util={util:.2f}{pin_note}"
     )
-    return tp, util, weights
+    return GpuPlan(tp, util, weights, kv, logits, pinned)
 
 
 def _run(cmd: list[str], log_path: str | None = None, env: dict | None = None) -> int:
@@ -489,7 +638,7 @@ def score_identity(
     rows: int,
     suite_limit: int | None = None,
     plan_from: str | None = None,
-) -> tuple[str, str, int, float]:
+) -> tuple[str, str, int, float, float]:
     """The tag, suffix, and GPU plan a scoring run would use.
 
     Separated from the run so a caller can find the report a run would produce
@@ -497,7 +646,7 @@ def score_identity(
     QDQ variant has the reference's geometry, and once its weights are pruned the
     variant on disk no longer implies the tensor-parallel degree it was scored at.
     """
-    tp, util, _ = plan_gpus([plan_from or student, teacher])
+    plan = plan_gpus([plan_from or student, teacher], config)
     # Everything the capture manifest binds itself to belongs in the directory
     # name, or a reused capture becomes a confusing abort instead of a recapture.
     if config.suite_dir:
@@ -505,10 +654,10 @@ def score_identity(
     else:
         scope = f"r{rows}"
     suffix = (
-        f"-v{int(config.runner_v2)}-tp{tp}-{scope}"
+        f"-v{int(config.runner_v2)}-tp{plan.tp}-{scope}"
         f"-c{config.context_length}-s{config.score_from}"
     )
-    return f"{label}{suffix}", suffix, tp, util
+    return f"{label}{suffix}", suffix, plan.tp, plan.util, plan.kv_gib
 
 
 def score_report(
@@ -521,7 +670,7 @@ def score_report(
     plan_from: str | None = None,
 ) -> str:
     """Where a scoring run's report would land."""
-    tag, _, _, _ = score_identity(
+    tag, *_ = score_identity(
         config, label, student, teacher, rows, suite_limit, plan_from
     )
     return os.path.join(config.work, "reports", f"{tag}.json")
@@ -548,7 +697,7 @@ def score_one(
     tens of gigabytes and a forward pass to produce identical tensors. It matters
     once a routed model adds a component cell and a scheme ladder.
     """
-    tag, suffix, tp, util = score_identity(
+    tag, suffix, tp, util, kv = score_identity(
         config, label, student, teacher, rows, suite_limit, plan_from
     )
     capture = os.path.join(
@@ -579,7 +728,7 @@ def score_one(
         "--report-json", report,
         "--tensor-parallel-size", str(tp),
         "--gpu-memory-utilization", f"{util:.2f}",
-        "--kv-cache-memory-gib", str(KV_CACHE_GIB),
+        "--kv-cache-memory-gib", f"{kv:.3f}",
     ]
     if config.suite_dir:
         cmd += ["--token-suite", config.suite_dir,
@@ -602,7 +751,7 @@ def score_one(
             ),
         ]
 
-    print(f"=== {tag} (TP={tp} util={util:.2f})")
+    print(f"=== {tag} (TP={tp} util={util:.2f} kv={kv:.2f} GiB)")
     rc = _run(cmd, log_path=log, env={
         "VLLM_USE_V2_MODEL_RUNNER": str(int(config.runner_v2)),
         # Scoring allocates and frees vocabulary-wide tensors thousands of
@@ -1599,6 +1748,49 @@ def selftest() -> int:
         copied = inspect_checkpoint("/no/such/python", cache_dir, durable)
         assert copied == durable
         assert os.path.isfile(durable)
+
+    rows = _parse_smi_rows(
+        "0, GPU-aaa, 97887, 97000\n1, GPU-bbb, 97887, 1000\n"
+    )
+    assert len(rows) == 2
+    selected = _select_visible(rows, "1")
+    assert selected[0][1] == "GPU-bbb"
+    assert selected[0][3] == 1000.0
+    by_uuid = _select_visible(rows, "GPU-aaa")
+    assert by_uuid[0][0] == 0
+
+    geom = {
+        "num_hidden_layers": 60,
+        "num_key_value_heads": 16,
+        "head_dim": 256,
+        "vocab_size": 262144,
+        "elem_bytes": 2,
+    }
+    logits = logits_headroom_gib(geom, 2048, 1)
+    assert abs(logits - 12.5) < 1e-6
+    kv = kv_cache_gib(geom, 2048, 1, 1)
+    assert 1.0 < kv < 2.5
+    cfg = Config(name="t", library="l", work="w", models=[])
+    plan = plan_gpus(
+        [],
+        cfg,
+        geometry=geom,
+        inventory=(4, 95.59, 94.83),
+        weight_gib=65.10,
+    )
+    assert plan.tp == 1
+    assert plan.pinned is False
+    assert plan.util <= UTIL_CEILING
+    cfg.tensor_parallel_size = 2
+    pinned = plan_gpus(
+        [],
+        cfg,
+        geometry=geom,
+        inventory=(4, 95.59, 94.83),
+        weight_gib=65.10,
+    )
+    assert pinned.tp == 2
+    assert pinned.pinned is True
 
     print("selftest passed")
     return 0

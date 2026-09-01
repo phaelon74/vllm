@@ -1,0 +1,15 @@
+{
+  "fp8": [
+    "prithivMLmods/gemma-4-31B-it-qat-FP8"
+  ],
+  "nvfp4": [
+    "yasu-oh/gemma-4-31B-it-qat-NVFP4",
+    "melcheikh/gemma-4-31B-it-qat-NVFP4-mse-Blackwell",
+    "melcheikh/gemma-4-31B-it-qat-NVFP4-Blackwell"
+  ],
+  "int4": [
+    "google/gemma-4-31B-it-qat-w4a16-ct",
+    "cyankiwi/gemma-4-31B-it-qat-AWQ-INT4",
+    "unsloth/gemma-4-31B-it-qat-w4a16"
+  ]
+}

@@ -29,25 +29,84 @@ ARCHITECTURE_FIELDS = (
     "head_dim",
 )
 
+_DTYPE_BYTES = {
+    "float32": 4,
+    "fp32": 4,
+    "float": 4,
+    "float16": 2,
+    "fp16": 2,
+    "half": 2,
+    "bfloat16": 2,
+    "bf16": 2,
+}
+
 
 def load_config(path: str) -> dict[str, Any]:
     with open(os.path.join(path, "config.json"), encoding="utf-8") as handle:
         return json.load(handle)
 
 
+def config_value(config: dict[str, Any], key: str) -> Any:
+    """Look up on the root, then inside `text_config`."""
+    if key in config:
+        return config[key]
+    text = config.get("text_config")
+    if isinstance(text, dict) and key in text:
+        return text[key]
+    return None
+
+
 def architecture_identity(config: dict[str, Any]) -> dict[str, Any]:
     """The architecture fields, unwrapping `text_config` when the root omits them."""
-    text = config.get("text_config")
-    nested = text if isinstance(text, dict) else {}
-    out: dict[str, Any] = {}
-    for key in ARCHITECTURE_FIELDS:
-        if key in config:
-            out[key] = config[key]
-        elif key in nested:
-            out[key] = nested[key]
-        else:
-            out[key] = None
-    return out
+    return {key: config_value(config, key) for key in ARCHITECTURE_FIELDS}
+
+
+def scoring_geometry(config: dict[str, Any]) -> dict[str, Any]:
+    """Layers, KV heads, head dim, vocab, and element width for memory planning.
+
+    Falls back to `head_dim = hidden_size // num_attention_heads` and
+    `num_key_value_heads = num_attention_heads` when a checkpoint omits them.
+    Accepts both `torch_dtype` and the newer `dtype` key.
+    """
+    hidden = config_value(config, "hidden_size")
+    layers = config_value(config, "num_hidden_layers")
+    kv_heads = config_value(config, "num_key_value_heads")
+    attn_heads = config_value(config, "num_attention_heads")
+    head_dim = config_value(config, "head_dim")
+    vocab = config_value(config, "vocab_size")
+    if head_dim is None and isinstance(hidden, int) and isinstance(attn_heads, int):
+        if attn_heads:
+            head_dim = hidden // attn_heads
+    if kv_heads is None:
+        kv_heads = attn_heads
+    missing = [
+        name
+        for name, value in (
+            ("num_hidden_layers", layers),
+            ("num_key_value_heads", kv_heads),
+            ("head_dim", head_dim),
+            ("vocab_size", vocab),
+        )
+        if not isinstance(value, int) or value < 1
+    ]
+    if missing:
+        raise ValueError(
+            "checkpoint config is missing scoring geometry: " + ", ".join(missing)
+        )
+    dtype = config_value(config, "torch_dtype") or config_value(config, "dtype")
+    elem = _DTYPE_BYTES.get(str(dtype).lower(), 2) if dtype else 2
+    return {
+        "num_hidden_layers": int(layers),
+        "num_key_value_heads": int(kv_heads),
+        "num_attention_heads": (
+            int(attn_heads) if isinstance(attn_heads, int) else None
+        ),
+        "head_dim": int(head_dim),
+        "hidden_size": int(hidden) if isinstance(hidden, int) else None,
+        "vocab_size": int(vocab),
+        "elem_bytes": elem,
+        "dtype": dtype,
+    }
 
 
 def tokenizer_fingerprint(path: str) -> str | None:
@@ -112,16 +171,54 @@ def selftest() -> int:
         "text_config": {
             "hidden_size": 5120,
             "num_hidden_layers": 64,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
             "layer_types": ["linear_attention", "full_attention"],
             "vocab_size": 248320,
             "intermediate_size": 17408,
             "head_dim": 256,
+            "torch_dtype": "bfloat16",
         },
     }
     ident = architecture_identity(ref)
     assert ident["architectures"] == ["Qwen3_5ForConditionalGeneration"]
     assert ident["hidden_size"] == 5120
     assert ident["vocab_size"] == 248320
+    geom = scoring_geometry(ref)
+    assert geom["num_hidden_layers"] == 64
+    assert geom["head_dim"] == 256
+    assert geom["vocab_size"] == 248320
+    assert geom["elem_bytes"] == 2
+    assert geom["num_key_value_heads"] == 8
+    derived = scoring_geometry(
+        {
+            "hidden_size": 4096,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "vocab_size": 32000,
+            "torch_dtype": "float32",
+        }
+    )
+    assert derived["head_dim"] == 128
+    assert derived["num_key_value_heads"] == 32
+    assert derived["elem_bytes"] == 4
+    gemma = scoring_geometry(
+        {
+            "architectures": ["Gemma4ForConditionalGeneration"],
+            "dtype": "bfloat16",
+            "text_config": {
+                "hidden_size": 5376,
+                "num_hidden_layers": 60,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 16,
+                "head_dim": 256,
+                "vocab_size": 262144,
+                "dtype": "bfloat16",
+            },
+        }
+    )
+    assert gemma["num_key_value_heads"] == 16
+    assert gemma["elem_bytes"] == 2
     other = dict(ref)
     other["text_config"] = dict(ref["text_config"], hidden_size=2560)
     assert architecture_identity(other)["hidden_size"] == 2560
