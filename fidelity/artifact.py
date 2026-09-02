@@ -23,7 +23,7 @@ from typing import Any
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from redaction import redact_env  # noqa: E402 - sibling module
 
-LAWS_VERSION = 6
+LAWS_VERSION = 7
 PROGRAM = "Local Inference Lab"
 # Vendor calibration on packed int4. QDQ still matches format only.
 _CALIBRATED_ALGORITHMS = frozenset({"awq", "gptq", "autoround"})
@@ -589,6 +589,7 @@ def _derived_terms(
     algorithm: str | None = None,
     partial: list[str] | None = None,
     match_mode: str | None = None,
+    floor_state: str | None = None,
 ) -> list[str]:
     """The two terms no cell can hold, tabled beside the cells that imply them.
 
@@ -618,14 +619,38 @@ def _derived_terms(
             )
         )
     excess = routing.get("routing_excess_mean")
+    flips = _pct(routing.get("selection_flip_rate"))
     if isinstance(excess, (int, float)):
         rows.append(
             (
                 "Routing, measured",
                 _kld(excess),
                 share(excess),
-                f"expert selection changed at "
-                f"{_pct(routing.get('selection_flip_rate'))} of choices",
+                f"expert selection changed at {flips} of choices",
+                "[Routing divergence](#routing-divergence)",
+            )
+        )
+    elif floor_state == "saturated":
+        # Silence here would read as "routing cost nothing", which is the
+        # opposite of what a saturated measurement says.
+        rows.append(
+            (
+                "Routing, measured",
+                "saturated",
+                "n/a",
+                f"expert selection changed at {flips} of choices and every "
+                f"scored position rerouted, so no held-routing population "
+                f"remains to measure the excess against",
+                "[Routing divergence](#routing-divergence)",
+            )
+        )
+    elif floor_state == "routing_held":
+        rows.append(
+            (
+                "Routing, measured",
+                _kld(0.0),
+                share(0.0),
+                "expert selection survived at every scored position",
                 "[Routing divergence](#routing-divergence)",
             )
         )
@@ -742,6 +767,7 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
         algorithm=algorithm,
         partial=over_rounded,
         match_mode=composite_mode,
+        floor_state=receipt.get("ranking_floor_state"),
     )
     measured_cells = [
         cell
@@ -956,6 +982,26 @@ def _routing(receipt: dict[str, Any]) -> list[str]:
             f"Two candidates whose deployed means differ by less than it are "
             f"not ranked by that difference; rank them on the experts-only "
             f"cell, which is a precision comparison.",
+            "",
+        ]
+    elif receipt.get("ranking_floor_state") == "saturated":
+        out += [
+            f"**Ranking floor undefined.** Every one of the "
+            f"{routing.get('positions')} scored positions rerouted in at least "
+            f"one layer, so there is no held-routing population to compare the "
+            f"flipped ones against. The floor is not small here, it is "
+            f"unmeasurable, and no rescore changes that: the perturbation is "
+            f"large enough that routing divergence is the whole picture rather "
+            f"than a correction to it. Rank against this candidate on the "
+            f"experts-only cell, and treat the deployed mean as unranked.",
+            "",
+        ]
+    elif receipt.get("ranking_floor_state") == "routing_held":
+        out += [
+            f"**Ranking floor 0.0.** Expert selection survived at every one of "
+            f"the {routing.get('positions')} scored positions, so routing "
+            f"contributes nothing to this candidate's mean and the deployed "
+            f"numbers can be compared directly.",
             "",
         ]
     buckets = [b for b in routing.get("buckets") or [] if b.get("positions")]

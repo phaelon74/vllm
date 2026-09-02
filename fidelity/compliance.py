@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-LAWS_VERSION = 6
+LAWS_VERSION = 7
 
 # The identity a capture is bound to. Law 5 requires the scored report to carry
 # it; Law 12 requires the published reference to agree with it, so an artifact
@@ -520,7 +520,8 @@ def law_14_component_attribution(c: Campaign) -> Finding:
     # because the activations reaching them were perturbed upstream. No
     # weight-rounding cell can produce this number, so it is required directly.
     routing = c.report.get("routing")
-    if not routing or routing.get("routing_excess_mean") is None:
+    state = routing_floor_state(c.report)
+    if state == "unmeasured":
         return Finding(
             14,
             title,
@@ -530,8 +531,17 @@ def law_14_component_attribution(c: Campaign) -> Finding:
             f"weight precision is not a substitute: an unquantized router "
             f"still receives perturbed activations",
         )
-    floor = float(routing["routing_excess_mean"])
+    floor = routing_floor(c.report)
     flip_rate = float(routing.get("selection_flip_rate") or 0.0)
+    if state == "saturated":
+        floor_detail = (
+            "ranking floor undefined: every scored position rerouted, so no "
+            "held-routing population remains to compare against"
+        )
+    elif state == "routing_held":
+        floor_detail = "ranking floor 0.0: expert selection survived everywhere"
+    else:
+        floor_detail = f"ranking floor {float(floor):.8f}"
 
     router_cell = c.attribution.get("router_cell")
     if not isinstance(router_cell, dict):
@@ -559,7 +569,7 @@ def law_14_component_attribution(c: Campaign) -> Finding:
         PASS,
         f"experts {float(expert_cell['mean_kld']):.8f}, {router_detail}; "
         f"selections changed at {flip_rate * 100:.3f}% of (token, layer) "
-        f"choices; ranking floor {floor:.8f}",
+        f"choices; {floor_detail}",
     )
 
 
@@ -693,7 +703,43 @@ def routing_floor(report: dict[str, Any] | None) -> float | None:
     if not isinstance(routing, dict):
         return None
     excess = routing.get("routing_excess_mean")
-    return float(excess) if isinstance(excess, (int, float)) else None
+    if isinstance(excess, (int, float)):
+        return float(excess)
+    # Routing that never flipped contributes nothing, so the floor is zero
+    # rather than unknown. The scorer reports no excess there only because
+    # there is no flipped population to subtract from.
+    if routing_floor_state(report) == "routing_held":
+        return 0.0
+    return None
+
+
+def routing_floor_state(report: dict[str, Any] | None) -> str:
+    """Why a routing floor is or is not a number.
+
+    A null excess means one of two opposite things, and conflating them either
+    refuses a publishable result or publishes an unknown as a zero.
+    `routing_held` is every position keeping its experts, where the floor is
+    genuinely zero. `saturated` is every position rerouting, where no
+    held-routing population remains and the floor is undefined - it is not
+    small, and no rescore will produce one.
+    """
+    if not isinstance(report, dict):
+        return "unmeasured"
+    routing = report.get("routing")
+    if not isinstance(routing, dict) or not routing.get("positions"):
+        return "unmeasured"
+    if isinstance(routing.get("routing_excess_mean"), (int, float)):
+        return "measured"
+    rate = routing.get("position_flip_rate")
+    if not isinstance(rate, (int, float)):
+        return "unmeasured"
+    if rate >= 1.0:
+        return "saturated"
+    if rate <= 0.0:
+        return "routing_held"
+    # Both populations are non-empty, so the scorer should have produced an
+    # excess. Something is wrong with the report rather than the routing.
+    return "unmeasured"
 
 
 # Registered after every check is defined. Numbering is append-only, so Law 14
@@ -831,6 +877,7 @@ def build_receipt(c: Campaign, findings: list[Finding]) -> dict[str, Any]:
         ),
         "attribution": c.attribution,
         "ranking_floor": routing_floor(c.report),
+        "ranking_floor_state": routing_floor_state(c.report),
         "routing": c.report.get("routing"),
         "strata": strata_summary(c.strata),
         "program": "Local Inference Lab — Distribution Fidelity",

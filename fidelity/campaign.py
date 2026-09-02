@@ -1967,6 +1967,7 @@ def selftest() -> int:
         _deployed_quantization,
         _derived_terms,
     )
+    from compliance import routing_floor, routing_floor_state
 
     assert "calibration benefit" in _beyond_rounding_what("awq", -0.01)
     assert "beat round-to-nearest" in _beyond_rounding_what("awq", -0.01)
@@ -2049,6 +2050,50 @@ def selftest() -> int:
     )
     assert "calibration benefit" in exact_term
     assert "not attributable" not in exact_term
+
+    # A null routing excess means opposite things at the two extremes, and
+    # omitting the row would let saturation read as "routing cost nothing".
+    saturated = "\n".join(
+        _derived_terms(
+            0.02,
+            -0.01,
+            {"selection_flip_rate": 0.56, "positions": 100},
+            floor_state="saturated",
+        )
+    )
+    assert "saturated" in saturated
+    assert "no held-routing population" in saturated
+    held = "\n".join(
+        _derived_terms(
+            0.02,
+            -0.01,
+            {"selection_flip_rate": 0.0, "positions": 100},
+            floor_state="routing_held",
+        )
+    )
+    assert "survived at every scored position" in held
+    silent = "\n".join(
+        _derived_terms(0.02, -0.01, {"selection_flip_rate": 0.5})
+    )
+    assert "Routing, measured" not in silent, (
+        "without a floor state there is nothing to disclose, so the row must "
+        "stay out rather than assert a value the report does not carry"
+    )
+    for report, expect in (
+        ({"routing": {"positions": 10, "routing_excess_mean": 0.5}}, "measured"),
+        ({"routing": {"positions": 10, "position_flip_rate": 1.0}}, "saturated"),
+        ({"routing": {"positions": 10, "position_flip_rate": 0.0}},
+         "routing_held"),
+        ({"routing": {}}, "unmeasured"),
+        ({}, "unmeasured"),
+    ):
+        assert routing_floor_state(report) == expect, report
+    assert routing_floor(
+        {"routing": {"positions": 10, "position_flip_rate": 0.0}}
+    ) == 0.0, "routing that never flipped has a zero floor, not an unknown one"
+    assert routing_floor(
+        {"routing": {"positions": 10, "position_flip_rate": 1.0}}
+    ) is None, "a saturated floor is undefined and must not read as zero"
 
     path = variant_path(cfg, "/models/Ref", "experts", "int4_g128_asym")
     assert path.endswith("Ref-qdq-experts-int4_g128_asym")

@@ -1,6 +1,6 @@
 # Local Inference Lab — Distribution Fidelity Laws
 
-**Laws version:** 6
+**Laws version:** 7
 **Status:** draft, pending coordination with `local-inference-lab` on the
 publication namespace and suite format.
 
@@ -41,6 +41,15 @@ each quantized name is resolved to the reference tensor that carries it, and a
 fused tensor the pack covers only in part is refused rather than rounded whole.
 A version-5 receipt for a partly quantized candidate is not a version-6
 receipt and must be rescored, not relabeled.
+
+Version 7 separates a saturated routing measurement from an absent one. Versions
+2 through 6 failed Law 14 whenever the routing excess was null and advised a
+rescore with `--measure-routing`, which was the right advice for a run that
+never measured routing and useless for one where every scored position rerouted
+or none did. Both of those are measurement outcomes a rescore reproduces
+exactly. Version 7 states which case holds and publishes a saturated candidate
+with its deployed mean marked unranked. This is a relabeling, not a rescore: a
+version-6 receipt becomes a version-7 receipt by reassembling it.
 
 These laws govern every distribution-fidelity measurement this program
 publishes. They are not guidance. The pipeline refuses to produce or upload an
@@ -393,6 +402,17 @@ the difference of the two means. It is a floor in the sense Law 1's repeat sprea
 is a floor. Two candidates whose deployed means differ by less than it are not
 ranked by that difference, and an artifact that ranks them ranks them on the
 expert cell and says so in the same sentence as the claim.
+
+**A floor that is not a number.** The excess is undefined when one of its two
+populations is empty, and the two cases are opposites. If no position rerouted,
+routing cost nothing and the floor is zero. If every position rerouted, no
+held-routing population remains and the floor is unmeasurable — not small, and
+no rescore produces one, because the perturbation is large enough that routing
+divergence is the whole picture. Both satisfy this law when the run measured
+routing and the artifact states which case it is; what the law refuses is a
+routing measurement that never ran, and an artifact that omits the routing term
+so that saturation reads as zero cost. A saturated candidate publishes with its
+deployed mean marked unranked.
 
 **Naming.** Cells are named for the component that carries the error, never as
 `B×Q` or `Q×B`. That notation does not say which factor is the router, and two
