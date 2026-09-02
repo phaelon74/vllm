@@ -2024,7 +2024,7 @@ def selftest() -> int:
             }
         )
     )
-    assert "exactly the 14 tensors" in partial_md
+    assert "exactly the 14 weights" in partial_md
     assert "upper bound" not in partial_md
     derived = "\n".join(
         _derived_terms(0.02, -0.01, {}, algorithm="gptq")
