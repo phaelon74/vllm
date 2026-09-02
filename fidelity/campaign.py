@@ -686,19 +686,33 @@ def score_report(
     return os.path.join(config.work, "reports", f"{tag}.json")
 
 
-def bind_weights(report_path: str, student: str) -> str | None:
+def bind_weights(
+    report_path: str, student: str, *, observed: bool = True
+) -> str | None:
     """Record on the report the identity of the weights that were scored.
 
     Returns the digest, or None when the weights are already gone. A report that
     cites a different digest than the directory now holds is refused rather than
     rewritten: the two disagree about what was measured, and only a rescore can
     settle it.
+
+    `observed` is False for a report this run did not produce. The digest is then
+    checked but never added, because a directory refetched afterwards proves what
+    is on disk now and not what the scorer read. Writing it would manufacture a
+    binding nobody witnessed, which is the whole thing Law 16 is guarding.
     """
+    with open(report_path, encoding="utf-8") as handle:
+        report = json.load(handle)
+    recorded = report.get("student_weights_sha256")
+    # Nothing to write and nothing to check, so nothing to read a checkpoint for.
+    if not recorded and not observed:
+        return None
+    if not os.path.isdir(student):
+        return None
+
     sys.path.insert(0, HERE)
     import qdq
 
-    if not os.path.isdir(student):
-        return None
     try:
         digest = qdq.weights_identity(student)
     except SystemExit as exc:
@@ -706,9 +720,6 @@ def bind_weights(report_path: str, student: str) -> str | None:
         # an unhashable checkpoint would cost a GPU-hour and prove nothing.
         print(f"WARNING  cannot bind {student}: {exc}", file=sys.stderr)
         return None
-    with open(report_path, encoding="utf-8") as handle:
-        report = json.load(handle)
-    recorded = report.get("student_weights_sha256")
     if recorded and recorded != digest:
         raise CampaignError(
             f"{os.path.basename(report_path)} was scored against weights "
@@ -788,7 +799,7 @@ def score_one(
 
     if os.path.isfile(report):
         print(f"=== {tag} already scored")
-        bind_weights(report, student)
+        bind_weights(report, student, observed=False)
         return report, capture
 
     capture_environment(config, python)
@@ -2185,6 +2196,17 @@ def selftest() -> int:
 
     status, _ = _law16(None, "a" * 64)
     assert status == "override", "an unbound legacy report must be excusable"
+
+    # A report this run did not produce is checked, never stamped: a refetched
+    # directory proves what is on disk now, not what the scorer read.
+    with tempfile.TemporaryDirectory() as root:
+        stale = os.path.join(root, "report.json")
+        with open(stale, "w", encoding="utf-8") as handle:
+            json.dump({"mean_kld": 0.1}, handle)
+        assert bind_weights(stale, root, observed=False) is None
+        with open(stale, encoding="utf-8") as handle:
+            assert "student_weights_sha256" not in json.load(handle)
+
     status, detail = _law16("a" * 64, "b" * 64)
     assert status == "fail", "a contradicted digest must not be overridable"
     assert "permits no override" in detail, detail
