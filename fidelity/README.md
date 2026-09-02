@@ -192,7 +192,11 @@ A checkpoint whose `config.json` will crash vLLM on load (for example a Quark
 W4A16 export whose `algo_config` is a list of dicts, which
 `WeightsMapper.apply_list` cannot map) is refused from `config.json` alone.
 That is a skipped candidate, not an EngineCore abort, and installing
-`amd-quark` does not change it.
+`amd-quark` does not change it. The same check refuses a grouped int4 pack whose
+group size does not divide the model's expert width: the exporter pads the
+reduction dimension and stores one group more than it carries, vLLM allocates for
+the unpadded width, and the expert weight loader fails on the length mismatch.
+Gemma 4's 704-wide experts do this to a 128-wide group but not to 32 or 64.
 
 Every model in a campaign is ingested, scored, and assembled by the identical
 code path. That is the point: a comparison between two candidates means nothing

@@ -398,11 +398,48 @@ def unloadable_reason(model: str) -> str | None:
     return unloadable_reason_from_config(config)
 
 
+def _padded_group_reason(config: dict[str, Any], quant: dict[str, Any]) -> str | None:
+    """Why a grouped int4 pack of this model will not load, or None.
+
+    A grouped quantizer needs the reduction dimension to be a multiple of its
+    group size. When it is not, the exporter pads and stores one group more than
+    the dimension really carries, while vLLM allocates for the unpadded width and
+    the expert weight loader fails copying a scale of the wrong length. The
+    dimensions are declared, so this is answerable before a download.
+    """
+    group = _as_int(_first_present(quant, ("group_size", "q_group_size")))
+    if not group or group <= 0:
+        return None
+    text = config.get("text_config")
+    section = text if isinstance(text, dict) else config
+    for key in ("moe_intermediate_size", "intermediate_size"):
+        width = _as_int(section.get(key))
+        if width and width % group:
+            return (
+                f"{key} {width} is not a multiple of the declared group size "
+                f"{group}, so the exporter padded it to "
+                f"{(width // group + 1) * group} while vLLM allocates {width}; "
+                f"the expert weight loader fails copying a scale one group too "
+                f"long. This is the checkpoint's geometry, not a missing package"
+            )
+    return None
+
+
 def unloadable_reason_from_config(config: dict[str, Any]) -> str | None:
     quant = config.get("quantization_config")
     if not isinstance(quant, dict):
         return None
     method = str(quant.get("quant_method") or "").lower()
+    grouped = (
+        "auto-round",
+        "auto_round",
+        "gptq",
+        "gptq_marlin",
+        "awq",
+        "awq_marlin",
+    )
+    if method in grouped:
+        return _padded_group_reason(config, quant)
     if method != "quark":
         return None
     if "export" not in quant:
@@ -1255,6 +1292,21 @@ def selftest() -> int:
     }
     assert unloadable_reason_from_config(fp8_quark) is None
 
+    # Gemma 4's 704-wide experts do not divide by AutoRound's 128 group.
+    gemma_autoround = {
+        "text_config": {"moe_intermediate_size": 704, "intermediate_size": 2112},
+        "quantization_config": {"quant_method": "auto-round", "group_size": 128},
+    }
+    reason = unloadable_reason_from_config(gemma_autoround)
+    assert reason is not None and "moe_intermediate_size 704" in reason, reason
+    assert "768" in reason, reason
+    for group in (32, 64):
+        loadable = {
+            "text_config": {"moe_intermediate_size": 704, "intermediate_size": 2112},
+            "quantization_config": {"quant_method": "awq", "group_size": group},
+        }
+        assert unloadable_reason_from_config(loadable) is None, group
+
     awq_cfg = {
         "quant_method": "awq",
         "bits": 4,
@@ -1387,7 +1439,9 @@ def selftest() -> int:
         {
             "quant_method": "compressed-tensors",
             "config_groups": {
-                "group_0": {"weights": {"num_bits": 4, "type": "int", "group_size": 128}}
+                "group_0": {
+                    "weights": {"num_bits": 4, "type": "int", "group_size": 128}
+                }
             },
         }
     ) is None
