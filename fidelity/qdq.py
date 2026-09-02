@@ -330,13 +330,34 @@ SCALE_SUFFIXES = ("weight_scale", "weight_scale_inv", "weight_scale_2", "scales"
 PACKED_WEIGHT_SUFFIXES = ("weight", "qweight", "weight_packed")
 _PACKED_REWRITE_SUFFIXES = ("weight_packed", "qweight", "weight")
 
+# A pack may keep its experts fused the way the reference does, in which case the
+# operand carries no `.weight` at all: `experts.gate_up_proj_packed` beside
+# `experts.gate_up_proj_scale`. The canonical name is then the bare stack, which
+# is exactly what the reference calls it. Leaves match `_FUSED_EXPERT_MEMBERS`.
+_FUSED_STACK_LEAVES = "gate_up_proj|gate_proj|up_proj|down_proj"
+_FUSED_STACK_OPERAND = re.compile(
+    rf"^(?P<stem>.+\.experts\.(?:{_FUSED_STACK_LEAVES}))_packed$"
+)
+_FUSED_STACK_SCALE = re.compile(
+    rf"^(?P<stem>.+\.experts\.(?:{_FUSED_STACK_LEAVES}))"
+    rf"_(?:scale|scales|scale_inv|scale_2|global_scale)$"
+)
+
 
 def _as_weight_name(key: str) -> str | None:
-    """Canonical `.weight` name for a packed or unpacked matmul operand."""
+    """Canonical operand name for a packed or unpacked matmul weight."""
     for suffix in _PACKED_REWRITE_SUFFIXES:
         if key.endswith("." + suffix):
             return key[: -len(suffix)] + "weight"
-    return None
+    hit = _FUSED_STACK_OPERAND.match(key)
+    return hit.group("stem") if hit is not None else None
+
+
+def _is_scale_key(key: str) -> bool:
+    """Whether `key` names a weight scale rather than a matmul operand."""
+    if any(key.endswith("." + suffix) for suffix in SCALE_SUFFIXES):
+        return True
+    return _FUSED_STACK_SCALE.match(key) is not None
 
 
 def _operand_from_scale_key(scale_key: str, keys: set[str]) -> str | None:
@@ -350,6 +371,11 @@ def _operand_from_scale_key(scale_key: str, keys: set[str]) -> str | None:
             if candidate in keys:
                 return candidate
         return None
+    hit = _FUSED_STACK_SCALE.match(scale_key)
+    if hit is not None:
+        candidate = hit.group("stem") + "_packed"
+        if candidate in keys:
+            return candidate
     return None
 
 
@@ -573,10 +599,8 @@ def _scale_shapes(model: str) -> dict[str, tuple[int, ...]]:
         with safe_open(os.path.join(model, name), framework="pt", device="cpu") as f:
             for key in f.keys():
                 all_keys.add(key)
-                for suffix in SCALE_SUFFIXES:
-                    if key.endswith("." + suffix):
-                        scale_shapes[key] = tuple(f.get_slice(key).get_shape())
-                        break
+                if _is_scale_key(key):
+                    scale_shapes[key] = tuple(f.get_slice(key).get_shape())
     found: dict[str, tuple[int, ...]] = {}
     for scale_key, shape in scale_shapes.items():
         operand = _operand_from_scale_key(scale_key, all_keys)
@@ -842,8 +866,7 @@ def inspect(model: str) -> dict[str, Any]:
 
     scales = _scale_shapes(model)
     packed_scales = any(
-        name.endswith(".qweight") or name.endswith(".weight_packed")
-        for name in scales
+        name.endswith(".qweight") or name.endswith("_packed") for name in scales
     )
     weight_shapes: dict[str, tuple[int, ...]] = {}
     operand_names: set[str] = set()
@@ -1552,6 +1575,26 @@ def selftest() -> int:
         for leaf in ("gate_proj", "up_proj")
     }
     print("  Gemma 4 experts, router, dense MLP, and vision tower classify")
+
+    # A pack that keeps its experts fused names the operand with no `.weight`.
+    # Canonicalizing it to the bare stack is what lets it match the reference.
+    stack = "model.language_model.layers.0.experts.gate_up_proj"
+    assert _as_weight_name(stack + "_packed") == stack
+    assert _as_weight_name(stack + "_scale") is None, "a scale is not an operand"
+    assert _is_scale_key(stack + "_scale")
+    assert not _is_scale_key(stack + "_packed")
+    assert _operand_from_scale_key(
+        stack + "_scale", {stack + "_packed"}
+    ) == stack + "_packed"
+    assert classify(_as_weight_name(stack + "_packed"), COMPONENTS) == "experts"
+    # The dotted conventions must keep resolving as before.
+    q = "model.layers.0.self_attn.q_proj"
+    assert _as_weight_name(q + ".weight_packed") == q + ".weight"
+    assert _as_weight_name(q + ".qweight") == q + ".weight"
+    assert _operand_from_scale_key(
+        q + ".weight_scale", {q + ".weight_packed"}
+    ) == q + ".weight_packed"
+    print("  fused experts.<leaf>_packed resolves to the reference's own stack")
 
     for scheme, edge in (
         ("fp8_block", 128),
