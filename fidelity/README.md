@@ -175,6 +175,13 @@ pins `hf_repo` and `revision`, and `inspect.json` is stored under
 `work/inspect/` (copied into the assembled tree) rather than only beside the
 checkpoint.
 
+Scoring also binds each report to the weights it read, hashing tensor names,
+dtypes, and shapes plus every shard's name and size from the safetensors headers.
+Law 16 requires that digest to match the published `inspect.json`, so a directory
+repopulated from a different repo cannot be scored under the old name, and two
+candidates that differ in weights cannot publish the same mean. A report whose
+digest disagrees with the checkpoint now on disk is refused rather than rewritten.
+
 Before a candidate is scored, `provenance.py` compares `architectures`,
 `hidden_size`, `num_hidden_layers`, `layer_types`, `vocab_size`,
 `intermediate_size`, and `head_dim` against the reference (unwrapping

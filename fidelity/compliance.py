@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-LAWS_VERSION = 7
+LAWS_VERSION = 8
 
 # The identity a capture is bound to. Law 5 requires the scored report to carry
 # it; Law 12 requires the published reference to agree with it, so an artifact
@@ -49,7 +49,11 @@ NOT_APPLICABLE = "not_applicable"
 
 # Laws whose text permits a recorded deviation. Anything else is absolute and an
 # approval entry cannot rescue it.
-OVERRIDABLE = frozenset({1, 8, 11, 12, 14})
+#
+# Law 16 is overridable only for a score taken before the binding existed, whose
+# weights have since been released: that evidence cannot be recovered without a
+# rescore, and the receipt must say the binding is missing rather than imply one.
+OVERRIDABLE = frozenset({1, 8, 11, 12, 14, 16})
 
 
 @dataclass
@@ -91,6 +95,7 @@ class Campaign:
     repeat_study: dict[str, Any] | None = None
     attribution: dict[str, Any] | None = None
     strata: dict[str, Any] | None = None
+    inspection: dict[str, Any] | None = None
     approvals: dict[str, Any] = field(default_factory=dict)
 
 
@@ -688,6 +693,39 @@ def law_15_domain_disclosure(c: Campaign) -> Finding:
     )
 
 
+def law_16_weight_binding(c: Campaign) -> Finding:
+    """The score must be tied to the weights that produced it."""
+    title = "Candidate weight binding"
+    scored = c.report.get("student_weights_sha256")
+    if not scored:
+        return Finding(
+            16,
+            title,
+            FAIL,
+            "the report names a checkpoint path but records no digest of its "
+            "weights, so nothing rules out a directory that held something else",
+        )
+    inspected = (c.inspection or {}).get("weights_sha256")
+    if not inspected:
+        return Finding(
+            16,
+            title,
+            FAIL,
+            f"the report is bound to weights {scored[:16]} but no inspection of "
+            f"the candidate was supplied to check it against",
+        )
+    if scored != inspected:
+        return Finding(
+            16,
+            title,
+            FAIL,
+            f"the report scored weights {scored[:16]} but the candidate this "
+            f"artifact publishes inspects to {inspected[:16]}; the score belongs "
+            f"to a different checkpoint",
+        )
+    return Finding(16, title, PASS, f"scored weights {scored[:16]} as inspected")
+
+
 def routing_floor(report: dict[str, Any] | None) -> float | None:
     """The measured routing term, below which a difference ranks nothing.
 
@@ -759,6 +797,7 @@ LAWS: tuple[tuple[int, Callable[[Campaign], Finding]], ...] = (
     (12, law_12_reusable_reference),
     (14, law_14_component_attribution),
     (15, law_15_domain_disclosure),
+    (16, law_16_weight_binding),
 )
 
 
@@ -889,6 +928,7 @@ def build_receipt(c: Campaign, findings: list[Finding]) -> dict[str, Any]:
         "overridden_laws": overrides,
         "comparability_key": comparability_key(c),
         "candidate": c.report.get("student_model"),
+        "candidate_weights_sha256": c.report.get("student_weights_sha256"),
         "mean_kld": c.report.get("mean_kld"),
         "findings": [f.as_dict() for f in findings],
     }
@@ -930,6 +970,11 @@ def main() -> int:
         help="per-domain report JSON from fidelity/strata.py, required for a "
         "stratified suite (Law 15)",
     )
+    parser.add_argument(
+        "--inspection",
+        help="the candidate's inspect.json, which carries the digest the scored "
+        "report must be bound to (Law 16)",
+    )
     parser.add_argument("--approvals", help="recorded deviations JSON (Law 13)")
     parser.add_argument("--out", help="write the receipt here")
     args = parser.parse_args()
@@ -954,6 +999,7 @@ def main() -> int:
         repeat_study=_load(args.repeat_study),
         attribution=_load(args.attribution),
         strata=_load(args.strata),
+        inspection=_load(args.inspection),
         approvals=_load(args.approvals) or {},
     )
 

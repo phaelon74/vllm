@@ -711,7 +711,15 @@ def _routing_info(model_path: str) -> dict[str, Any] | None:
         "num_local_experts",
         "moe_num_experts",
     )
-    topk_keys = ("num_experts_per_tok", "moe_topk", "num_experts_per_token")
+    topk_keys = (
+        "num_experts_per_tok",
+        "moe_topk",
+        "num_experts_per_token",
+        # Gemma 4's name for it. vLLM already reads this; recording None here
+        # would report a declared top-k of unknown for a model that declares 8.
+        "top_k_experts",
+        "moe_top_k",
+    )
     for section in (config, config.get("text_config") or {}):
         experts = next(
             (section[key] for key in count_keys if isinstance(section.get(key), int)),

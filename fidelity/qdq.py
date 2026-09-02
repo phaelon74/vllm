@@ -72,11 +72,17 @@ COMPONENT_PATTERNS: dict[str, tuple[str, ...]] = {
         r"\.mlp\.router\.weight$",
         r"\.block_sparse_moe\.gate\.weight$",
         r"\.feed_forward\.router\.weight$",
+        # Gemma 4 hangs the router off the layer and splits it into a projection
+        # and two 1-D scales. Only the projection is a matmul operand.
+        r"\.router\.proj\.weight$",
     ),
     "experts": (
         r"\.mlp\.experts\.",
         r"\.block_sparse_moe\.experts\.",
         r"\.feed_forward\.experts\.",
+        # Gemma 4 has no MoE wrapper module: the fused stacks sit directly on the
+        # layer as `layers.N.experts.gate_up_proj`.
+        r"\.layers\.\d+\.experts\.",
     ),
     "shared_expert": (
         r"\.mlp\.shared_expert\.",
@@ -99,6 +105,12 @@ NEVER = (
     r"^lm_head\.weight$",
     r"\.lm_head\.weight$",
     r"norm\.weight$",
+    # Scoring runs --language-model-only, so a vision tower contributes nothing
+    # to the logits being compared. Its `self_attn` projections would otherwise
+    # be swept into the attention cell, whose cost the run cannot observe.
+    r"^model\.vision_tower\.",
+    r"^model\.embed_vision\.",
+    r"^vision_tower\.",
 )
 
 COMPONENTS = tuple(COMPONENT_PATTERNS)
@@ -578,6 +590,36 @@ def names_sha256(names: list[str] | set[str]) -> str:
     return hashlib.sha256("\n".join(sorted(names)).encode("utf-8")).hexdigest()
 
 
+def weights_identity(model: str) -> str:
+    """Digest of the weights on disk at `model`, from headers only.
+
+    Two checkpoints share this digest only if they carry the same tensor names
+    at the same dtypes and shapes, sharded into files of the same names and
+    sizes. It is what binds a score to the weights that produced it: a
+    directory repopulated from a different repo cannot keep the same digest,
+    and a verbatim re-upload under a new name cannot change it.
+
+    Tensor data is not read, so this costs a directory listing and one header
+    per shard even on a checkpoint of hundreds of gigabytes.
+    """
+    from safetensors import safe_open
+
+    lines: list[str] = []
+    for fname in sorted(os.listdir(model)):
+        if not fname.endswith(".safetensors"):
+            continue
+        path = os.path.join(model, fname)
+        lines.append(f"{fname} {os.path.getsize(path)}")
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            for key in sorted(handle.keys()):
+                sliced = handle.get_slice(key)
+                shape = ",".join(str(dim) for dim in sliced.get_shape())
+                lines.append(f"  {key} {sliced.get_dtype()} [{shape}]")
+    if not lines:
+        raise SystemExit(f"no safetensors weights at {model} to bind a score to")
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
 def inspect_for_disk(report: dict[str, Any]) -> dict[str, Any]:
     """Inspect JSON without the name list, which is tens of thousands of strings.
 
@@ -812,6 +854,7 @@ def inspect(model: str) -> dict[str, Any]:
 
     return {
         "model": os.path.abspath(model),
+        "weights_sha256": weights_identity(model),
         "quant_method": quant.get("quant_method"),
         "declared": {
             key: quant.get(key)
@@ -1426,6 +1469,37 @@ def selftest() -> int:
         assert actual == expected, f"{name}: classified {actual}, expected {expected}"
     print("  router and gate_proj do not alias; components are disjoint")
 
+    # Gemma 4 puts no MoE wrapper between the layer and its experts, names the
+    # router `router.proj`, keeps a dense MLP in every layer beside the expert
+    # block, and ships a vision tower whose attention the scored graph never
+    # touches. Every one of these was silently unmatched.
+    gemma = {
+        "model.language_model.layers.0.experts.gate_up_proj": "experts",
+        "model.language_model.layers.0.experts.down_proj": "experts",
+        "model.language_model.layers.0.router.proj.weight": "router",
+        "model.language_model.layers.0.mlp.gate_proj.weight": "dense_mlp",
+        "model.language_model.layers.0.mlp.down_proj.weight": "dense_mlp",
+        "model.language_model.layers.0.self_attn.q_proj.weight": "attention",
+        "model.language_model.layers.0.self_attn.k_norm.weight": None,
+        "model.language_model.layers.0.router.scale": None,
+        "model.language_model.layers.0.router.per_expert_scale": None,
+        "model.language_model.layers.0.layer_scalar": None,
+        "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight": None,
+        "model.vision_tower.encoder.layers.0.mlp.gate_proj.linear.weight": None,
+        "model.embed_vision.embedding_projection.weight": None,
+    }
+    for name, expected in gemma.items():
+        actual = classify(name, COMPONENTS)
+        assert actual == expected, f"{name}: classified {actual}, expected {expected}"
+    assert _fused_constituents(
+        "model.language_model.layers.0.experts.gate_up_proj", (128, 1408, 2816)
+    ) == {
+        f"model.language_model.layers.0.experts.{e}.{leaf}.weight"
+        for e in range(128)
+        for leaf in ("gate_proj", "up_proj")
+    }
+    print("  Gemma 4 experts, router, dense MLP, and vision tower classify")
+
     import tempfile
     from safetensors.torch import save_file
 
@@ -1478,7 +1552,29 @@ def selftest() -> int:
         assert disk["quantized_names_sha256"] == names_sha256(
             report["quantized_names"]
         )
+        identity = report["weights_sha256"]
+        assert identity == weights_identity(root), "identity is not stable"
+        assert disk["weights_sha256"] == identity, "identity must survive to disk"
+        # A pack that differs only in one tensor's dtype is a different pack.
+        with tempfile.TemporaryDirectory() as other:
+            save_file(
+                {
+                    "model.layers.0.self_attn.q_proj.qweight": torch.zeros(
+                        64, 8, dtype=torch.int32
+                    ),
+                    "model.layers.0.self_attn.q_proj.scales": torch.zeros(
+                        64, 8, dtype=torch.float32
+                    ),
+                    "model.layers.0.mlp.gate.weight": torch.zeros(
+                        32, 32, dtype=torch.bfloat16
+                    ),
+                    "lm_head.weight": torch.zeros(32, 32, dtype=torch.bfloat16),
+                },
+                os.path.join(other, "model.safetensors"),
+            )
+            assert weights_identity(other) != identity, "dtype drift went unseen"
     print("  inspect reads packed AWQ scales and coverage denominators")
+    print("  weights_identity binds a checkpoint to its tensors and shards")
 
     from safetensors import safe_open
 

@@ -23,7 +23,7 @@ from typing import Any
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from redaction import redact_env  # noqa: E402 - sibling module
 
-LAWS_VERSION = 7
+LAWS_VERSION = 8
 PROGRAM = "Local Inference Lab"
 # Vendor calibration on packed int4. QDQ still matches format only.
 _CALIBRATED_ALGORITHMS = frozenset({"awq", "gptq", "autoround"})
@@ -110,6 +110,12 @@ def _identity(
         ("Reference checkpoint", str(manifest.get("reference_model"))),
         ("Reference config SHA-256", _short(manifest.get("reference_config_sha256"))),
         ("Candidate checkpoint", str(report.get("student_model"))),
+        (
+            "Candidate weights SHA-256",
+            _short(report["student_weights_sha256"], 16)
+            if report.get("student_weights_sha256")
+            else "unbound (Law 16 gap)",
+        ),
         ("Suite", str(caps.get("suite_id") or "run-time tokenization (Law 3 gap)")),
         ("Suite token SHA-256", _short(manifest.get("token_sha256"), 16)),
         ("Capture manifest SHA-256", _short(report.get("capture_manifest_sha256"), 16)),

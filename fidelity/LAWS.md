@@ -1,6 +1,6 @@
 # Local Inference Lab — Distribution Fidelity Laws
 
-**Laws version:** 7
+**Laws version:** 8
 **Status:** draft, pending coordination with `local-inference-lab` on the
 publication namespace and suite format.
 
@@ -50,6 +50,17 @@ or none did. Both of those are measurement outcomes a rescore reproduces
 exactly. Version 7 states which case holds and publishes a saturated candidate
 with its deployed mean marked unranked. This is a relabeling, not a rescore: a
 version-6 receipt becomes a version-7 receipt by reassembling it.
+
+Version 8 adds Law 16. Versions 1 through 7 bound a report to its tokens, its
+capture, and its reference, and never to the candidate weights themselves: the
+report named a directory, and nothing said what that directory held when it was
+read. Two candidates in one campaign then published the same mean from different
+checkpoints, which is only possible if one was scored against the other's
+weights, and every law passed. Version 8 requires the digest of the scored
+tensors on the report and refuses a family in which distinct weights produced an
+identical mean. A version-7 report whose weights were released cannot be bound
+after the fact; it publishes under a recorded Law 13 deviation saying so, or it
+is rescored.
 
 These laws govern every distribution-fidelity measurement this program
 publishes. They are not guidance. The pipeline refuses to produce or upload an
@@ -498,6 +509,50 @@ A suite that declares fewer than two strata is `not_applicable`.
 to describe, and for a zero-baseline or bounded-prefix run that is not published
 as a candidate measurement. Not permitted for a published candidate on a
 stratified suite.
+
+## Law 16 — Candidate weight binding
+
+**Required.** A published result carries a digest of the weights it scored, taken
+from the checkpoint at the moment it was read, and that digest must match the
+inspection of the candidate the artifact publishes. Within one family, two
+candidates whose digests differ must not report the same mean.
+
+**Why.** Every other binding in these laws points at the inputs a candidate was
+measured against — the tokens under Law 3, the capture under Law 5, the reference
+under Law 12 — and none of them points at the candidate. A report named a path,
+and a path is not evidence. A directory that was repopulated, or a scorer handed
+the wrong one of two similarly named checkpoints, produces a fully compliant
+artifact attributing one vendor's numbers to another's work. That is the worst
+error this program can make, because it is invisible: the number is real, the
+receipt is honest, and the name on it is wrong.
+
+**Digest, not a file list.** The bond is over tensor names, dtypes, and shapes,
+plus each shard's name and size, read from safetensors headers. It costs one
+header per shard rather than a pass over hundreds of gigabytes, and it cannot be
+preserved by a repack: a checkpoint that quantized one more layer, or stored a
+scale at a different width, is a different checkpoint under this digest. Two
+directories that share it hold the same weights, whatever their repos are called.
+
+**The same mean from different weights is refused, not explained.** Distinct
+quantizations of one reference do not land on an identical mean to eighteen
+digits; a suite of this size does not produce that coincidence. When it appears,
+one report was scored against the other's checkpoint, and nothing in the
+artifacts says which. Both results are withdrawn and rescored. The converse —
+two candidates sharing a digest — is not an error in the measurement but a fact
+about the upstream repositories: one is a verbatim re-upload of the other. It
+publishes once, and the artifact names the re-upload as such rather than
+presenting it as an independent quantization.
+
+**Check.** The compliance receipt requires `student_weights_sha256` on the report
+and an inspection of the published candidate carrying the same digest.
+Assembly refuses a family containing an identical mean across differing digests,
+and reports a shared digest as a duplicate.
+
+**Override.** Permitted under Law 13 only for a result scored before this law
+existed whose weights have since been released, where no digest can be recovered
+without a rescore. The deviation is printed beside the number, which then states
+that its weights are unbound. Not permitted for a new measurement, and never
+permitted for a refused identical mean.
 
 ## Numbering
 

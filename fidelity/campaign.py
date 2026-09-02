@@ -686,6 +686,75 @@ def score_report(
     return os.path.join(config.work, "reports", f"{tag}.json")
 
 
+def bind_weights(report_path: str, student: str) -> str | None:
+    """Record on the report the identity of the weights that were scored.
+
+    Returns the digest, or None when the weights are already gone. A report that
+    cites a different digest than the directory now holds is refused rather than
+    rewritten: the two disagree about what was measured, and only a rescore can
+    settle it.
+    """
+    sys.path.insert(0, HERE)
+    import qdq
+
+    if not os.path.isdir(student):
+        return None
+    try:
+        digest = qdq.weights_identity(student)
+    except SystemExit as exc:
+        # Law 16 reports the gap on the receipt. Discarding a finished score over
+        # an unhashable checkpoint would cost a GPU-hour and prove nothing.
+        print(f"WARNING  cannot bind {student}: {exc}", file=sys.stderr)
+        return None
+    with open(report_path, encoding="utf-8") as handle:
+        report = json.load(handle)
+    recorded = report.get("student_weights_sha256")
+    if recorded and recorded != digest:
+        raise CampaignError(
+            f"{os.path.basename(report_path)} was scored against weights "
+            f"{recorded[:16]} but {student} now holds {digest[:16]}. The report "
+            f"and the checkpoint disagree about what was measured; rescore."
+        )
+    if recorded:
+        return digest
+    report["student_weights_sha256"] = digest
+    with open(report_path, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(report, handle, indent=2)
+        handle.write("\n")
+    return digest
+
+
+def weight_collisions(
+    scored: list[tuple[str, Any, str | None]],
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Split a family's candidates into impossible pairs and honest duplicates.
+
+    Two candidates that scored the same mean from different weights is not a
+    coincidence a suite of this size produces; it is one checkpoint measured
+    twice, and both numbers are refused because nothing says which directory
+    the scorer actually read. Two candidates that share a digest are the same
+    weights under two names, which is a real finding about the upstream repos
+    rather than a defect here, so they are reported and published once.
+
+    Returns (impossible, duplicates), each a list of name pairs.
+    """
+    impossible: list[tuple[str, str]] = []
+    duplicates: list[tuple[str, str]] = []
+    for i, (name, mean, digest) in enumerate(scored):
+        for other, other_mean, other_digest in scored[i + 1:]:
+            same_weights = bool(digest) and digest == other_digest
+            if same_weights:
+                duplicates.append((name, other))
+            elif (
+                isinstance(mean, (int, float))
+                and mean == other_mean
+                and digest
+                and other_digest
+            ):
+                impossible.append((name, other))
+    return impossible, duplicates
+
+
 def score_one(
     config: Config,
     python: str,
@@ -719,6 +788,7 @@ def score_one(
 
     if os.path.isfile(report):
         print(f"=== {tag} already scored")
+        bind_weights(report, student)
         return report, capture
 
     capture_environment(config, python)
@@ -772,6 +842,7 @@ def score_one(
     })
     if rc != 0:
         raise CampaignError(f"scoring failed for {tag}; see {log}")
+    bind_weights(report, student)
     return report, capture
 
 
@@ -1753,6 +1824,9 @@ def cmd_assemble(config: Config, python: str, force: bool = False) -> int:
             strata = os.path.join(cand_dir, "strata.json")
             if os.path.isfile(strata):
                 cmd += ["--strata", strata]
+            inspection = os.path.join(cand_dir, "inspect.json")
+            if os.path.isfile(inspection):
+                cmd += ["--inspection", inspection]
             if config.approvals and os.path.isfile(config.approvals):
                 cmd += ["--approvals", config.approvals]
             if _run(cmd) != 0:
@@ -1783,6 +1857,33 @@ def cmd_assemble(config: Config, python: str, force: bool = False) -> int:
                 "--label", f"{model.name} / {cand.name}",
                 "--out", os.path.join(cand_dir, "report.md"),
             ])
+
+        scored_weights: list[tuple[str, Any, str | None]] = []
+        for cand in model.candidates:
+            path = os.path.join(model_root, cand.name, "report.json")
+            if not os.path.isfile(path):
+                continue
+            with open(path, encoding="utf-8") as handle:
+                record = json.load(handle)
+            scored_weights.append((
+                cand.name,
+                record.get("mean_kld"),
+                record.get("student_weights_sha256"),
+            ))
+        impossible, duplicates = weight_collisions(scored_weights)
+        for left, right in duplicates:
+            print(
+                f"DUPLICATE {left} and {right} are byte-identical weights under "
+                f"two names; publish one and disclose the other as a re-upload."
+            )
+        for left, right in impossible:
+            print(
+                f"IMPOSSIBLE {left} and {right} carry different weights and the "
+                f"same mean KLD, so at least one was scored against the other's "
+                f"checkpoint. Both are refused; rescore them.",
+                file=sys.stderr,
+            )
+            failures.extend([left, right])
 
         # Rewrite checksums so they cover the receipts and one-pagers too.
         _run([python, os.path.join(HERE, "artifact.py"), "checksums",
@@ -1967,7 +2068,40 @@ def selftest() -> int:
         _deployed_quantization,
         _derived_terms,
     )
-    from compliance import routing_floor, routing_floor_state
+    from compliance import (
+        Campaign as _Campaign,
+        law_16_weight_binding,
+        routing_floor,
+        routing_floor_state,
+    )
+
+    def _binding(scored: str | None, inspected: str | None) -> str:
+        return law_16_weight_binding(
+            _Campaign(
+                report={"student_weights_sha256": scored} if scored else {},
+                manifest={},
+                manifest_path="",
+                inspection={"weights_sha256": inspected} if inspected else None,
+            )
+        ).status
+
+    assert _binding("a" * 64, "a" * 64) == "pass"
+    assert _binding("a" * 64, "b" * 64) == "fail", "wrong weights went unseen"
+    assert _binding(None, "a" * 64) == "fail", "an unbound report must not pass"
+    assert _binding("a" * 64, None) == "fail", "nothing to check against"
+
+    # Same mean from different weights is one checkpoint scored twice; a shared
+    # digest is one upload under two names.
+    impossible, duplicates = weight_collisions([
+        ("mse", 0.0345, "a" * 64),
+        ("plain", 0.0345, "b" * 64),
+        ("rebrand", 0.09, "c" * 64),
+        ("original", 0.09, "c" * 64),
+    ])
+    assert impossible == [("mse", "plain")], impossible
+    assert duplicates == [("rebrand", "original")], duplicates
+    # An unbound report cannot be accused of either.
+    assert weight_collisions([("a", 0.1, None), ("b", 0.1, None)]) == ([], [])
 
     assert "calibration benefit" in _beyond_rounding_what("awq", -0.01)
     assert "beat round-to-nearest" in _beyond_rounding_what("awq", -0.01)
