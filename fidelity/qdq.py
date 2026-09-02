@@ -512,6 +512,62 @@ def _int4_from_compressed_tensors(quant: dict[str, Any]) -> dict[str, Any] | Non
     return None
 
 
+def _nvfp4_declared_scheme(quant: dict[str, Any]) -> dict[str, Any] | None:
+    """NVFP4 declared by a config, or None.
+
+    NVFP4 is a 4-bit float on a 16-element block, so it is neither an int4
+    grouping nor an FP8 granularity and no other reader here recognizes it. Left
+    undetected, a compressed-tensors pack reports no scheme at all and a modelopt
+    pack is mistaken for per-tensor FP8, because its scalar `weight_scale_2`
+    global scale looks exactly like one.
+    """
+    if not isinstance(quant, dict):
+        return None
+    method = str(quant.get("quant_method") or "").lower()
+    group: Any = None
+    algorithm: str | None = None
+
+    if method == "modelopt":
+        inner = quant.get("quantization")
+        section = inner if isinstance(inner, dict) else quant
+        if str(section.get("quant_algo") or "").upper() != "NVFP4":
+            return None
+        group = section.get("group_size")
+        algorithm = "modelopt"
+    elif method == "compressed-tensors":
+        if "nvfp4" not in str(quant.get("format") or "").lower():
+            groups = quant.get("config_groups")
+            if not isinstance(groups, dict):
+                return None
+            for entry in groups.values():
+                weights = (entry or {}).get("weights")
+                if not isinstance(weights, dict):
+                    continue
+                if (
+                    str(weights.get("type") or "").lower() == "float"
+                    and _as_int(weights.get("num_bits")) == 4
+                ):
+                    group = weights.get("group_size")
+                    break
+            else:
+                return None
+        else:
+            for entry in (quant.get("config_groups") or {}).values():
+                weights = (entry or {}).get("weights")
+                if isinstance(weights, dict):
+                    group = weights.get("group_size")
+                    break
+        algorithm = "round_to_nearest"
+    else:
+        return None
+
+    return {
+        "scheme": "nvfp4",
+        "group_size": _as_int(group) or 16,
+        "algorithm": algorithm,
+    }
+
+
 def _int4_declared_scheme(quant: dict[str, Any]) -> dict[str, Any] | None:
     """Format name, group size, and algorithm from a packed int4 config.
 
@@ -602,11 +658,24 @@ def _scale_shapes(model: str) -> dict[str, tuple[int, ...]]:
                 if _is_scale_key(key):
                     scale_shapes[key] = tuple(f.get_slice(key).get_shape())
     found: dict[str, tuple[int, ...]] = {}
-    for scale_key, shape in scale_shapes.items():
+    for scale_key, shape in sorted(scale_shapes.items()):
         operand = _operand_from_scale_key(scale_key, all_keys)
-        if operand is not None:
-            found[operand] = shape
+        if operand is None:
+            continue
+        # An operand can carry both a per-block scale and a scalar global scale.
+        # The finer one describes the granularity; letting shard order decide
+        # would report a 16-element block as per-tensor FP8.
+        if operand in found and _elements(found[operand]) >= _elements(shape):
+            continue
+        found[operand] = shape
     return found
+
+
+def _elements(shape: tuple[int, ...]) -> int:
+    total = 1
+    for dim in shape:
+        total *= dim
+    return total
 
 
 def scheme_block_size(scheme: str, block_size: int | None) -> int | None:
@@ -862,6 +931,7 @@ def inspect(model: str) -> dict[str, Any]:
     reason = unloadable_reason_from_config(config)
     quark_scheme = _quark_declared_scheme(quant)
     _refuse_mixed_bit_widths(quant)
+    nvfp4 = _nvfp4_declared_scheme(quant)
     int4 = _int4_declared_scheme(quant)
 
     scales = _scale_shapes(model)
@@ -886,13 +956,11 @@ def inspect(model: str) -> dict[str, Any]:
     # Packed int4 scale/weight shapes are not FP8 granularities. A qweight's
     # packed last dim would otherwise look like a block scale.
     if not packed_scales:
-        for weight, scale_shape in scales.items():
+        for weight, scale_shape in sorted(scales.items()):
             shape = weight_shapes.get(weight)
             if not shape or len(shape) < 2:
                 continue
-            elements = 1
-            for dim in scale_shape:
-                elements *= dim
+            elements = _elements(scale_shape)
             if elements == 1:
                 granularity = "fp8_per_tensor"
             elif elements == shape[0]:
@@ -906,7 +974,11 @@ def inspect(model: str) -> dict[str, Any]:
     detected_scheme = quark_scheme
     detected_block = block
     quant_algorithm: str | None = None
-    if detected_scheme is None and int4 is not None:
+    if detected_scheme is None and nvfp4 is not None:
+        detected_scheme = nvfp4["scheme"]
+        detected_block = nvfp4["group_size"]
+        quant_algorithm = nvfp4["algorithm"]
+    elif detected_scheme is None and int4 is not None:
         detected_scheme = int4["scheme"]
         detected_block = int4["group_size"]
         quant_algorithm = int4["algorithm"]
@@ -1263,6 +1335,68 @@ def selftest() -> int:
     eight_bit = {"quant_method": "awq", "bits": 8, "group_size": 128}
     assert _int4_declared_scheme(eight_bit) is None
     print("  declared int4 schemes: awq/gptq/ct/autoround")
+
+    # NVFP4 is a 4-bit float on a 16-element block: neither an int4 grouping nor
+    # an FP8 granularity. Undetected, compressed-tensors packs report no scheme
+    # and modelopt packs are mistaken for per-tensor FP8.
+    for label, quant in (
+        (
+            "compressed-tensors format",
+            {
+                "quant_method": "compressed-tensors",
+                "format": "nvfp4-pack-quantized",
+                "config_groups": {
+                    "group_0": {
+                        "weights": {"num_bits": 4, "type": "float", "group_size": 16}
+                    }
+                },
+            },
+        ),
+        (
+            "compressed-tensors groups",
+            {
+                "quant_method": "compressed-tensors",
+                "config_groups": {
+                    "group_0": {
+                        "weights": {"num_bits": 4, "type": "float", "group_size": 16}
+                    }
+                },
+            },
+        ),
+        (
+            "modelopt nested",
+            {
+                "quant_method": "modelopt",
+                "quantization": {"quant_algo": "NVFP4", "group_size": 16},
+            },
+        ),
+        (
+            "modelopt flat",
+            {"quant_method": "modelopt", "quant_algo": "NVFP4"},
+        ),
+    ):
+        found = _nvfp4_declared_scheme(quant)
+        assert found is not None, label
+        assert found["scheme"] == "nvfp4", label
+        assert found["group_size"] == 16, (label, found)
+        # Never an algorithm the artifact treats as calibrated: NVFP4 packs here
+        # round to nearest, and claiming calibration would credit work not done.
+        assert found["algorithm"] in ("round_to_nearest", "modelopt"), label
+    # An int4 compressed-tensors pack and an FP8 config are not NVFP4.
+    assert _nvfp4_declared_scheme(
+        {
+            "quant_method": "compressed-tensors",
+            "config_groups": {
+                "group_0": {"weights": {"num_bits": 4, "type": "int", "group_size": 128}}
+            },
+        }
+    ) is None
+    assert _nvfp4_declared_scheme(
+        {"quant_method": "modelopt", "quantization": {"quant_algo": "FP8"}}
+    ) is None
+    assert _nvfp4_declared_scheme({"quant_method": "fp8"}) is None
+    assert scheme_block_size("nvfp4", 16) == 16
+    print("  NVFP4 is detected from compressed-tensors and modelopt configs")
 
     # A 16-bit override names a module left alone, which is how AutoRound
     # spells "int4-mixed"; every such module carries no scale and drops out of
