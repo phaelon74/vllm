@@ -191,8 +191,10 @@ writes `inspect.json` so the format matrix is known before GPU time is spent.
 A checkpoint whose `config.json` will crash vLLM on load (for example a Quark
 W4A16 export whose `algo_config` is a list of dicts, which
 `WeightsMapper.apply_list` cannot map) is refused from `config.json` alone.
-That is a skipped candidate, not an EngineCore abort, and installing
-`amd-quark` does not change it. The same check refuses a grouped int4 pack whose
+That is a refused candidate, not an EngineCore abort, and installing
+`amd-quark` does not change it. A refusal is reported and counted apart from a
+failure, because nothing went wrong: the absence is disclosed with its reason.
+The same check refuses a grouped int4 pack whose
 group size does not divide the model's expert width: the exporter pads the
 reduction dimension and stores one group more than it carries, vLLM allocates for
 the unpadded width, and the expert weight loader fails on the length mismatch.

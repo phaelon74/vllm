@@ -72,6 +72,14 @@ class CampaignError(Exception):
     """One candidate failed; the campaign may continue with the rest."""
 
 
+class CandidateRefused(CampaignError):
+    """The checkpoint cannot be measured, and the reason is known and stated.
+
+    Distinct from a failure: nothing went wrong here, so it must not be counted
+    as though something had. A refused candidate is a disclosed absence.
+    """
+
+
 @dataclass
 class Candidate:
     name: str
@@ -432,11 +440,11 @@ def inspect_checkpoint(
 
 
 def refuse_if_unloadable(path: str) -> None:
-    """Raise CampaignError if config.json says vLLM will crash on load."""
+    """Refuse the candidate if config.json says vLLM will crash on load."""
     import qdq as _qdq
     reason = _qdq.unloadable_reason(path)
     if reason:
-        raise CampaignError(f"will not load: {reason}")
+        raise CandidateRefused(f"will not load: {reason}")
 
 
 def fetch_checkpoint(repo: str, dest: str, revision: str | None) -> int:
@@ -1432,6 +1440,7 @@ def cmd_score(config: Config, python: str) -> int:
     preflight_suite(config)
     os.makedirs(config.work, exist_ok=True)
     failed: list[str] = []
+    refused: list[str] = []
 
     for model in config.models:
         print(f"\n##### {model.name}")
@@ -1484,11 +1493,21 @@ def cmd_score(config: Config, python: str) -> int:
             try:
                 ensure_candidate_weights(config, cand)
                 _score_candidate(config, python, model, cand, routed)
+            except CandidateRefused as exc:
+                print(f"REFUSED {cand.name}: {exc}", file=sys.stderr)
+                refused.append(f"{model.name}/{cand.name}")
+                continue
             except CampaignError as exc:
                 print(f"FAILED  {cand.name}: {exc}", file=sys.stderr)
                 failed.append(f"{model.name}/{cand.name}")
                 continue
             maybe_release(config, cand)
+    if refused:
+        print(
+            f"\n{len(refused)} candidate(s) refused, with reasons stated above: "
+            f"{', '.join(refused)}",
+            file=sys.stderr,
+        )
     if failed:
         print(
             f"\n{len(failed)} candidate(s) failed: {', '.join(failed)}",
