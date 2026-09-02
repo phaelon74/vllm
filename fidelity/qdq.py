@@ -514,6 +514,37 @@ def _int4_declared_scheme(quant: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _refuse_mixed_bit_widths(quant: dict[str, Any]) -> None:
+    """Refuse a checkpoint that declares two quantized widths in one config.
+
+    An AutoRound-style `extra_config` names per-module overrides. A 16-bit or
+    wider entry names a module left alone, which carries no scale and drops
+    out of the matched set on its own. A narrower width that disagrees with
+    the global one is a second format, and one cell rounding both at the
+    global scheme would over-round the coarser half while reporting an exact
+    match.
+    """
+    global_width = _as_int(quant.get("bits"))
+    offenders: dict[str, int] = {}
+    for module, override in (quant.get("extra_config") or {}).items():
+        if not isinstance(override, dict):
+            continue
+        width = _as_int(override.get("bits"))
+        if width is None or width >= 16:
+            continue
+        if global_width is None or width != global_width:
+            offenders[str(module)] = width
+    if not offenders:
+        return
+    module, width = sorted(offenders.items())[0]
+    extra = f" and {len(offenders) - 1} more" if len(offenders) > 1 else ""
+    raise SystemExit(
+        f"{module} is declared at {width} bits against a global "
+        f"{global_width}{extra}. A cell carries one scheme, so matching this "
+        f"checkpoint needs per-tensor schemes, not just per-tensor names."
+    )
+
+
 def _scale_shapes(model: str) -> dict[str, tuple[int, ...]]:
     """Map each quantized weight to its scale's shape, reading headers only.
 
@@ -711,6 +742,7 @@ def inspect(model: str) -> dict[str, Any]:
     quant = config.get("quantization_config") or {}
     reason = unloadable_reason_from_config(config)
     quark_scheme = _quark_declared_scheme(quant)
+    _refuse_mixed_bit_widths(quant)
     int4 = _int4_declared_scheme(quant)
 
     scales = _scale_shapes(model)
@@ -1112,6 +1144,36 @@ def selftest() -> int:
     eight_bit = {"quant_method": "awq", "bits": 8, "group_size": 128}
     assert _int4_declared_scheme(eight_bit) is None
     print("  declared int4 schemes: awq/gptq/ct/autoround")
+
+    # A 16-bit override names a module left alone, which is how AutoRound
+    # spells "int4-mixed"; every such module carries no scale and drops out of
+    # the matched set already. An 8-bit override is a second format.
+    kept_in_bf16 = {
+        "quant_method": "auto-round",
+        "bits": 4,
+        "group_size": 128,
+        "extra_config": {
+            "model.layers.0.mlp.gate": {"bits": 16},
+            "model.layers.0.self_attn.q_proj": {"bits": 16, "data_type": "fp"},
+        },
+    }
+    _refuse_mixed_bit_widths(kept_in_bf16)
+    try:
+        _refuse_mixed_bit_widths(
+            {
+                "quant_method": "auto-round",
+                "bits": 4,
+                "group_size": 128,
+                "extra_config": {
+                    "model.layers.0.self_attn.q_proj": {"bits": 8}
+                },
+            }
+        )
+    except SystemExit as exc:
+        assert "per-tensor schemes" in str(exc)
+    else:
+        raise AssertionError("two quantized widths in one config must refuse")
+    print("  mixed widths: 16-bit overrides pass, 8-bit beside 4-bit refuses")
 
     keys = {
         "model.layers.0.self_attn.q_proj.qweight",
