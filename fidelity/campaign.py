@@ -980,14 +980,15 @@ def _append_deployed_ladder(
         return
     if any(entry.get("scheme") == deployed_scheme for entry in ladder):
         return
-    ladder.append(
-        {
-            "scheme": deployed_scheme,
-            "mean_kld": expert.get("mean_kld"),
-            "variant": expert.get("variant"),
-            "report": expert.get("report"),
-        }
-    )
+    rung = {
+        "scheme": deployed_scheme,
+        "mean_kld": expert.get("mean_kld"),
+        "variant": expert.get("variant"),
+        "report": expert.get("report"),
+    }
+    if expert.get("unavailable"):
+        rung["unavailable"] = expert["unavailable"]
+    ladder.append(rung)
 
 
 def attribute_model(
@@ -1154,6 +1155,18 @@ def attribute_model(
 
     ladder = []
     for scheme in config.ladder:
+        # A rung whose grid the reference's shapes cannot carry is reported
+        # absent with its reason. Padding to fit would change the scales, and a
+        # rung measured under a padding no deployment used is worse than a gap.
+        reason = qdq.unexpressible_reason(
+            model.reference_path, ("experts",), scheme
+        )
+        if reason:
+            print(f"Law 14: ladder rung {scheme} unavailable - {reason}")
+            ladder.append(
+                {"scheme": scheme, "mean_kld": None, "unavailable": reason}
+            )
+            continue
         entry = score_variant("experts", scheme, per_tensor=False)
         ladder.append(
             {
@@ -1163,10 +1176,22 @@ def attribute_model(
                 "report": entry["report"],
             }
         )
-    deployed_rung = score_variant(
-        "experts", deployed_scheme, per_tensor=False
+    deployed_reason = (
+        qdq.unexpressible_reason(model.reference_path, ("experts",), deployed_scheme)
+        if deployed_scheme
+        else None
     )
-    _append_deployed_ladder(ladder, deployed_scheme, deployed_rung)
+    if deployed_reason:
+        print(f"Law 14: deployed rung {deployed_scheme} unavailable - {deployed_reason}")
+        _append_deployed_ladder(
+            ladder, deployed_scheme, {"mean_kld": None, "unavailable": deployed_reason}
+        )
+    else:
+        _append_deployed_ladder(
+            ladder,
+            deployed_scheme,
+            score_variant("experts", deployed_scheme, per_tensor=False),
+        )
     attribution["ladder"] = ladder
 
     out = os.path.join(config.work, "attribution", f"{deployed.name}.json")
@@ -2089,6 +2114,33 @@ def selftest() -> int:
     assert _binding("a" * 64, "b" * 64) == "fail", "wrong weights went unseen"
     assert _binding(None, "a" * 64) == "fail", "an unbound report must not pass"
     assert _binding("a" * 64, None) == "fail", "nothing to check against"
+
+    # A complete approval publishes a report that predates binding, and cannot
+    # publish one whose digest contradicts the checkpoint beside it.
+    from compliance import evaluate as _evaluate
+
+    def _law16(scored: str | None, inspected: str) -> tuple[str, str]:
+        camp = _Campaign(
+            report={"student_weights_sha256": scored} if scored else {},
+            manifest={},
+            manifest_path="",
+            inspection={"weights_sha256": inspected},
+            approvals={
+                "16": {
+                    "approver": "selftest",
+                    "justification": "weights released before Law 16 existed",
+                    "timestamp": "2026-09-02T00:00:00Z",
+                }
+            },
+        )
+        found = next(f for f in _evaluate(camp) if f.law == 16)
+        return found.status, found.detail
+
+    status, _ = _law16(None, "a" * 64)
+    assert status == "override", "an unbound legacy report must be excusable"
+    status, detail = _law16("a" * 64, "b" * 64)
+    assert status == "fail", "a contradicted digest must not be overridable"
+    assert "permits no override" in detail, detail
 
     # Same mean from different weights is one checkpoint scored twice; a shared
     # digest is one upload under two names.

@@ -585,6 +585,54 @@ def _scale_shapes(model: str) -> dict[str, tuple[int, ...]]:
     return found
 
 
+def _scheme_granularity(scheme: str, block_size: int | None) -> int | None:
+    """The edge a scheme's scales are laid out on, or None if it has no grid."""
+    group = parse_int4_scheme(scheme)
+    if group is not None:
+        size = group[0]
+        return None if size == -1 else size
+    if scheme == "fp8_block":
+        return block_size or 128
+    if scheme == "nvfp4":
+        return block_size or 16
+    if scheme == "mxfp8":
+        return 32
+    return None
+
+
+def unexpressible_reason(
+    model: str,
+    selected: tuple[str, ...],
+    scheme: str,
+    block_size: int | None = None,
+) -> str | None:
+    """Why `scheme` cannot round `model`'s selected weights, or None if it can.
+
+    A blocked or grouped scheme lays its scales on a fixed grid, and a weight
+    whose shape is not a multiple of that grid cannot carry them. A real
+    quantizer pads, which changes the scales and so changes what is being
+    measured, so the ladder reports such a rung as absent with this reason
+    rather than guessing at a padding the deployed checkpoint never used.
+    `fp8_block` is square, so it constrains both dimensions; every other grid
+    applies along the reduction dimension only.
+    """
+    edge = _scheme_granularity(scheme, block_size)
+    if edge is None:
+        return None
+    for name, shape in sorted(_component_shapes(model, selected).items()):
+        if len(shape) < 2:
+            continue
+        dims = shape[-2:] if scheme == "fp8_block" else shape[-1:]
+        offenders = [dim for dim in dims if dim % edge]
+        if offenders:
+            return (
+                f"{scheme} lays scales on a {edge}-wide grid and "
+                f"{os.path.basename(name)} is {'x'.join(str(d) for d in shape)}, "
+                f"whose {offenders[0]} is not a multiple of {edge}"
+            )
+    return None
+
+
 def names_sha256(names: list[str] | set[str]) -> str:
     """Stable digest of a tensor-name set, independent of input order."""
     return hashlib.sha256("\n".join(sorted(names)).encode("utf-8")).hexdigest()
@@ -1500,6 +1548,18 @@ def selftest() -> int:
     }
     print("  Gemma 4 experts, router, dense MLP, and vision tower classify")
 
+    for scheme, edge in (
+        ("fp8_block", 128),
+        ("nvfp4", 16),
+        ("mxfp8", 32),
+        ("int4_g64_sym", 64),
+        ("int4_g-1_sym", None),
+        ("fp8_per_channel", None),
+        ("fp8_per_tensor", None),
+    ):
+        assert _scheme_granularity(scheme, None) == edge, scheme
+
+
     import tempfile
     from safetensors.torch import save_file
 
@@ -1574,6 +1634,26 @@ def selftest() -> int:
             )
             assert weights_identity(other) != identity, "dtype drift went unseen"
     print("  inspect reads packed AWQ scales and coverage denominators")
+
+    # Gemma 4's moe_intermediate_size is 704, which no 128-wide grid divides.
+    # fp8_block therefore has no rung on it, while every narrower grid does.
+    with tempfile.TemporaryDirectory() as root:
+        save_file(
+            {
+                "model.layers.0.experts.gate_up_proj": torch.zeros(
+                    4, 1408, 2816, dtype=torch.bfloat16
+                ),
+                "model.layers.0.experts.down_proj": torch.zeros(
+                    4, 2816, 704, dtype=torch.bfloat16
+                ),
+            },
+            os.path.join(root, "model.safetensors"),
+        )
+        blocked = unexpressible_reason(root, ("experts",), "fp8_block")
+        assert blocked and "704" in blocked and "128" in blocked, blocked
+        for fine in ("nvfp4", "mxfp8", "int4_g64_sym", "fp8_per_channel"):
+            assert unexpressible_reason(root, ("experts",), fine) is None, fine
+    print("  a ladder rung the reference's shapes cannot carry is refused early")
     print("  weights_identity binds a checkpoint to its tensors and shards")
 
     from safetensors import safe_open

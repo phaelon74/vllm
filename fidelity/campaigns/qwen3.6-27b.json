@@ -10,6 +10,7 @@
   "storage": "hidden",
   "max_num_seqs": 1,
   "fetch": "lease",
+  "approvals": "fidelity/approvals/unbound-legacy-weights.json",
   "models": [
     {
       "name": "Qwen3.6-27B",

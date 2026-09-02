@@ -65,6 +65,10 @@ class Finding:
     status: str
     detail: str
     approval: dict[str, Any] | None = None
+    # A law in OVERRIDABLE may still hold absolutely for a particular failure.
+    # Law 16 permits an approval for a report that carries no digest, and none at
+    # all for one whose digest contradicts the checkpoint being published.
+    absolute: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -722,6 +726,7 @@ def law_16_weight_binding(c: Campaign) -> Finding:
             f"the report scored weights {scored[:16]} but the candidate this "
             f"artifact publishes inspects to {inspected[:16]}; the score belongs "
             f"to a different checkpoint",
+            absolute=True,
         )
     return Finding(16, title, PASS, f"scored weights {scored[:16]} as inspected")
 
@@ -842,7 +847,7 @@ def evaluate(c: Campaign) -> list[Finding]:
         finding = check(c)
         if finding.status == FAIL:
             approval = _approval_for(c, law)
-            if approval is not None and law in OVERRIDABLE:
+            if approval is not None and law in OVERRIDABLE and not finding.absolute:
                 spread = repeat_spread(c.repeat_study)
                 if law == 1 and spread is None:
                     finding.detail += (
@@ -860,7 +865,8 @@ def evaluate(c: Campaign) -> list[Finding]:
                         )
             elif approval is not None:
                 finding.detail += (
-                    " (an approval was supplied but this law permits no override)"
+                    " (an approval was supplied but this failure permits no "
+                    "override)"
                 )
             elif c.approvals.get(str(law)) or c.approvals.get(f"law_{law}"):
                 incomplete_approvals.append(law)

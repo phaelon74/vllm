@@ -10,6 +10,7 @@
   "storage": "hidden",
   "max_num_seqs": 1,
   "fetch": "lease",
+  "approvals": "fidelity/approvals/unbound-legacy-weights.json",
   "tensor_parallel_size": 2,
   "models": [
     {

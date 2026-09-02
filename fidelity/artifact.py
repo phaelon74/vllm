@@ -880,7 +880,11 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
             [
                 (
                     str(entry.get("scheme")),
-                    _kld(entry.get("mean_kld")),
+                    (
+                        "not expressible"
+                        if entry.get("unavailable")
+                        else _kld(entry.get("mean_kld"))
+                    ),
                     str(entry.get("variant") or ""),
                     _link(entry),
                 )
@@ -889,6 +893,16 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
             ("Scheme", "Experts-only mean KLD", "Variant", "Support"),
         )
         out.append("")
+        for entry in ladder:
+            reason = entry.get("unavailable")
+            if reason:
+                out += [
+                    f"`{entry.get('scheme')}` has no rung on this model: "
+                    f"{reason}. Padding the weight to fit the grid would change "
+                    f"the scales, so the rung is reported absent rather than "
+                    f"measured under a layout no checkpoint deploys.",
+                    "",
+                ]
     out += [
         "Full cells, digests, and the deployed checkpoint's inspection are in "
         "[attribution.json](attribution.json).",

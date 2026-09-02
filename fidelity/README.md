@@ -571,7 +571,10 @@ sweep against.
 
 A deviation needs a named approver, a written justification, and a timestamp
 (Law 13). Anything less is not an approval and the underlying failure stands.
-Only Laws 1, 8, 11, 12, and 14 permit an override at all.
+Only Laws 1, 8, 11, 12, 14, and 16 permit an override at all, and Law 16 permits
+one only for a report that carries no weight digest. A digest that contradicts the
+published checkpoint is absolute: an approval there would excuse the single error
+the law exists to catch, so it is rejected even when the approval is complete.
 
 ```json
 {
