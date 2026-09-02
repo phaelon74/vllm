@@ -585,8 +585,13 @@ def _scale_shapes(model: str) -> dict[str, tuple[int, ...]]:
     return found
 
 
-def _scheme_granularity(scheme: str, block_size: int | None) -> int | None:
-    """The edge a scheme's scales are laid out on, or None if it has no grid."""
+def scheme_block_size(scheme: str, block_size: int | None) -> int | None:
+    """The edge a scheme's scales are laid out on, or None if it has no grid.
+
+    This is the scheme's own convention, which is what a ladder rung must use.
+    A rung's width cannot come from the candidate beside it: the ladder exists
+    to hold the weight set and the grid fixed while only the format changes.
+    """
     group = parse_int4_scheme(scheme)
     if group is not None:
         size = group[0]
@@ -616,7 +621,7 @@ def unexpressible_reason(
     `fp8_block` is square, so it constrains both dimensions; every other grid
     applies along the reduction dimension only.
     """
-    edge = _scheme_granularity(scheme, block_size)
+    edge = scheme_block_size(scheme, block_size)
     if edge is None:
         return None
     for name, shape in sorted(_component_shapes(model, selected).items()):
@@ -1557,7 +1562,7 @@ def selftest() -> int:
         ("fp8_per_channel", None),
         ("fp8_per_tensor", None),
     ):
-        assert _scheme_granularity(scheme, None) == edge, scheme
+        assert scheme_block_size(scheme, None) == edge, scheme
 
 
     import tempfile
@@ -1912,7 +1917,8 @@ def main() -> int:
     matched: dict[str, Any] | None = None
     if args.match:
         matched = inspect(args.match)
-        if scheme is None:
+        inherited_scheme = scheme is None
+        if inherited_scheme:
             scheme = matched["detected_scheme"]
             if scheme is None:
                 parser.error(
@@ -1920,18 +1926,16 @@ def main() -> int:
                     f"scheme to match; pass --scheme explicitly"
                 )
             print(f"matched scheme {scheme} from {os.path.basename(args.match)}")
-        if block_size is None and matched.get("detected_block") is not None:
-            block_size = matched["detected_block"]
+        # A block edge belongs to the scheme it was measured on. Inheriting an
+        # int4 group size into an explicitly named fp8_block produces a
+        # different format under the same label, and a ladder whose rung width
+        # depends on the candidate beside it compares nothing.
+        if block_size is None and inherited_scheme:
+            block_size = matched.get("detected_block")
     if scheme is None:
         parser.error("pass --scheme, or --match a quantized checkpoint")
     if block_size is None:
-        int4 = INT4_SCHEME_RE.fullmatch(scheme)
-        if int4 is not None:
-            block_size = int(int4.group(1))
-        elif scheme == "nvfp4":
-            block_size = 16
-        else:
-            block_size = 128
+        block_size = scheme_block_size(scheme, None) or 128
 
     device = args.device
     if device is None:

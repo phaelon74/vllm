@@ -865,6 +865,15 @@ def variant_path(
     return os.path.join(config.work, "variants", name)
 
 
+def _manifest_block(path: str) -> int | None:
+    """The grid a built variant recorded, or None if it did not record one."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle).get("block_size")
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def build_variant(
     config: Config,
     python: str,
@@ -875,22 +884,32 @@ def build_variant(
     *,
     per_tensor: bool = False,
     expect_digest: str | None = None,
+    block_size: int | None = None,
 ) -> str:
     """Build a QDQ variant if absent, and return its path.
 
     The weights are deleted once its report exists (`prune_variants`), because a
     scheme ladder is several checkpoint copies and the report plus the QDQ
     manifest are what an artifact publishes.
+
+    A variant path names its components and scheme but not its grid, so an
+    existing one is reused only when its manifest records the same block size.
+    Otherwise two widths would share a directory under one label.
     """
     out = variant_path(
         config, reference, components, scheme, match_digest=expect_digest
     )
     name = os.path.basename(out)
-    if os.path.isfile(os.path.join(out, "qdq-manifest.json")) and glob.glob(
-        os.path.join(out, "*.safetensors")
-    ):
-        print(f"=== variant {name} already built")
-        return out
+    manifest = os.path.join(out, "qdq-manifest.json")
+    if os.path.isfile(manifest) and glob.glob(os.path.join(out, "*.safetensors")):
+        if block_size is None or _manifest_block(manifest) == block_size:
+            print(f"=== variant {name} already built")
+            return out
+        print(
+            f"=== rebuilding {name}: it was rounded on a "
+            f"{_manifest_block(manifest)}-wide grid, not {block_size}",
+            file=sys.stderr,
+        )
     cmd = [
         python, os.path.join(HERE, "qdq.py"),
         "--model", reference,
@@ -900,6 +919,8 @@ def build_variant(
     ]
     if scheme:
         cmd += ["--scheme", scheme]
+    if block_size is not None:
+        cmd += ["--block-size", str(block_size)]
     if per_tensor:
         cmd += ["--per-tensor"]
     if expect_digest:
@@ -1041,6 +1062,14 @@ def attribute_model(
         parts = tuple(
             part.strip() for part in components.split(",") if part.strip()
         )
+        # A cell decomposes this deployment, so it is rounded on the grid the
+        # deployment used. A rung at any other scheme is rounded on that
+        # scheme's own grid, never on the neighbouring candidate's.
+        block = (
+            inspection.get("detected_block")
+            if scheme == deployed_scheme
+            else None
+        ) or (qdq.scheme_block_size(scheme, None) if scheme else None)
         digest = (
             qdq.match_digest(model.reference_path, inspection, parts)
             if per_tensor
@@ -1059,6 +1088,18 @@ def attribute_model(
             scheme,
             match_digest=digest,
         )
+        # A variant path names its components and scheme but not its grid, so a
+        # report left by a different width would otherwise be reused under this
+        # label. Refuse rather than guess which one the number describes.
+        built = os.path.join(variant, "qdq-manifest.json")
+        recorded = _manifest_block(built) if os.path.isfile(built) else None
+        if block is not None and recorded is not None and recorded != block:
+            raise CampaignError(
+                f"{os.path.basename(variant)} was rounded on a {recorded}-wide "
+                f"grid but this rung is {block}-wide. Its report describes a "
+                f"format this label does not name; delete {variant} and the "
+                f"report beside it, then rescore."
+            )
         # `prune_variants` deletes a variant's weights once it is scored, so
         # rebuilding before checking for the report writes a full checkpoint
         # copy to disk only to discard it again.
@@ -1072,6 +1113,7 @@ def attribute_model(
                 components, scheme,
                 per_tensor=per_tensor,
                 expect_digest=digest,
+                block_size=block,
             )
         report, _ = score_one(
             config, python, label, variant, model.reference_path, config.rows,
@@ -1177,7 +1219,12 @@ def attribute_model(
             }
         )
     deployed_reason = (
-        qdq.unexpressible_reason(model.reference_path, ("experts",), deployed_scheme)
+        qdq.unexpressible_reason(
+            model.reference_path,
+            ("experts",),
+            deployed_scheme,
+            inspection.get("detected_block"),
+        )
         if deployed_scheme
         else None
     )
