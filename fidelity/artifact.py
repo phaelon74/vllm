@@ -531,7 +531,7 @@ def _deployed_quantization(deployed: dict[str, Any]) -> list[str]:
         )
         out += [
             f"Partial coverage in {', '.join(partial)}. Component cells round "
-            f"exactly the {matched} tensors the checkpoint quantizes, not every "
+            f"exactly the {matched} weights the checkpoint quantizes, not every "
             f"weight whose name matches a pattern.",
             "",
         ]

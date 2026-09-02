@@ -35,8 +35,12 @@ Version 6 changes what Law 14 cells match. Versions 2 through 5 selected
 weights by component name pattern and rounded every match, so a mixed-precision
 checkpoint that quantized only some attention or expert weights produced a
 composite cell heavier than the deployment it claimed to decompose. Version 6
-matches per tensor. A version-5 receipt for a partly quantized candidate is
-not a version-6 receipt and must be rescored, not relabeled.
+matches per tensor. Because a reference may fuse what a pack names separately —
+one `experts.gate_up_proj` stack against a quantized pack's per-expert names —
+each quantized name is resolved to the reference tensor that carries it, and a
+fused tensor the pack covers only in part is refused rather than rounded whole.
+A version-5 receipt for a partly quantized candidate is not a version-6
+receipt and must be rescored, not relabeled.
 
 These laws govern every distribution-fidelity measurement this program
 publishes. They are not guidance. The pipeline refuses to produce or upload an

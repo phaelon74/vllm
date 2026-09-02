@@ -558,13 +558,18 @@ def inspect_for_disk(report: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _component_names(model: str, selected: tuple[str, ...]) -> set[str]:
-    """Canonical `.weight` names in `model` that classify into `selected`."""
+def _component_shapes(
+    model: str, selected: tuple[str, ...]
+) -> dict[str, tuple[int, ...]]:
+    """Canonical names in `model` that classify into `selected`, with shapes.
+
+    Headers only; no tensor data is read.
+    """
     from safetensors import safe_open
 
-    names: set[str] = set()
+    shapes: dict[str, tuple[int, ...]] = {}
     if not os.path.isdir(model):
-        return names
+        return shapes
     for fname in sorted(os.listdir(model)):
         if not fname.endswith(".safetensors"):
             continue
@@ -574,8 +579,95 @@ def _component_names(model: str, selected: tuple[str, ...]) -> set[str]:
             for key in handle.keys():
                 canonical = _as_weight_name(key) or key
                 if classify(canonical, selected) is not None:
-                    names.add(canonical)
-    return names
+                    shapes[canonical] = tuple(handle.get_slice(key).get_shape())
+    return shapes
+
+
+def _component_names(model: str, selected: tuple[str, ...]) -> set[str]:
+    """Canonical `.weight` names in `model` that classify into `selected`."""
+    return set(_component_shapes(model, selected))
+
+
+_FUSED_EXPERT_MEMBERS: dict[str, tuple[str, ...]] = {
+    "gate_up_proj": ("gate_proj", "up_proj"),
+    "gate_proj": ("gate_proj",),
+    "up_proj": ("up_proj",),
+    "down_proj": ("down_proj",),
+}
+
+_EXPERT_STACK = re.compile(r"^(?P<prefix>.+\.experts)\.(?P<leaf>[^.]+)$")
+
+
+def _fused_constituents(name: str, shape: tuple[int, ...]) -> set[str] | None:
+    """Per-expert names carried by a fused expert stack, or None if not one.
+
+    A reference that stores experts fused holds `experts.gate_up_proj` with
+    shape `[num_experts, ...]` where a quantized pack names the same weights
+    `experts.<e>.gate_proj.weight`. Enumerating the stack's members is what
+    lets a per-tensor cell decide whether a pack covers the whole stack.
+    """
+    if len(shape) != 3:
+        return None
+    hit = _EXPERT_STACK.match(name)
+    if hit is None:
+        return None
+    members = _FUSED_EXPERT_MEMBERS.get(hit.group("leaf"))
+    if members is None:
+        return None
+    prefix = hit.group("prefix")
+    return {
+        f"{prefix}.{index}.{member}.weight"
+        for index in range(shape[0])
+        for member in members
+    }
+
+
+def resolve_matched(
+    reference: str, selected: tuple[str, ...], matched: set[str] | list[str]
+) -> set[str]:
+    """Reference tensor names that carry the weights named in `matched`.
+
+    Names present in the reference resolve to themselves. A per-expert name
+    resolves to the fused stack that holds it. A stack the pack covers only in
+    part is refused: rounding it whole would over-round the experts the pack
+    left alone, and rounding it in part is not a tensor-level operation.
+    """
+    wanted = {
+        name for name in matched if classify(name, selected) is not None
+    }
+    shapes = _component_shapes(reference, selected)
+    resolved = wanted & set(shapes)
+    remaining = wanted - resolved
+    partial: list[tuple[str, int, int]] = []
+    for name, shape in sorted(shapes.items()):
+        members = _fused_constituents(name, shape)
+        if not members:
+            continue
+        covered = members & remaining
+        if not covered:
+            continue
+        if covered != members:
+            partial.append((name, len(covered), len(members)))
+            continue
+        resolved.add(name)
+        remaining -= covered
+    if partial:
+        name, covered, total = partial[0]
+        extra = f" and {len(partial) - 1} more" if len(partial) > 1 else ""
+        raise SystemExit(
+            f"{name} is a fused stack of {total} expert weights and the "
+            f"checkpoint quantized {covered} of them{extra}. Rounding the "
+            f"stack whole would over-round the rest, so this cell cannot "
+            f"match the checkpoint exactly."
+        )
+    if remaining:
+        missing = sorted(remaining)
+        extra = f" and {len(missing) - 1} more" if len(missing) > 1 else ""
+        raise SystemExit(
+            f"{len(missing)} matched weight(s) have no counterpart in "
+            f"{reference}: {missing[0]}{extra}"
+        )
+    return resolved
 
 
 def match_digest(
@@ -583,40 +675,21 @@ def match_digest(
     inspection: dict[str, Any],
     components: tuple[str, ...] | list[str],
 ) -> str | None:
-    """Short digest of the matched name set, or None when it equals the
-    reference's full set for those components.
+    """Short digest of the reference tensors a cell would round, or None when
+    that is every tensor the components own.
 
     Returning None is what keeps a fully-covered cell on the path (and the
-    report) a component-wide conversion already wrote.
+    report) a component-wide conversion already wrote. The digest covers
+    reference names, not the pack's, so a fused and an unfused pack that touch
+    the same weights land on the same cell.
     """
     selected = tuple(components)
-    matched = [
-        name
-        for name in inspection.get("quantized_names") or []
-        if classify(name, selected) is not None
-    ]
-    if set(matched) == _component_names(reference, selected):
-        return None
-    return names_sha256(matched)[:MATCH_DIGEST_LEN]
-
-
-def _refuse_name_drift(
-    model: str, selected: tuple[str, ...], only: set[str]
-) -> None:
-    """A matched name absent from the reference would round nothing silently."""
-    present = _component_names(model, selected)
-    missing = [
-        name
-        for name in sorted(only)
-        if classify(name, selected) is not None and name not in present
-    ]
-    if not missing:
-        return
-    extra = f" and {len(missing) - 1} more" if len(missing) > 1 else ""
-    raise SystemExit(
-        f"{len(missing)} matched weight(s) are absent from {model}: "
-        f"{missing[0]}{extra}"
+    resolved = resolve_matched(
+        reference, selected, inspection.get("quantized_names") or []
     )
+    if resolved == _component_names(reference, selected):
+        return None
+    return names_sha256(resolved)[:MATCH_DIGEST_LEN]
 
 
 def inspect(model: str) -> dict[str, Any]:
@@ -795,10 +868,12 @@ def convert(
 ) -> dict[str, Any]:
     """Copy a checkpoint, rounding the selected components through `scheme`.
 
-    `only` restricts rounding to that name set (canonical `.weight` names).
-    A name in `only` that classifies into `selected` but is absent from
-    `model` is a hard error: the cell would otherwise look like a match
-    and round nothing.
+    `only` restricts rounding to that name set (canonical `.weight` names as
+    the quantized pack spells them). Each is resolved to the reference tensor
+    that carries it, which for a fused expert stack is one tensor per many
+    names. A name with no counterpart, or a stack the pack covers only in
+    part, is a hard error: the cell would otherwise look like a match while
+    rounding nothing, or more than the pack did.
     """
     import torch
     from safetensors import safe_open
@@ -806,7 +881,7 @@ def convert(
 
     _assert_unquantized(model)
     if only is not None:
-        _refuse_name_drift(model, selected, only)
+        only = resolve_matched(model, selected, only)
     os.makedirs(out, exist_ok=True)
 
     shards = sorted(
@@ -1391,7 +1466,7 @@ def selftest() -> int:
                 only={"model.layers.0.mlp.experts.99.gate_proj.weight"},
             )
         except SystemExit as exc:
-            assert "absent" in str(exc)
+            assert "no counterpart" in str(exc)
         else:
             raise AssertionError("name drift must be refused")
         full = {"quantized_names": [kept, rounded]}
@@ -1400,6 +1475,52 @@ def selftest() -> int:
         digest = match_digest(ref, part, ("experts",))
         assert digest is not None and len(digest) == MATCH_DIGEST_LEN
         assert digest == match_digest(ref, part, ("experts",))
+
+        # A reference that fuses experts names two stacks where a pack names
+        # six per-expert weights. Without resolution every pack looks like
+        # total name drift, which is how four int4 cells came to refuse.
+        fused = os.path.join(root, "fused")
+        os.makedirs(fused)
+        stem = "model.layers.0.mlp.experts"
+        save_file(
+            {
+                f"{stem}.gate_up_proj": torch.randn(2, 4, 8, dtype=torch.bfloat16),
+                f"{stem}.down_proj": torch.randn(2, 8, 4, dtype=torch.bfloat16),
+            },
+            os.path.join(fused, "model.safetensors"),
+        )
+        with open(
+            os.path.join(fused, "config.json"), "w", encoding="utf-8", newline="\n"
+        ) as handle:
+            json.dump({"hidden_size": 8}, handle)
+        per_expert = {
+            f"{stem}.{index}.{proj}.weight"
+            for index in range(2)
+            for proj in ("gate_proj", "up_proj", "down_proj")
+        }
+        assert resolve_matched(fused, ("experts",), per_expert) == {
+            f"{stem}.gate_up_proj",
+            f"{stem}.down_proj",
+        }
+        assert match_digest(fused, {"quantized_names": sorted(per_expert)},
+                            ("experts",)) is None
+        try:
+            resolve_matched(
+                fused, ("experts",), per_expert - {f"{stem}.1.up_proj.weight"}
+            )
+        except SystemExit as exc:
+            assert "fused stack" in str(exc)
+        else:
+            raise AssertionError("a partly covered fused stack must be refused")
+        down_only = {f"{stem}.{index}.down_proj.weight" for index in range(2)}
+        fused_manifest = convert(
+            fused, os.path.join(root, "fused-out"), ("experts",),
+            "fp8_per_tensor", 128, "cpu", only=down_only,
+        )
+        assert fused_manifest["tensors_rounded"] == 1, (
+            "rounding both experts' down_proj must round the one stack that "
+            "holds them, and leave gate_up_proj alone"
+        )
         match_dir = os.path.join(root, "match")
         os.makedirs(match_dir)
         save_file(
@@ -1437,24 +1558,21 @@ def selftest() -> int:
 
 
 def check_names(reference: str, match: str) -> int:
-    """Refuse (exit 1) if MATCH quantized a name the reference does not have."""
+    """Refuse (exit 1) if MATCH names weights the reference cannot resolve."""
     inspection = inspect(match)
-    present = _component_names(reference, COMPONENTS)
-    missing = [
-        name
-        for name in inspection.get("quantized_names") or []
-        if classify(name, COMPONENTS) is not None and name not in present
-    ]
+    quantized = inspection.get("quantized_names") or []
+    try:
+        resolved = resolve_matched(reference, COMPONENTS, quantized)
+    except SystemExit as exc:
+        print(f"{os.path.basename(match)}: {exc}")
+        return 1
+    total = len(_component_names(reference, COMPONENTS))
     print(
-        f"{os.path.basename(match)}: "
-        f"{len(inspection.get('quantized_names') or [])} quantized, "
-        f"{len(missing)} absent from {os.path.basename(reference)}"
+        f"{os.path.basename(match)}: {len(quantized)} quantized names resolve "
+        f"to {len(resolved)} of {total} reference tensors in "
+        f"{os.path.basename(reference)}"
     )
-    for name in missing[:20]:
-        print(f"  {name}")
-    if len(missing) > 20:
-        print(f"  ... and {len(missing) - 20} more")
-    return 1 if missing else 0
+    return 0
 
 
 def main() -> int:
