@@ -584,6 +584,18 @@ def test_v1_v2_engine_kld_parity(monkeypatch, tmp_path):
     assert all(value == 0.0 for value in results[0].kld_ref_to_model)
 
 
+def test_nonfinite_logits_are_refused_not_summarized():
+    """A NaN mean must never reach a report; it propagates silently otherwise."""
+    from vllm.v1.sample.kld import compute_kld_chunk
+
+    torch.manual_seed(4)
+    ref = torch.randn(4, 32)
+    model = ref.clone()
+    model[2, 5] = float("nan")
+    with pytest.raises(ValueError, match="not finite at"):
+        compute_kld_chunk(model, ref)
+
+
 def test_shared_helper_is_deterministic():
     """V1 and V2 both call compute_kld_chunk; identical inputs must match."""
     from vllm.v1.sample.kld import compute_kld_chunk

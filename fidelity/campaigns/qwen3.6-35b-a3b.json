@@ -12,6 +12,13 @@
   "fetch": "lease",
   "approvals": "fidelity/approvals/unbound-legacy-weights.json",
   "tensor_parallel_size": 2,
+  "excluded_candidates": [
+    {
+      "hf_repo": "ykarout/Qwen3.6-35B-A3B-NVFP4",
+      "revision": "5093c2a1d4d263007b563753438caf75dadaec48",
+      "reason": "Its forward pass emits NaN hidden states: every one of the 63569920 logits in the first scored window is non-finite, with the hidden states themselves already NaN before the head. No mean can be computed, so there is nothing to score rather than a poor score to report. Not a defect of this pipeline; the other NVFP4 candidates of this family score at the same tensor-parallel size."
+    }
+  ],
   "models": [
     {
       "name": "Qwen3.6-35B-A3B",
@@ -50,12 +57,6 @@
           "path": "/media/fmodels2/unsloth/Qwen3.6-35B-A3B-NVFP4-Fast",
           "hf_repo": "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast",
           "revision": "1c3f884bc99aac2524f6d49bcbac8c88401afd66"
-        },
-        {
-          "name": "ykarout-Qwen3.6-35B-A3B-NVFP4",
-          "path": "/media/fmodels2/ykarout/Qwen3.6-35B-A3B-NVFP4",
-          "hf_repo": "ykarout/Qwen3.6-35B-A3B-NVFP4",
-          "revision": "5093c2a1d4d263007b563753438caf75dadaec48"
         },
         {
           "name": "Qwen3.6-35B-A3B-AWQ-4bit",

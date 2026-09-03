@@ -288,6 +288,19 @@ def compute_kld_chunk(
     log_ref = F.log_softmax(ref, dim=-1)
     kld_rm = F.kl_div(log_model, log_ref, reduction="none", log_target=True).sum(-1)
     kld_mr = F.kl_div(log_ref, log_model, reduction="none", log_target=True).sum(-1)
+    # Every path that produces a published mean passes through here, so this is
+    # the one place that can guarantee the mean is a number. A candidate whose
+    # forward pass emits NaN would otherwise be summarized, ranked, and
+    # published, because a NaN propagates through a mean without complaint.
+    if not bool(torch.isfinite(kld_rm).all() and torch.isfinite(kld_mr).all()):
+        bad = int((~torch.isfinite(kld_rm)).sum())
+        raise ValueError(
+            f"KLD is not finite at {bad} of {kld_rm.numel()} positions. "
+            f"Candidate logits reach {float(model.abs().max()):.4g} and the "
+            f"reference's {float(ref.abs().max()):.4g}; a NaN or an infinity in "
+            f"either makes the mean meaningless, so it is refused rather than "
+            f"summarized."
+        )
     ref_prob = log_ref.exp()
     ref_top1_prob, ref_top1 = ref_prob.max(dim=-1)
     model_top1 = log_model.argmax(dim=-1)
