@@ -246,11 +246,20 @@ def test_forced_topk_uses_student_weights(scoring_func, renormalize):
     logits = torch.tensor([[3.0, 1.0, -1.0, 0.0]])
     forced_ids = torch.tensor([[2, 0]], dtype=torch.int32)
 
-    weights, selected_ids = router.select_forced_experts(
-        hidden_states=torch.empty(1, 1),
-        router_logits=logits,
-        forced_topk_ids=forced_ids,
-    )
+    with patch(
+        "vllm.model_executor.layers.fused_moe.router."
+        "fused_topk_router.fused_topk",
+        return_value=(
+            torch.tensor([[0.8, 0.2]]),
+            torch.tensor([[0, 1]], dtype=torch.int32),
+            torch.empty(1, 2, dtype=torch.int32),
+        ),
+    ):
+        weights, selected_ids = router.select_forced_experts(
+            hidden_states=torch.empty(1, 1),
+            router_logits=logits,
+            forced_topk_ids=forced_ids,
+        )
 
     scores = (
         torch.softmax(logits, dim=-1)
@@ -262,6 +271,29 @@ def test_forced_topk_uses_student_weights(scoring_func, renormalize):
         expected = expected / expected.sum(dim=-1, keepdim=True)
     assert torch.equal(selected_ids, forced_ids)
     torch.testing.assert_close(weights, expected)
+
+
+def test_forced_topk_reuses_native_weights_for_matching_routes():
+    router = FusedTopKRouter(top_k=2, global_num_experts=4)
+    forced_ids = torch.tensor([[2, 0]], dtype=torch.int32)
+    native_weights = torch.tensor([[0.625, 0.375]])
+
+    with patch(
+        "vllm.model_executor.layers.fused_moe.router."
+        "fused_topk_router.fused_topk",
+        return_value=(
+            native_weights,
+            forced_ids,
+            torch.empty(1, 2, dtype=torch.int32),
+        ),
+    ):
+        weights, _ = router.select_forced_experts(
+            hidden_states=torch.empty(1, 1),
+            router_logits=torch.tensor([[3.0, 1.0, 2.0, 0.0]]),
+            forced_topk_ids=forced_ids,
+        )
+
+    assert torch.equal(weights, native_weights)
 
 
 def test_forced_ids_are_captured_before_eplb_mapping():

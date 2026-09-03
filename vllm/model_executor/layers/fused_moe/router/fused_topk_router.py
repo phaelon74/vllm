@@ -184,9 +184,23 @@ class FusedTopKRouter(BaseRouter):
         *,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return compute_forced_routing_weights(
+        forced_weights = compute_forced_routing_weights(
             router_logits,
             forced_topk_ids,
             scoring_func=self.scoring_func,
             renormalize=self.renormalize,
         )
+        natural_weights, natural_ids, _ = fused_topk(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            topk=self.top_k,
+            renormalize=self.renormalize,
+            indices_type=forced_topk_ids.dtype,
+            scoring_func=self.scoring_func,
+        )
+        matching_rows = torch.all(
+            natural_ids == forced_topk_ids,
+            dim=-1,
+            keepdim=True,
+        )
+        return torch.where(matching_rows, natural_weights, forced_weights)
