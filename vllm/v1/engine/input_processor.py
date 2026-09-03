@@ -420,6 +420,14 @@ class InputProcessor:
         reference_logits_path = decoder_input.get("reference_logits_path")
         reference_logits_key = decoder_input.get("reference_logits_key")
         kld_vocab_size = decoder_input.get("kld_vocab_size")
+        reference_routing_path = decoder_input.get("reference_routing_path")
+        reference_routing_sha256 = decoder_input.get("reference_routing_sha256")
+        if reference_routing_path is not None and not (
+            sampling_params is not None and sampling_params.kld_mode
+        ):
+            raise VLLMValidationError(
+                "reference_routing_path is fidelity-only and requires kld_mode."
+            )
 
         if sampling_params is not None and sampling_params.score_mode:
             if target_token_ids is None:
@@ -453,6 +461,12 @@ class InputProcessor:
                     "kld_mode requires a positive kld_vocab_size in "
                     "TokensPrompt so padded vocabulary rows are excluded."
                 )
+            if (reference_routing_path is None) != (
+                reference_routing_sha256 is None
+            ):
+                raise VLLMValidationError(
+                    "BxQ routing path and SHA256 must be provided together."
+                )
 
         return EngineCoreRequest(
             request_id=request_id,
@@ -474,6 +488,8 @@ class InputProcessor:
             reference_logits_path=reference_logits_path,
             reference_logits_key=reference_logits_key,
             kld_vocab_size=kld_vocab_size,
+            reference_routing_path=reference_routing_path,
+            reference_routing_sha256=reference_routing_sha256,
         )
 
     def _validate_prompt_len(

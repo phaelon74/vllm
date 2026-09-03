@@ -1,6 +1,6 @@
 # Local Inference Lab — Distribution Fidelity Laws
 
-**Laws version:** 8
+**Laws version:** 10
 **Status:** draft, pending coordination with `local-inference-lab` on the
 publication namespace and suite format.
 
@@ -74,6 +74,15 @@ takes more precision from the digits than was measured, and refuses a real
 disagreement with the field, the position, and both values named. A version-8
 receipt from a single-worker run becomes a version-9 receipt by reassembling it;
 a multi-worker candidate that version 8 refused must be scored.
+
+Version 10 replaces Law 14's synthetic component-cell interpretation with a
+paired routed-model intervention. QxQ is the unchanged quantized candidate under
+its natural routing. BxQ is the same candidate with the BF16 teacher's expert IDs
+forced while the student computes its own gating weights for those experts.
+Earlier `expert_cell`, `router_cell`, and `composite_cell` results remain useful
+synthetic QDQ diagnostics, but none measured BxQ or QxQ. Routed candidates must
+therefore be rescored for BxQ; an existing deployed report may supply QxQ only
+after the paired-run controls and bindings are established.
 
 These laws govern every distribution-fidelity measurement this program
 publishes. They are not guidance. The pipeline refuses to produce or upload an
@@ -391,107 +400,70 @@ indistinguishable from a bug.
 
 **Override.** None. This law has no exceptions.
 
-## Law 14 — Component attribution on routed models
+## Law 14 — Routed-model QxQ/BxQ intervention
 
-**Required.** For a checkpoint that routes tokens to experts, a fidelity number
-does not publish as a single mean. The artifact carries, measured on the same
-tokens against the same reference and at the deployed checkpoint's own scheme and
-granularity:
+**Required.** A reference that routes tokens to experts publishes a paired
+intervention over the identical frozen tokens:
 
-1. the **expert cell** — the reference with only its expert weights rounded
-   through the deployed scheme;
-2. the **measured routing divergence** — the candidate's own expert selections
-   compared against the reference's over the same frozen tokens;
-3. the **router weight cell** — the reference with only its router rounded, or
-   `not_applicable` with inspection evidence when the deployed checkpoint leaves
-   the router unquantized;
-4. the **deployed cell** — the candidate as it ships.
+1. **QxQ** (`qxq_cell`) is the unchanged quantized candidate running normally,
+   with its natural expert IDs and its own gating weights.
+2. **BxQ** (`bxq_cell`) is that same unchanged quantized candidate with the BF16
+   teacher's ordered logical expert IDs forced at every routed layer. The student
+   computes the gating weights for those forced experts from its own router
+   logits, using its native scoring, bias, normalization, and scaling rules.
 
-**Why.** Routing cost saturates, and a saturating term cannot rank anything. A
-perturbation changes an expert selection only when it crosses a near-tie, so the
-count of changed selections is governed by how many near-ties the model has, not
-by how large the perturbation was. Measured on one MoE checkpoint, NVFP4 and
-MXFP8 expert weights differed by a factor of 36 (0.1065 against 0.0030), while the
-deployed means differed by a factor of 1.2 (0.2534 against 0.2119), because a
-routing term near 0.20 dominated both. A reader given only the deployed means
-would conclude the two formats are nearly equivalent. They are not.
+The first axis is the source of the expert IDs: `B` means BF16 teacher IDs and
+`Q` means the quantized student's natural IDs. The second `Q` is the candidate,
+which is identical in both runs. It does not mean "quantized experts" in a
+synthetic checkpoint, and the first axis does not mean router-weight precision.
 
-**Routing is not router precision.** The mechanism is the activations arriving at
-the router, not the router's own weights. A checkpoint that ships its router in
-BF16 has a bit-identical router and still selects different experts, because
-quantized attention and quantized experts upstream have already moved the
-residual stream. It follows that the router weight cell is not the routing term
-and cannot stand in for it: on such a checkpoint that cell is exactly zero while
-routing divergence is not. The cell is retained only as the evidence that router
-weight precision is a red herring.
+**Binding.** Both cells carry `mean_kld`, their supporting report path, partition,
+token SHA-256, reference-config SHA-256, and `candidate_weights_sha256`. Every
+binding equals the deployed report, and QxQ's mean equals the deployed natural
+mean. BxQ additionally carries a 64-hex `routing_trace_sha256`,
+`routing_mode: teacher_ids_student_weights`, and the supported
+`protocol_version`. The trace binds the forced IDs to the same teacher, tokens,
+layer order, and routing geometry used by both scores.
 
-It also follows that no quantize-dequantize cell is routing-free. Rounding any
-weight moves the residual stream, so every router downstream of it sees different
-inputs. An artifact must not describe a cell as holding routing fixed; each cell
-reports the share of its own selections that changed, which is what makes the
-claim checkable rather than assumed.
+**Backend control.** Exact ID replay is a capability, not an assumption.
+`backend_evidence` names the active backend or kernel, and `replay_supported` is
+true only when that path injects logical teacher IDs before placement mapping and
+dispatch. If replay uses a different kernel path, the candidate is first run with
+that path and no override;
+`natural_control_parity.passed` is true only when this natural control agrees
+with the deployed QxQ run within the protocol's declared bound. This prevents a
+backend change from being reported as a routing intervention. The candidate
+weight digest must remain unchanged and `candidate_weights_unchanged` must be
+true.
 
-**Measurement, not emulation.** The routing term is measured by recording the
-reference's selected experts per token and per layer, then comparing the
-candidate's selections over the same tokens. The artifact reports the share of
-(token, layer) selections that changed, the share of scored positions where any
-layer rerouted, the mean divergence at positions where routing held against
-positions where it changed, and how divergence grows with the number of rerouted
-layers.
+**Natural routing divergence.** The QxQ run also measures the student's natural
+expert IDs against the teacher trace. The artifact reports selection flip rate,
+position flip rate, conditional KLD where routing held and flipped, per-layer
+rates, and the existing routing-excess state. Conditioning after the run is not
+BxQ: it observes the subset where routes happened to agree, while BxQ forces the
+teacher IDs over the full suite.
 
-**Floor.** The floor is the excess the mean carries because rerouted positions
-diverge more than positions whose selection survived: the flipped fraction times
-the difference of the two means. It is a floor in the sense Law 1's repeat spread
-is a floor. Two candidates whose deployed means differ by less than it are not
-ranked by that difference, and an artifact that ranks them ranks them on the
-expert cell and says so in the same sentence as the claim.
+**Paired delta.** `routing_intervention_delta = QxQ mean KLD - BxQ mean KLD`.
+It may be positive or negative. It is a paired intervention result, not an
+additive decomposition and not a claim that routing alone contributed that much.
 
-**A floor that is not a number.** The excess is undefined when one of its two
-populations is empty, and the two cases are opposites. If no position rerouted,
-routing cost nothing and the floor is zero. If every position rerouted, no
-held-routing population remains and the floor is unmeasurable — not small, and
-no rescore produces one, because the perturbation is large enough that routing
-divergence is the whole picture. Both satisfy this law when the run measured
-routing and the artifact states which case it is; what the law refuses is a
-routing measurement that never ran, and an artifact that omits the routing term
-so that saturation reads as zero cost. A saturated candidate publishes with its
-deployed mean marked unranked.
+**Synthetic QDQ diagnostics remain synthetic.** `expert_cell`, `router_cell`,
+`composite_cell`, and ladder rungs round selected BF16 weights, run on BF16
+kernels, and route naturally. They may still diagnose weight rounding and report
+their own route flips, but they are never labeled BxQ or QxQ. In particular,
+`expert_cell` is not BxQ because it changes the checkpoint and does not force
+teacher IDs.
 
-**Naming.** Cells are named for the component that carries the error, never as
-`B×Q` or `Q×B`. That notation does not say which factor is the router, and two
-readers will order it two ways and mean opposite things by the same symbol. A cell
-is `expert_cell`, `router_cell`, or `composite_cell`, and a published artifact
-spells out what each one isolates.
+**Check.** For a manifest declaring experts, compliance requires both paired
+cells and all bindings above; exact QxQ/deployed parity; a complete trace digest;
+protocol, backend, and passing natural-control evidence; the exact paired delta;
+and measured natural routing divergence. A manifest declaring no experts is
+`not_applicable`. Missing replay support, stale or unbound traces, failed natural
+control, and missing BxQ are failures. They are never converted into an override
+or a synthetic substitute.
 
-**Weight rounding is not the deployment.** A QDQ cell rounds weights and runs on
-BF16 kernels. A deployed checkpoint may also quantize activations and does use
-quantized kernels, so the artifact reports the deployed mean minus the composite
-cell. On one FP8 MoE checkpoint that term was 40% of the deployed mean, which no
-arrangement of weight-only cells can see. A component decomposition that omits it
-attributes a deployment to weight precision alone and understates it.
-
-**Ladder.** A campaign on a routed reference also scores the expert weights at
-each scheme on its ladder, not only at the deployed one. Ladder rungs are
-component-wide by construction: every expert weight is rounded, so the rungs
-differ only in format. The expert cell that decomposes the deployed mean matches
-per tensor and may therefore round a subset; it is not the deployed ladder rung.
-The cost of one more cell is a QDQ pass and a scoring run against a capture that
-already exists; the cost of not having it is a comparison nobody can make later
-without redoing the campaign.
-
-**Check.** For a reference whose capture manifest records declared experts, the
-compliance receipt requires an expert cell and a router weight cell, each naming
-the variant checkpoint and its QDQ manifest, and each carrying the same partition,
-token digest, and reference config digest as the deployed cell. A cell measured on
-other tokens is not a decomposition of this number and is rejected as one. The
-receipt also requires a measured routing term from the run itself; a routed
-candidate scored without one fails, and an unquantized router is not accepted as
-a reason to omit it.
-
-**Override.** Permitted under Law 13 for a dense checkpoint misdetected as routed,
-and for an exploratory result that is never published as a ranking. Not permitted
-for a published comparison between two quantization schemes, which is the case the
-law exists for.
+**Override.** Not permitted. Dense models satisfy this law as
+`not_applicable`; a routed model without supported exact replay does not.
 
 ## Law 15 — Domain disclosure
 
@@ -558,12 +530,11 @@ artifact attributing one vendor's numbers to another's work. That is the worst
 error this program can make, because it is invisible: the number is real, the
 receipt is honest, and the name on it is wrong.
 
-**Digest, not a file list.** The bond is over tensor names, dtypes, and shapes,
-plus each shard's name and size, read from safetensors headers. It costs one
-header per shard rather than a pass over hundreds of gigabytes, and it cannot be
-preserved by a repack: a checkpoint that quantized one more layer, or stored a
-scale at a different width, is a different checkpoint under this digest. Two
-directories that share it hold the same weights, whatever their repos are called.
+**Content digest, not a file list.** The bond hashes each shard name and every
+byte of every safetensors shard, including its header. A checkpoint with the same
+tensor names, dtypes, shapes, and file sizes but different values therefore
+cannot preserve the digest. Two directories that share it hold byte-identical
+weight shards, whatever their repos are called.
 
 **The same mean from different weights is refused, not explained.** Distinct
 quantizations of one reference do not land on an identical mean to eighteen
@@ -572,8 +543,9 @@ one report was scored against the other's checkpoint, and nothing in the
 artifacts says which. Both results are withdrawn and rescored. The converse —
 two candidates sharing a digest — is not an error in the measurement but a fact
 about the upstream repositories: one is a verbatim re-upload of the other. It
-publishes once, and the artifact names the re-upload as such rather than
-presenting it as an independent quantization.
+publishes once only when both reports agree; conflicting scores from identical
+weights are refused. The artifact names an agreeing re-upload as such rather
+than presenting it as an independent quantization.
 
 **Check.** The compliance receipt requires `student_weights_sha256` on the report
 and an inspection of the published candidate carrying the same digest.

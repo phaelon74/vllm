@@ -39,6 +39,12 @@ class _InputOptions(TypedDict):
     kld_vocab_size: NotRequired[int]
     """Unpadded vocab size for KLD softmax truncation."""
 
+    reference_routing_path: NotRequired[str]
+    """Versioned BF16 logical expert-ID trace for BxQ scoring."""
+
+    reference_routing_sha256: NotRequired[str]
+    """SHA256 binding for the routing trace file."""
+
 
 class TokensInput(_InputOptions):
     """Represents token-based input to the engine."""

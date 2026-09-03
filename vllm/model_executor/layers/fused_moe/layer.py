@@ -102,6 +102,7 @@ def FusedMoEFactory(
     pcp_size: int | None = None,
     prefix: str = "",
     custom_routing_function: Callable | None = None,
+    custom_forced_routing_function: Callable | None = None,
     router: FusedMoERouter | None = None,
     scoring_func: str = "softmax",
     routed_scaling_factor: float = 1.0,
@@ -166,6 +167,8 @@ def FusedMoEFactory(
         pcp_size: Pipeline context parallelism size (None = use global default)
         prefix: Layer name prefix for weight loading
         custom_routing_function: Custom routing function override
+        custom_forced_routing_function: Callback that computes student routing
+            weights for forced expert IDs used with custom routing
         router: Pre-configured router instance (None = create default)
         scoring_func: Scoring function for routing ("softmax" or others)
         routed_scaling_factor: Scaling factor applied to topk_weights or output
@@ -286,6 +289,7 @@ def FusedMoEFactory(
             num_expert_group=num_expert_group,
             topk_group=topk_group,
             custom_routing_function=custom_routing_function,
+            custom_forced_routing_function=custom_forced_routing_function,
             scoring_func=scoring_func,
             # When apply_routed_scale_to_output is True, we set the scaling factor
             # to 1.0 so it ends up being a nop. Applying the scale will be handled

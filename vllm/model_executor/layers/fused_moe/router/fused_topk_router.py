@@ -13,7 +13,10 @@ from vllm.model_executor.layers.fused_moe.config import (
     RoutingMethodType,
     get_routing_method_type,
 )
-from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+from vllm.model_executor.layers.fused_moe.router.base_router import (
+    BaseRouter,
+    compute_forced_routing_weights,
+)
 
 
 def _get_padding_mask(num_tokens: int) -> torch.Tensor | None:
@@ -172,3 +175,18 @@ class FusedTopKRouter(BaseRouter):
         )
 
         return topk_weights, topk_ids
+
+    def _compute_forced_weights(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        forced_topk_ids: torch.Tensor,
+        *,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return compute_forced_routing_weights(
+            router_logits,
+            forced_topk_ids,
+            scoring_func=self.scoring_func,
+            renormalize=self.renormalize,
+        )

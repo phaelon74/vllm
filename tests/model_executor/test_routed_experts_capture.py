@@ -7,17 +7,39 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.compilation import CompilationMode
 from vllm.distributed.eplb.eplb_state import EplbLayerState
+from vllm.forward_context import override_forward_context
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+from vllm.model_executor.layers.fused_moe.forced_routing import (
+    FORCED_ROUTING_KEY,
+    ForcedRouting,
+)
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
     RoutedExpertsManager,
     bind_routed_experts_capturer,
     get_routed_experts_attn_gid,
 )
-from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+from vllm.model_executor.layers.fused_moe.router.base_router import (
+    BaseRouter,
+    compute_forced_routing_weights,
+)
+from vllm.model_executor.layers.fused_moe.router.custom_routing_router import (
+    CustomRoutingRouter,
+)
+from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
+    FusedTopKRouter,
+)
+from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
+    GroupedTopKRouter,
+)
+from vllm.model_executor.layers.fused_moe.router.router_factory import (
+    create_fused_moe_router,
+)
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.transformers_utils.model_arch_config_convertor import (
     ModelArchConfigConvertorBase,
 )
@@ -72,6 +94,11 @@ class DummyRouter(BaseRouter):
     def _apply_eplb_mapping(self, topk_ids: torch.Tensor) -> torch.Tensor:
         # Make mapping observable without requiring CUDA EPLB path.
         return topk_ids + 10
+
+    def _compute_forced_weights(
+        self, hidden_states, router_logits, forced_topk_ids, *, input_ids=None
+    ):
+        return torch.ones_like(forced_topk_ids, dtype=torch.float32)
 
 
 def _make_router(eplb_state: EplbLayerState | None = None) -> DummyRouter:
@@ -198,6 +225,412 @@ def test_base_router_capture_with_eplb_enabled():
     assert torch.equal(captured[0], torch.tensor([[1, 2], [3, 4]]))
     # Our DummyRouter mapping adds +10.
     assert torch.equal(topk_ids, torch.tensor([[11, 12], [13, 14]]))
+
+
+@pytest.mark.parametrize("scoring_func", ["softmax", "sigmoid"])
+@pytest.mark.parametrize("renormalize", [False, True])
+def test_forced_topk_uses_student_weights(scoring_func, renormalize):
+    router = FusedTopKRouter(
+        top_k=2,
+        global_num_experts=4,
+        scoring_func=scoring_func,
+        renormalize=renormalize,
+    )
+    logits = torch.tensor([[3.0, 1.0, -1.0, 0.0]])
+    forced_ids = torch.tensor([[2, 0]], dtype=torch.int32)
+
+    weights, selected_ids = router.select_forced_experts(
+        hidden_states=torch.empty(1, 1),
+        router_logits=logits,
+        forced_topk_ids=forced_ids,
+    )
+
+    scores = (
+        torch.softmax(logits, dim=-1)
+        if scoring_func == "softmax"
+        else torch.sigmoid(logits)
+    )
+    expected = scores.gather(1, forced_ids.to(torch.int64))
+    if renormalize:
+        expected = expected / expected.sum(dim=-1, keepdim=True)
+    assert torch.equal(selected_ids, forced_ids)
+    torch.testing.assert_close(weights, expected)
+
+
+def test_forced_ids_are_captured_before_eplb_mapping():
+    router = _make_router()
+    captured = []
+    router.set_capture_fn(lambda ids: captured.append(ids.clone()))
+    forced_ids = torch.tensor([[5, 2]], dtype=torch.int32)
+
+    weights, mapped_ids = router.select_forced_experts(
+        hidden_states=torch.empty(1, 1),
+        router_logits=torch.empty(1, 16),
+        forced_topk_ids=forced_ids,
+    )
+
+    assert weights.tolist() == [[1.0, 1.0]]
+    assert len(captured) == 1
+    assert torch.equal(captured[0], forced_ids)
+    assert torch.equal(mapped_ids, forced_ids + 10)
+
+
+def test_forced_routing_refuses_eplb_remapping():
+    router = FusedTopKRouter(
+        top_k=1,
+        global_num_experts=2,
+        eplb_state=Mock(),
+    )
+    with pytest.raises(ValueError, match="requires EPLB to be disabled"):
+        router.select_forced_experts(
+            hidden_states=torch.empty(1, 1),
+            router_logits=torch.tensor([[1.0, 0.0]]),
+            forced_topk_ids=torch.tensor([[0]], dtype=torch.int32),
+        )
+
+
+def test_grouped_forced_weights_ignore_selection_bias_and_apply_scale():
+    logits = torch.tensor([[2.0, 1.0, 0.0, -1.0]])
+    forced_ids = torch.tensor([[0]], dtype=torch.int32)
+    common = dict(
+        top_k=1,
+        global_num_experts=4,
+        num_expert_group=2,
+        topk_group=2,
+        scoring_func="sigmoid",
+        renormalize=False,
+        routed_scaling_factor=3.0,
+    )
+    unbiased_router = GroupedTopKRouter(**common)
+    biased_router = GroupedTopKRouter(
+        **common,
+        e_score_correction_bias=torch.tensor([0.0, 0.0, 0.0, 5.0]),
+    )
+
+    _, unbiased_ids = unbiased_router.select_experts(
+        hidden_states=torch.empty(1, 1),
+        router_logits=logits,
+    )
+    _, biased_ids = biased_router.select_experts(
+        hidden_states=torch.empty(1, 1),
+        router_logits=logits,
+    )
+    unbiased_weights, _ = unbiased_router.select_forced_experts(
+        hidden_states=torch.empty(1, 1),
+        router_logits=logits,
+        forced_topk_ids=forced_ids,
+    )
+    biased_weights, _ = biased_router.select_forced_experts(
+        hidden_states=torch.empty(1, 1),
+        router_logits=logits,
+        forced_topk_ids=forced_ids,
+    )
+
+    assert unbiased_ids.item() == 0
+    assert biased_ids.item() == 3
+    expected = torch.sigmoid(logits[:, :1]) * 3.0
+    torch.testing.assert_close(unbiased_weights, expected)
+    torch.testing.assert_close(biased_weights, expected)
+
+
+def test_custom_forced_callback_applies_gemma_per_expert_scale():
+    per_expert_scale = torch.tensor([2.0, 3.0, 0.5, 4.0])
+
+    def natural_routing(hidden_states, gating_output, topk, renormalize):
+        weights, ids = torch.topk(gating_output, topk, dim=-1)
+        return weights, ids
+
+    def gemma_forced_routing(
+        hidden_states, gating_output, forced_topk_ids, renormalize
+    ):
+        return compute_forced_routing_weights(
+            gating_output,
+            forced_topk_ids,
+            scoring_func="softmax",
+            renormalize=True,
+            per_expert_scale=per_expert_scale,
+        )
+
+    router = create_fused_moe_router(
+        top_k=2,
+        global_num_experts=4,
+        custom_routing_function=natural_routing,
+        custom_forced_routing_function=gemma_forced_routing,
+    )
+    assert isinstance(router, CustomRoutingRouter)
+    logits = torch.tensor([[2.0, 1.0, 0.0, -1.0]])
+    forced_ids = torch.tensor([[1, 3]], dtype=torch.int32)
+
+    weights, selected_ids = router.select_forced_experts(
+        hidden_states=torch.empty(1, 1),
+        router_logits=logits,
+        forced_topk_ids=forced_ids,
+    )
+
+    selected_scores = torch.softmax(logits, dim=-1).gather(
+        1, forced_ids.to(torch.int64)
+    )
+    selected_scores /= selected_scores.sum(dim=-1, keepdim=True)
+    expected = selected_scores * per_expert_scale[forced_ids]
+    assert torch.equal(selected_ids, forced_ids)
+    torch.testing.assert_close(weights, expected)
+
+
+def test_custom_router_without_forced_callback_refuses():
+    def natural_routing(hidden_states, gating_output, topk, renormalize):
+        return torch.topk(gating_output, topk, dim=-1)
+
+    router = CustomRoutingRouter(
+        top_k=1,
+        global_num_experts=2,
+        custom_routing_function=natural_routing,
+    )
+
+    with pytest.raises(ValueError, match="custom_forced_routing_function"):
+        router.select_forced_experts(
+            hidden_states=torch.empty(1, 1),
+            router_logits=torch.tensor([[1.0, 0.0]]),
+            forced_topk_ids=torch.tensor([[1]], dtype=torch.int32),
+        )
+
+
+def _runner_for_forced_routing(router, *, monolithic=False):
+    runner = MoERunner.__new__(MoERunner)
+    runner._shared_experts = None
+    runner.layer_name = "model.layers.0.mlp.experts"
+    runner.moe_config = SimpleNamespace(
+        experts_per_token=2,
+        num_logical_experts=4,
+    )
+    quant_method = SimpleNamespace(
+        is_monolithic=monolithic,
+        topk_indices_dtype=torch.int64,
+        apply_monolithic_routed=Mock(return_value=torch.empty(1, 1)),
+    )
+    runner.router = router
+    runner.routed_experts = SimpleNamespace(
+        quant_method=quant_method,
+        forward_modular=Mock(return_value=torch.empty(1, 1)),
+        forward_monolithic=Mock(return_value=torch.empty(1, 1)),
+    )
+    return runner
+
+
+def test_modular_runner_dispatches_forced_ids_with_student_weights():
+    router = FusedTopKRouter(
+        top_k=2,
+        global_num_experts=4,
+        scoring_func="softmax",
+        renormalize=True,
+    )
+    runner = _runner_for_forced_routing(router)
+    logits = torch.tensor([[3.0, 1.0, -1.0, 0.0]])
+    forced_ids = torch.tensor([[[2, 0]]], dtype=torch.int32)
+    ctx = SimpleNamespace(
+        additional_kwargs={FORCED_ROUTING_KEY: ForcedRouting(expert_ids=forced_ids)}
+    )
+
+    with override_forward_context(ctx):
+        runner._apply_quant_method(torch.empty(1, 1), logits, None)
+
+    call = runner.routed_experts.forward_modular.call_args.kwargs
+    assert torch.equal(call["topk_ids"], forced_ids[:, 0].to(torch.int64))
+    selected_scores = torch.softmax(logits, dim=-1).gather(
+        1, forced_ids[:, 0].to(torch.int64)
+    )
+    expected = selected_scores / selected_scores.sum(dim=-1, keepdim=True)
+    torch.testing.assert_close(call["topk_weights"], expected)
+
+
+def test_modular_runner_uses_normal_router_without_override():
+    router = Mock()
+    natural_weights = torch.tensor([[0.75, 0.25]])
+    natural_ids = torch.tensor([[0, 1]], dtype=torch.int64)
+    router.select_experts.return_value = natural_weights, natural_ids
+    runner = _runner_for_forced_routing(router)
+    ctx = SimpleNamespace(additional_kwargs={})
+
+    with override_forward_context(ctx):
+        runner._apply_quant_method(
+            torch.empty(1, 1),
+            torch.empty(1, 4),
+            None,
+        )
+
+    router.select_experts.assert_called_once()
+    router.select_forced_experts.assert_not_called()
+    call = runner.routed_experts.forward_modular.call_args.kwargs
+    assert call["topk_weights"] is natural_weights
+    assert call["topk_ids"] is natural_ids
+
+
+def test_monolithic_runner_dispatches_exact_forced_routing():
+    router = FusedTopKRouter(
+        top_k=2,
+        global_num_experts=4,
+        scoring_func="softmax",
+        renormalize=True,
+    )
+    runner = _runner_for_forced_routing(router, monolithic=True)
+    logits = torch.tensor([[3.0, 1.0, -1.0, 0.0]])
+    forced_ids = torch.tensor([[[2, 0]]], dtype=torch.int64)
+    ctx = SimpleNamespace(
+        additional_kwargs={FORCED_ROUTING_KEY: ForcedRouting(expert_ids=forced_ids)}
+    )
+
+    with override_forward_context(ctx):
+        runner._apply_quant_method(
+            torch.empty(1, 1),
+            logits,
+            None,
+        )
+
+    call = runner.routed_experts.quant_method.apply_monolithic_routed.call_args.kwargs
+    assert call["layer"] is runner.routed_experts
+    assert call["topk_ids"].dtype == torch.int32
+    assert call["topk_ids"].is_contiguous()
+    assert torch.equal(call["topk_ids"], forced_ids[:, 0].to(torch.int32))
+    expected = torch.softmax(logits, dim=-1).gather(1, forced_ids[:, 0])
+    expected /= expected.sum(dim=-1, keepdim=True)
+    assert call["topk_weights"].dtype == torch.float32
+    assert call["topk_weights"].is_contiguous()
+    torch.testing.assert_close(call["topk_weights"], expected)
+    runner.routed_experts.forward_monolithic.assert_not_called()
+
+
+def test_monolithic_runner_preserves_natural_path():
+    runner = _runner_for_forced_routing(Mock(), monolithic=True)
+    ctx = SimpleNamespace(additional_kwargs={})
+
+    with override_forward_context(ctx):
+        runner._apply_quant_method(
+            torch.empty(1, 1),
+            torch.empty(1, 4),
+            None,
+        )
+
+    runner.routed_experts.forward_monolithic.assert_called_once()
+    runner.routed_experts.quant_method.apply_monolithic_routed.assert_not_called()
+
+
+def test_monolithic_kernel_forwards_exact_routing_tensors():
+    parallel_config = SimpleNamespace(
+        dp_size=1,
+        ep_size=1,
+        pcp_size=1,
+        is_sequence_parallel=False,
+    )
+    moe_config = SimpleNamespace(
+        moe_parallel_config=parallel_config,
+        experts_per_token=2,
+        should_defer_moe_finalize=lambda num_tokens: False,
+    )
+    prepare_finalize = SimpleNamespace(
+        prepare=Mock(
+            side_effect=lambda hidden_states, **kwargs: (
+                hidden_states,
+                None,
+                kwargs["router_logits"],
+            )
+        ),
+        finalize=Mock(side_effect=lambda output: output),
+    )
+    routed_output = torch.empty(2, 4)
+    experts = SimpleNamespace(
+        moe_config=moe_config,
+        quant_config=SimpleNamespace(),
+        expects_unquantized_inputs=True,
+        apply_routed=Mock(return_value=routed_output),
+    )
+    impl = mk.FusedMoEKernelMonolithicImpl(prepare_finalize, experts)
+    hidden_states = torch.empty(2, 4)
+    topk_ids = torch.tensor([[2, 0], [1, 3]], dtype=torch.int32)
+    topk_weights = torch.tensor([[0.75, 0.25], [0.125, 0.875]], dtype=torch.float32)
+
+    output = impl.apply_routed(
+        hidden_states=hidden_states,
+        w1=torch.empty(1),
+        w2=torch.empty(1),
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        activation=Mock(),
+        global_num_experts=4,
+        expert_map=None,
+        apply_router_weight_on_input=False,
+    )
+
+    call = experts.apply_routed.call_args.kwargs
+    assert call["topk_ids"] is topk_ids
+    assert call["topk_weights"] is topk_weights
+    assert output is routed_output
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("dp_size", 2, "does not support DP"),
+        ("ep_size", 2, "does not support DP"),
+        ("pcp_size", 2, "does not support DP"),
+        ("is_sequence_parallel", True, "does not support DP"),
+    ],
+)
+def test_monolithic_kernel_rejects_distributed_forced_routing(field, value, match):
+    parallel_config = SimpleNamespace(
+        dp_size=1,
+        ep_size=1,
+        pcp_size=1,
+        is_sequence_parallel=False,
+    )
+    setattr(parallel_config, field, value)
+    experts = SimpleNamespace(
+        moe_config=SimpleNamespace(
+            moe_parallel_config=parallel_config,
+            experts_per_token=2,
+            should_defer_moe_finalize=lambda num_tokens: False,
+        )
+    )
+    impl = mk.FusedMoEKernelMonolithicImpl(SimpleNamespace(), experts)
+
+    with pytest.raises(NotImplementedError, match=match):
+        impl.apply_routed(
+            hidden_states=torch.empty(1, 4),
+            w1=torch.empty(1),
+            w2=torch.empty(1),
+            topk_weights=torch.empty(1, 2),
+            topk_ids=torch.empty(1, 2, dtype=torch.int32),
+            activation=Mock(),
+            global_num_experts=4,
+            expert_map=None,
+            apply_router_weight_on_input=False,
+        )
+
+
+def test_monolithic_kernel_rejects_deferred_finalize():
+    experts = SimpleNamespace(
+        moe_config=SimpleNamespace(
+            moe_parallel_config=SimpleNamespace(
+                dp_size=1,
+                ep_size=1,
+                pcp_size=1,
+                is_sequence_parallel=False,
+            ),
+            should_defer_moe_finalize=lambda num_tokens: True,
+        )
+    )
+    impl = mk.FusedMoEKernelMonolithicImpl(SimpleNamespace(), experts)
+
+    with pytest.raises(NotImplementedError, match="deferred finalize"):
+        impl.apply_routed(
+            hidden_states=torch.empty(1, 4),
+            w1=torch.empty(1),
+            w2=torch.empty(1),
+            topk_weights=torch.empty(1, 2),
+            topk_ids=torch.empty(1, 2, dtype=torch.int32),
+            activation=Mock(),
+            global_num_experts=4,
+            expert_map=None,
+            apply_router_weight_on_input=False,
+        )
 
 
 def test_public_binding_only_visits_target_model(monkeypatch):

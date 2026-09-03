@@ -79,6 +79,8 @@ class CachedRequestState:
     reference_logits_path: str | None = None
     reference_logits_key: str | None = None
     kld_vocab_size: int | None = None
+    reference_routing_path: str | None = None
+    reference_routing_sha256: str | None = None
 
     def __post_init__(self):
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(

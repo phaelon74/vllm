@@ -79,3 +79,17 @@ class FusedMoERouter(ABC):
             )
 
         return topk_weights, topk_ids
+
+    def select_forced_experts(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        forced_topk_ids: torch.Tensor,
+        topk_indices_dtype: torch.dtype | None = None,
+        *,
+        input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Route to supplied logical IDs when the router supports it."""
+        raise ValueError(
+            f"Forced MoE routing is not supported with router {type(self).__name__}."
+        )

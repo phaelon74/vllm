@@ -53,6 +53,8 @@ class NewRequestData:
     reference_logits_path: str | None = None
     reference_logits_key: str | None = None
     kld_vocab_size: int | None = None
+    reference_routing_path: str | None = None
+    reference_routing_sha256: str | None = None
 
     @classmethod
     def from_request(
@@ -84,6 +86,8 @@ class NewRequestData:
             reference_logits_path=request.reference_logits_path,
             reference_logits_key=request.reference_logits_key,
             kld_vocab_size=request.kld_vocab_size,
+            reference_routing_path=request.reference_routing_path,
+            reference_routing_sha256=request.reference_routing_sha256,
         )
 
     @property

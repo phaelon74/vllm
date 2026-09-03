@@ -38,6 +38,7 @@ from vllm.distributed.parallel_state import (
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
+from vllm.model_executor.layers.fused_moe.forced_routing import ForcedRouting
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
     bind_routed_experts_capturer,
@@ -198,6 +199,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.is_encoder_decoder = self.model_config.is_encoder_decoder
+        self._forced_routing_requests: dict[str, tuple[str, str]] = {}
+        self._forced_routing_cache: dict[str, torch.Tensor] = {}
 
         self.output_copy_stream = torch.cuda.Stream(self.device)
 
@@ -949,6 +952,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
         self.model_state.remove_request(req_id)
+        self._forced_routing_requests.pop(req_id, None)
         req_idx = self.req_states.remove_request(req_id)
         if req_idx is None:
             return False
@@ -1027,6 +1031,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.encoder_cache.add_request(req_id, new_req_data.mm_features)
 
             self.model_state.add_request(req_index, new_req_data)
+            routing_path = new_req_data.reference_routing_path
+            routing_sha = new_req_data.reference_routing_sha256
+            if (routing_path is None) != (routing_sha is None):
+                raise ValueError(
+                    "BxQ routing path and SHA256 must be provided together"
+                )
+            if routing_path is not None and routing_sha is not None:
+                self._forced_routing_requests[req_id] = (
+                    routing_path,
+                    routing_sha,
+                )
             self.block_tables.append_block_ids(
                 req_index, new_req_data.block_ids, overwrite=True
             )
@@ -1495,6 +1510,70 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.ec_connector.no_forward(scheduler_output).ec_connector_output,
         )
 
+    def _prepare_forced_moe_routing(
+        self, input_batch: InputBatch
+    ) -> torch.Tensor | None:
+        """Align each request's bound BF16 trace with the flattened token batch."""
+        from safetensors.torch import load_file
+        from vllm.v1.sample.kld import sha256_file
+
+        enabled = [
+            req_id in self._forced_routing_requests for req_id in input_batch.req_ids
+        ]
+        if not any(enabled):
+            return None
+        if not all(enabled):
+            raise ValueError(
+                "BxQ routing replay cannot share a batch with natural-routing requests"
+            )
+        if self.parallel_config.data_parallel_size > 1:
+            raise NotImplementedError(
+                "BxQ routing replay currently requires data_parallel_size=1; "
+                "cross-DP trace dispatch is not implemented."
+            )
+        chunks: list[torch.Tensor] = []
+        expected_tail: tuple[int, int] | None = None
+        for batch_index, req_id in enumerate(input_batch.req_ids):
+            path, expected_sha = self._forced_routing_requests[req_id]
+            if sha256_file(path) != expected_sha:
+                raise ValueError(f"BxQ routing trace hash mismatch: {path}")
+            trace = self._forced_routing_cache.get(path)
+            if trace is None:
+                tensors = load_file(path, device="cpu")
+                if set(tensors) != {"routed_experts"}:
+                    raise ValueError(
+                        f"BxQ routing trace must contain only routed_experts: {path}"
+                    )
+                trace = tensors["routed_experts"].to(torch.int32)
+                if trace.ndim != 3:
+                    raise ValueError(
+                        f"BxQ routing trace must be [tokens, layers, top_k]: {path}"
+                    )
+                self._forced_routing_cache[path] = trace
+            tail = (trace.shape[1], trace.shape[2])
+            if expected_tail is not None and tail != expected_tail:
+                raise ValueError("BxQ requests in one batch use incompatible traces")
+            expected_tail = tail
+            start = int(input_batch.num_computed_tokens_np[batch_index])
+            end = start + int(input_batch.num_scheduled_tokens[batch_index])
+            if start < 0 or end > trace.shape[0]:
+                raise ValueError(
+                    f"BxQ trace {path} has {trace.shape[0]} rows but step needs "
+                    f"[{start}:{end}]"
+                )
+            chunks.append(trace[start:end])
+        forced = torch.cat(chunks, dim=0)
+        if forced.shape[0] < input_batch.num_tokens_after_padding:
+            padding_rows = input_batch.num_tokens_after_padding - forced.shape[0]
+            padding = torch.arange(
+                forced.shape[2], dtype=forced.dtype
+            ).view(1, 1, -1).expand(padding_rows, forced.shape[1], -1)
+            forced = torch.cat(
+                [forced, padding],
+                dim=0,
+            )
+        return forced.to(self.device, non_blocking=True)
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1620,6 +1699,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 block_tables = None
                 slot_mappings = None
 
+        forced_moe_routing = (
+            None if dummy_run else self._prepare_forced_moe_routing(input_batch)
+        )
+        if (
+            forced_moe_routing is not None
+            and batch_desc.cg_mode != CUDAGraphMode.NONE
+        ):
+            raise ValueError("BxQ routing replay requires eager model execution")
+
         attn_metadata = None
         slot_mappings_by_layer = None
         if not (dummy_run and skip_attn_for_dummy_run):
@@ -1741,6 +1829,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
+                additional_kwargs=(
+                    {"forced_moe_routing": ForcedRouting(forced_moe_routing)}
+                    if forced_moe_routing is not None
+                    else None
+                ),
             ):
                 self.kv_connector.pre_forward(scheduler_output)
                 if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:

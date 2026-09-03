@@ -777,6 +777,10 @@ class BaseRenderer(ABC, Generic[_T]):
             engine_input["reference_logits_key"] = reference_logits_key
         if (kld_vocab_size := prompt.get("kld_vocab_size")) is not None:
             engine_input["kld_vocab_size"] = kld_vocab_size
+        if (routing_path := prompt.get("reference_routing_path")) is not None:
+            engine_input["reference_routing_path"] = routing_path
+        if (routing_sha := prompt.get("reference_routing_sha256")) is not None:
+            engine_input["reference_routing_sha256"] = routing_sha
 
     def _process_tokens(
         self,

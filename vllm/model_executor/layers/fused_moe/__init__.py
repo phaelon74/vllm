@@ -16,6 +16,10 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     RoutingMethodType,
 )
+from vllm.model_executor.layers.fused_moe.forced_routing import (
+    FORCED_ROUTING_KEY,
+    ForcedRouting,
+)
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
@@ -71,6 +75,8 @@ __all__ = [
     "FusedMoEQuantConfig",
     "FusedMoEParallelConfig",
     "FusedMoEMethodBase",
+    "FORCED_ROUTING_KEY",
+    "ForcedRouting",
     "MoEActivation",
     "UnquantizedFusedMoEMethod",
     "FusedMoeWeightScaleSupported",

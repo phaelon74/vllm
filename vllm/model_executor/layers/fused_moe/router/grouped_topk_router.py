@@ -16,7 +16,10 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
     rocm_aiter_grouped_topk,
 )
-from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+from vllm.model_executor.layers.fused_moe.router.base_router import (
+    BaseRouter,
+    compute_forced_routing_weights,
+)
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     fused_topk_bias,
 )
@@ -347,3 +350,21 @@ class GroupedTopKRouter(BaseRouter):
         )
 
         return topk_weights, topk_ids
+
+    def _compute_forced_weights(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        forced_topk_ids: torch.Tensor,
+        *,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Correction bias and grouping affect selection only. Teacher IDs
+        # replace that selection, so weights come from the unbiased scores.
+        return compute_forced_routing_weights(
+            router_logits,
+            forced_topk_ids,
+            scoring_func=self.scoring_func,
+            renormalize=self.renormalize,
+            routed_scaling_factor=self.routed_scaling_factor,
+        )

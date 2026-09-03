@@ -398,10 +398,78 @@ def _dump_positions(chunks: Any, score_from: int, path: str) -> None:
 
 
 ROUTING_MANIFEST = "routing-manifest.json"
+ROUTING_TRACE_PROTOCOL_VERSION = 2
+PAIRED_ROUTED_SCORE_PROTOCOL_VERSION = 1
 
 
 def _routing_filename(idx: int) -> str:
     return f"routing_{idx:05d}.safetensors"
+
+
+def _validate_routing_trace(
+    routing_dir: str,
+    manifest: dict[str, Any],
+    token_hash: str,
+    rows: int,
+) -> None:
+    """Refuse incomplete, stale, or internally inconsistent routing traces."""
+    import numpy as np
+    from safetensors.numpy import load_file as load_numpy
+    from vllm.v1.sample.kld import sha256_file
+
+    if manifest.get("protocol_version") != ROUTING_TRACE_PROTOCOL_VERSION:
+        raise ValueError("routing trace predates the BxQ binding protocol")
+    for field in ("reference_weights_sha256", "capture_manifest_sha256"):
+        digest = manifest.get(field)
+        if not isinstance(digest, str) or len(digest) != 64:
+            raise ValueError(f"routing trace has no complete {field}")
+    if manifest.get("token_sha256") != token_hash or manifest.get("rows") != rows:
+        raise ValueError("routing trace is bound to different tokens or row count")
+    num_layers = int(manifest["num_layers"])
+    topk = int(manifest["num_experts_per_tok"])
+    num_experts = int(manifest["num_experts"])
+    layer_map = manifest.get("layer_map")
+    if (
+        not isinstance(layer_map, list)
+        or not layer_map
+        or layer_map != sorted(set(layer_map))
+        or min(layer_map) < 0
+        or max(layer_map) >= num_layers
+    ):
+        raise ValueError("routing trace layer map is incomplete or invalid")
+    shapes = manifest.get("tensor_shapes")
+    dtypes = manifest.get("tensor_dtypes")
+    hashes = manifest.get("file_hashes")
+    if (
+        not isinstance(hashes, dict)
+        or len(hashes) != rows
+        or not isinstance(shapes, dict)
+        or len(shapes) != rows
+        or not isinstance(dtypes, dict)
+        or len(dtypes) != rows
+    ):
+        raise ValueError("routing trace has incomplete tensor metadata or file hashes")
+    for idx in range(rows):
+        name = _routing_filename(idx)
+        path = os.path.join(routing_dir, name)
+        if hashes.get(name) != sha256_file(path):
+            raise ValueError(f"routing trace hash mismatch for {name}")
+        routed = load_numpy(path)["routed_experts"]
+        if str(routed.dtype) != dtypes.get(name):
+            raise ValueError(f"routing trace {name} dtype does not match manifest")
+        if list(routed.shape) != shapes.get(name):
+            raise ValueError(
+                f"routing trace {name} shape {list(routed.shape)} does not "
+                f"match {shapes.get(name)}"
+            )
+        selected = routed[:, layer_map, :]
+        if selected.min() < 0 or selected.max() >= num_experts:
+            raise ValueError(f"routing trace {name} contains out-of-range expert IDs")
+        ordered = np.sort(selected, axis=-1)
+        if topk > 1 and np.any(ordered[..., 1:] == ordered[..., :-1]):
+            raise ValueError(
+                f"routing trace {name} repeats an expert within a top-k row"
+            )
 
 
 def _capture_reference_routing(
@@ -410,37 +478,92 @@ def _capture_reference_routing(
     routing_dir: str,
     llm_kwargs: dict[str, Any],
     token_hash: str,
+    reference_weights_sha256: str,
+    capture_manifest_sha256: str,
 ) -> dict[str, Any]:
     """Record which experts the reference selected, per token and per layer.
 
     This is a separate pass over the reference rather than part of the
-    hidden-state capture, so an existing capture stays valid: expert IDs are a
-    few hundred megabytes against tens of gigabytes of hidden states, and a
-    campaign that already paid for Phase 1 should not pay again to learn what
-    the router did.
+    hidden-state capture. Both artifacts are bound to the same reference weight
+    digest; a current Phase 1 capture can therefore be reused safely.
 
     Returns:
         The routing manifest, whether it was just written or already present.
     """
     from safetensors.numpy import save_file as save_numpy
-    from vllm.v1.sample.kld import read_json, sha256_file, write_json
+    from vllm.v1.sample.kld import (
+        capture_runtime_manifest,
+        inspect_model_moe_backends,
+        read_json,
+        sha256_file,
+        write_json,
+    )
 
     os.makedirs(routing_dir, exist_ok=True)
     manifest_path = os.path.join(routing_dir, ROUTING_MANIFEST)
+    reference_config = os.path.join(reference_model_path, "config.json")
     if os.path.isfile(manifest_path):
         manifest = read_json(manifest_path)
-        if manifest.get("token_sha256") == token_hash and manifest.get(
-            "rows"
-        ) == len(windows):
+        if manifest.get("protocol_version") == ROUTING_TRACE_PROTOCOL_VERSION:
+            if (
+                manifest.get("reference_weights_sha256")
+                != reference_weights_sha256
+                or manifest.get("capture_manifest_sha256")
+                != capture_manifest_sha256
+            ):
+                print(
+                    "Routing capture names different teacher weights or a "
+                    "different reference capture and will be replaced."
+                )
+                os.remove(manifest_path)
+                return _capture_reference_routing(
+                    reference_model_path,
+                    windows,
+                    routing_dir,
+                    llm_kwargs,
+                    token_hash,
+                    reference_weights_sha256,
+                    capture_manifest_sha256,
+                )
+            if manifest.get("reference_config_sha256") != sha256_file(
+                reference_config
+            ):
+                print(
+                    "Routing capture names a different reference config and "
+                    "will be replaced."
+                )
+                os.remove(manifest_path)
+                return _capture_reference_routing(
+                    reference_model_path,
+                    windows,
+                    routing_dir,
+                    llm_kwargs,
+                    token_hash,
+                    reference_weights_sha256,
+                    capture_manifest_sha256,
+                )
+            try:
+                _validate_routing_trace(
+                    routing_dir, manifest, token_hash, len(windows)
+                )
+            except (OSError, ValueError) as exc:
+                print(f"Routing capture is invalid and will be replaced: {exc}")
+                os.remove(manifest_path)
+                return _capture_reference_routing(
+                    reference_model_path,
+                    windows,
+                    routing_dir,
+                    llm_kwargs,
+                    token_hash,
+                    reference_weights_sha256,
+                    capture_manifest_sha256,
+                )
             print(
                 f"Routing capture reused: {len(windows)} windows in "
                 f"{routing_dir}"
             )
             return manifest
-        raise ValueError(
-            f"{manifest_path} was captured for different tokens or row count; "
-            f"delete it to recapture"
-        )
+        print(f"Routing capture is historical and will be replaced: {manifest_path}")
 
     print(f"Routing capture: reading reference selections from {routing_dir}")
     llm = LLM(
@@ -449,6 +572,24 @@ def _capture_reference_routing(
         **llm_kwargs,
     )
     shape: tuple[int, int] | None = None
+    worker_backends = llm.apply_model(inspect_model_moe_backends)
+    worker_layer_maps = [
+        sorted(
+            {
+                int(layer["layer_id"])
+                for layer in worker.get("layers", [])
+                if isinstance(layer.get("layer_id"), int)
+            }
+        )
+        for worker in worker_backends
+    ]
+    if not worker_layer_maps or not worker_layer_maps[0]:
+        raise ValueError("routing capture found no MoE layers in the reference")
+    if any(layer_map != worker_layer_maps[0] for layer_map in worker_layer_maps[1:]):
+        raise ValueError("reference MoE layer IDs differ across workers")
+    layer_map = worker_layer_maps[0]
+    tensor_shapes: dict[str, list[int]] = {}
+    tensor_dtypes: dict[str, str] = {}
     try:
         for idx, window_tokens in enumerate(windows):
             prompt: TokensPrompt = {"prompt_token_ids": window_tokens}
@@ -467,9 +608,12 @@ def _capture_reference_routing(
                     f"{len(window_tokens)}-token window"
                 )
             shape = (int(routing.shape[1]), int(routing.shape[2]))
+            name = _routing_filename(idx)
+            tensor_shapes[name] = list(routing.shape)
+            tensor_dtypes[name] = str(routing.dtype)
             save_numpy(
                 {"routed_experts": routing},
-                os.path.join(routing_dir, _routing_filename(idx)),
+                os.path.join(routing_dir, name),
             )
     finally:
         del llm
@@ -478,17 +622,32 @@ def _capture_reference_routing(
 
     assert shape is not None
     names = [_routing_filename(i) for i in range(len(windows))]
+    routing_info = _routing_info(reference_model_path)
+    if routing_info is None:
+        raise ValueError("reference routing was captured but config declares no experts")
     manifest = {
+        "protocol_version": ROUTING_TRACE_PROTOCOL_VERSION,
         "token_sha256": token_hash,
         "rows": len(windows),
         "num_layers": shape[0],
+        "layer_map": layer_map,
+        "num_experts": routing_info["num_experts"],
         "num_experts_per_tok": shape[1],
+        "routing_method": "ordered_logical_topk_before_eplb",
+        "tensor_key": "routed_experts",
+        "tensor_dtypes": tensor_dtypes,
+        "tensor_shapes": tensor_shapes,
         "reference_model": os.path.abspath(reference_model_path),
+        "reference_config_sha256": sha256_file(reference_config),
+        "reference_weights_sha256": reference_weights_sha256,
+        "capture_manifest_sha256": capture_manifest_sha256,
+        "runtime": capture_runtime_manifest(),
         "file_hashes": {
             name: sha256_file(os.path.join(routing_dir, name)) for name in names
         },
     }
     write_json(manifest_path, manifest)
+    _validate_routing_trace(routing_dir, manifest, token_hash, len(windows))
     print(
         f"Saved routing for {len(windows)} windows "
         f"({shape[0]} layers x {shape[1]} experts per token)"
@@ -628,6 +787,7 @@ def _compare_window_routing(
     out: Any,
     kld_result: Any,
     score_from: int,
+    layer_map: list[int] | None = None,
 ) -> None:
     """Fold one window's candidate selections against the captured reference."""
     from safetensors.numpy import load_file as load_numpy
@@ -641,9 +801,30 @@ def _compare_window_routing(
     reference = load_numpy(os.path.join(routing_dir, _routing_filename(idx)))[
         "routed_experts"
     ]
+    if layer_map is not None:
+        reference = reference[:, layer_map, :]
+        candidate = candidate[:, layer_map, :]
     divergence.update(
         reference, candidate, kld_result.kld_ref_to_model[score_from:], score_from
     )
+
+
+def _assert_forced_window_routing(routing_dir: str, idx: int, out: Any) -> None:
+    """Prove the BxQ pass dispatched the captured ordered logical IDs."""
+    import numpy as np
+    from safetensors.numpy import load_file as load_numpy
+
+    actual = out.outputs[0].routed_experts if out.outputs else None
+    if actual is None:
+        raise RuntimeError("BxQ pass returned no routed experts to verify")
+    expected = load_numpy(os.path.join(routing_dir, _routing_filename(idx)))[
+        "routed_experts"
+    ]
+    if actual.shape != expected.shape or not np.array_equal(actual, expected):
+        raise RuntimeError(
+            f"BxQ routing replay mismatch in window {idx}: expected "
+            f"{expected.shape}, got {actual.shape}"
+        )
 
 
 def _per_context_summary(
@@ -813,6 +994,8 @@ def calculate_kld(
     dump_positions: str | None = None,
     measure_routing: bool = False,
     routing_dir: str | None = None,
+    paired_routing: bool = False,
+    reference_weights_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Two-phase KLD: capture teacher references, then score the student."""
     from vllm.v1.sample.kld import (
@@ -898,6 +1081,29 @@ def calculate_kld(
             glob.glob(os.path.join(ref_dir, "logits_*.safetensors"))
             + glob.glob(os.path.join(ref_dir, "hidden_*.safetensors"))
         )
+        existing_manifest_path = os.path.join(ref_dir, "manifest.json")
+        if existing and reference_weights_sha256 is not None:
+            existing_manifest = (
+                read_json(existing_manifest_path)
+                if os.path.isfile(existing_manifest_path)
+                else {}
+            )
+            if (
+                existing_manifest.get("reference_weights_sha256")
+                != reference_weights_sha256
+            ):
+                print(
+                    "Reference capture predates content binding or names "
+                    "different teacher weights; recapturing it."
+                )
+                for path in [
+                    *existing,
+                    os.path.join(ref_dir, "lm_head.safetensors"),
+                    existing_manifest_path,
+                ]:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                existing = []
         if not existing:
             if run_gate:
                 _run_determinism_gate(
@@ -1036,6 +1242,7 @@ def calculate_kld(
                     if os.path.isfile(reference_config)
                     else None
                 ),
+                "reference_weights_sha256": reference_weights_sha256,
                 "reference_engine_config": {
                     key: (llm_kwargs or {}).get(key)
                     for key in (
@@ -1188,6 +1395,8 @@ def calculate_kld(
             "Hidden-state LM-head replay requires enforce_eager=True"
         )
 
+    if paired_routing and not measure_routing:
+        raise ValueError("--paired-routing requires --measure-routing")
     routing_manifest: dict[str, Any] | None = None
     if measure_routing:
         if reference_model_path is None:
@@ -1196,12 +1405,21 @@ def calculate_kld(
                 "have to be read from the reference itself"
             )
         routing_dir = routing_dir or os.path.join(reference_logits_path, "routing")
+        if (
+            not isinstance(reference_weights_sha256, str)
+            or len(reference_weights_sha256) != 64
+        ):
+            raise ValueError(
+                "paired routing requires a complete reference weight digest"
+            )
         routing_manifest = _capture_reference_routing(
             reference_model_path,
             windows,
             routing_dir,
             llm_kwargs or {},
             token_hash,
+            reference_weights_sha256,
+            sha256_file(os.path.join(reference_logits_path, "manifest.json")),
         )
 
     if capture_only:
@@ -1222,6 +1440,30 @@ def calculate_kld(
         student_kwargs["enable_return_routed_experts"] = True
     with _phase(timings, "student_load"):
         llm = LLM(model=model_path, **student_kwargs)
+    moe_backends: list[dict[str, Any]] = []
+    if routing_manifest is not None:
+        from vllm.v1.sample.kld import inspect_model_moe_backends
+
+        moe_backends = llm.apply_model(inspect_model_moe_backends)
+        if not moe_backends or not all(item.get("layers") for item in moe_backends):
+            raise ValueError("routed scoring found no replay-capable MoE layers")
+        candidate_layer_maps = [
+            sorted(
+                {
+                    int(layer["layer_id"])
+                    for layer in worker.get("layers", [])
+                    if isinstance(layer.get("layer_id"), int)
+                }
+            )
+            for worker in moe_backends
+        ]
+        if any(
+            layer_map != routing_manifest["layer_map"]
+            for layer_map in candidate_layer_maps
+        ):
+            raise ValueError(
+                "candidate MoE layer IDs do not match the BF16 routing trace"
+            )
     student_uses_v2 = bool(
         llm.llm_engine.vllm_config.use_v2_model_runner
     )
@@ -1290,11 +1532,17 @@ def calculate_kld(
     divergence: _RoutingDivergence | None = None
     if routing_manifest is not None:
         divergence = _RoutingDivergence(
-            int(routing_manifest["num_layers"]),
+            len(routing_manifest["layer_map"]),
             int(routing_manifest["num_experts_per_tok"]),
         )
 
     chunks: list[KLDResult] = []
+    control_chunks: list[KLDResult] = []
+    control_temp = (
+        tempfile.TemporaryDirectory(prefix="vllm-kld-qxq-control-")
+        if paired_routing
+        else None
+    )
     for idx, window_tokens in enumerate(windows):
         if ref_is_directory:
             ref_file = os.path.join(
@@ -1328,7 +1576,66 @@ def calculate_kld(
                     out,
                     out.kld_result,
                     score_from,
+                    routing_manifest["layer_map"],
                 )
+        if control_temp is not None:
+            from safetensors.numpy import save_file as save_numpy
+
+            natural_ids = out.outputs[0].routed_experts if out.outputs else None
+            if natural_ids is None:
+                raise RuntimeError("QxQ pass returned no routes for control parity")
+            control_path = os.path.join(
+                control_temp.name, _routing_filename(idx)
+            )
+            save_numpy({"routed_experts": natural_ids}, control_path)
+            control_prompt: TokensPrompt = {
+                **prompt,
+                "reference_routing_path": control_path,
+                "reference_routing_sha256": sha256_file(control_path),
+            }
+            with _phase(timings, "qxq_control_forward"):
+                control_out = llm.generate(
+                    [control_prompt],
+                    sampling_params=SamplingParams(max_tokens=1, kld_mode=True),
+                )[0]
+            if control_out.kld_result is None:
+                raise RuntimeError("QxQ control returned no KLD result")
+            _assert_forced_window_routing(control_temp.name, idx, control_out)
+            control_chunks.append(control_out.kld_result)
+
+    bxq_chunks: list[KLDResult] = []
+    if paired_routing:
+        assert routing_manifest is not None
+        assert routing_dir is not None
+        print("Phase 2b: BxQ with BF16 expert IDs and student gating weights...")
+        for idx, window_tokens in enumerate(windows):
+            ref_file = os.path.join(
+                reference_logits_path, _window_filename(capture_kind, idx)
+            )
+            routing_name = _routing_filename(idx)
+            prompt = {
+                "prompt_token_ids": window_tokens,
+                "reference_logits_path": ref_file,
+                "reference_logits_key": (
+                    "hidden_states" if capture_kind == "hidden" else "logits"
+                ),
+                "kld_vocab_size": kld_vocab,
+                "reference_routing_path": os.path.join(
+                    routing_dir, routing_name
+                ),
+                "reference_routing_sha256": routing_manifest["file_hashes"][
+                    routing_name
+                ],
+            }
+            with _phase(timings, "bxq_score_forward"):
+                out = llm.generate(
+                    [prompt],
+                    sampling_params=SamplingParams(max_tokens=1, kld_mode=True),
+                )[0]
+            if out.kld_result is None:
+                raise RuntimeError("BxQ kld_result is None; KLD plumbing is broken")
+            _assert_forced_window_routing(routing_dir, idx, out)
+            bxq_chunks.append(out.kld_result)
 
     if dump_positions:
         _dump_positions(chunks, score_from, dump_positions)
@@ -1345,6 +1652,9 @@ def calculate_kld(
     report["student_model"] = os.path.abspath(model_path)
     if manifest is not None:
         report["teacher_lm_head"] = manifest.get("lm_head")
+        report["reference_weights_sha256"] = manifest.get(
+            "reference_weights_sha256"
+        )
         report["capture_manifest_sha256"] = sha256_file(
             os.path.join(reference_logits_path, "manifest.json")
         )
@@ -1354,6 +1664,96 @@ def calculate_kld(
     )
     if divergence is not None:
         report["routing"] = divergence.finalize()
+    control_evidence: dict[str, Any] | None = None
+    if control_chunks:
+        import numpy as np
+
+        natural_values = np.concatenate(
+            [
+                np.asarray(chunk.kld_ref_to_model[score_from:], dtype=np.float64)
+                for chunk in chunks
+            ]
+        )
+        control_values = np.concatenate(
+            [
+                np.asarray(chunk.kld_ref_to_model[score_from:], dtype=np.float64)
+                for chunk in control_chunks
+            ]
+        )
+        max_abs = float(np.max(np.abs(natural_values - control_values), initial=0.0))
+        mean_delta = float(control_values.mean() - natural_values.mean())
+        control_evidence = {
+            "passed": max_abs <= 1e-5 and abs(mean_delta) <= 1e-7,
+            "max_absolute_position_delta": max_abs,
+            "absolute_mean_delta": abs(mean_delta),
+            "position_absolute_tolerance": 1e-5,
+            "mean_absolute_tolerance": 1e-7,
+        }
+        if not control_evidence["passed"]:
+            raise RuntimeError(
+                "QxQ forced-route control does not match deployed natural "
+                f"execution: max position delta {max_abs:.3e}, mean delta "
+                f"{mean_delta:.3e}"
+            )
+    if bxq_chunks:
+        bxq = summarize_kld_rows(
+            bxq_chunks, score_from=score_from, context_length=context_length
+        )
+        bxq["per_context"] = _per_context_summary(
+            bxq_chunks, score_from, (suite_identity or {}).get("context_ids")
+        )
+        routing_manifest_path = os.path.join(routing_dir, ROUTING_MANIFEST)
+        backend_names = sorted(
+            {
+                layer.get("experts") or layer.get("quant_method") or "unknown"
+                for worker in moe_backends
+                for layer in worker.get("layers", [])
+            }
+        )
+        binding = {
+            "protocol_version": PAIRED_ROUTED_SCORE_PROTOCOL_VERSION,
+            "routing_trace_protocol_version": ROUTING_TRACE_PROTOCOL_VERSION,
+            "routing_trace_sha256": sha256_file(routing_manifest_path),
+            "routing_trace_manifest": routing_manifest_path,
+            "reference_weights_sha256": routing_manifest.get(
+                "reference_weights_sha256"
+            ),
+            "candidate_weights_unchanged": None,
+            "backend_identity": moe_backends,
+            "backend_evidence": {
+                "backend": ", ".join(backend_names),
+                "replay_supported": True,
+                "workers": len(moe_backends),
+            },
+            "natural_control_parity": control_evidence,
+        }
+        report["paired_routing_protocol_version"] = (
+            PAIRED_ROUTED_SCORE_PROTOCOL_VERSION
+        )
+        report["qxq_cell"] = {
+            **summarize_kld_rows(
+                chunks, score_from=score_from, context_length=context_length
+            ),
+            "routing_mode": "student_natural",
+            "timings": {
+                "score_forward": timings.get("score_forward", 0.0),
+                "control_forward": timings.get("qxq_control_forward", 0.0),
+            },
+            **binding,
+        }
+        report["bxq_cell"] = {
+            **bxq,
+            "routing_mode": "teacher_ids_student_weights",
+            "timings": {
+                "score_forward": timings.get("bxq_score_forward", 0.0)
+            },
+            **binding,
+        }
+        report["routing_intervention_delta"] = (
+            report["qxq_cell"]["mean_kld"] - report["bxq_cell"]["mean_kld"]
+        )
+    if control_temp is not None:
+        control_temp.cleanup()
     if decompose_head:
         with _phase(timings, "decompose_head"):
             extra = _decompose_head_kld(
@@ -1674,6 +2074,14 @@ def _print_kld_report(report: dict[str, Any]) -> None:
             f"    routing term: "
             f"{'n/a' if excess is None else f'{excess:+.8f}'}"
         )
+    bxq = report.get("bxq_cell")
+    if bxq:
+        print(
+            "  Paired routing intervention: "
+            f"QxQ={report['qxq_cell']['mean_kld']:.8f}, "
+            f"BxQ={bxq['mean_kld']:.8f}, "
+            f"QxQ-BxQ={report['routing_intervention_delta']:+.8f}"
+        )
     head = report.get("student_lm_head") or {}
     print(f"  Student LM head: {head.get('state', 'unknown')}")
     print(f"  Storage: {report.get('storage')}")
@@ -1711,6 +2119,12 @@ def main():
         type=str,
         default=None,
         help="Path to reference model (generates ref logits if needed)",
+    )
+    parser.add_argument(
+        "--reference-weights-sha256",
+        help="Content digest of the reference safetensors, required for paired "
+        "routing so the BF16 IDs and teacher capture cannot come from "
+        "different weights.",
     )
     parser.add_argument(
         "--reference-logits",
@@ -1777,6 +2191,12 @@ def main():
         default=None,
         help="Where reference expert selections live (default: "
         "<reference capture>/routing)",
+    )
+    parser.add_argument(
+        "--paired-routing",
+        action="store_true",
+        help="After natural QxQ, score BxQ by forcing the BF16 trace's ordered "
+        "expert IDs while retaining the student's own gating weights.",
     )
     parser.add_argument(
         "--dataset-config",
@@ -2028,6 +2448,8 @@ def main():
         dump_positions=args.dump_positions,
         measure_routing=args.measure_routing,
         routing_dir=args.routing_dir,
+        paired_routing=args.paired_routing,
+        reference_weights_sha256=args.reference_weights_sha256,
     )
     elapsed_time = time.time() - start_time
 
@@ -2056,6 +2478,8 @@ def main():
             "replay_probe",
             "student_load",
             "score_forward",
+            "qxq_control_forward",
+            "bxq_score_forward",
             "decompose_head",
         ):
             if name in timings:

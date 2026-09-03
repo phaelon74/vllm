@@ -14,6 +14,45 @@ from vllm.logprobs import create_prompt_logprobs
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.sample.sampler import Sampler
 
+
+def test_bxq_routing_trace_validation_binds_hash_shape_and_ids(tmp_path):
+    import numpy as np
+    from safetensors.numpy import save_file
+
+    from examples.offline_inference.score_mode_kld import (
+        ROUTING_TRACE_PROTOCOL_VERSION,
+        _routing_filename,
+        _validate_routing_trace,
+    )
+    from vllm.v1.sample.kld import sha256_file
+
+    name = _routing_filename(0)
+    path = tmp_path / name
+    routed = np.array([[[0, 1], [2, 3]], [[1, 2], [3, 0]]], dtype=np.uint8)
+    save_file({"routed_experts": routed}, str(path))
+    manifest = {
+        "protocol_version": ROUTING_TRACE_PROTOCOL_VERSION,
+        "reference_weights_sha256": "a" * 64,
+        "capture_manifest_sha256": "b" * 64,
+        "token_sha256": "tokens",
+        "rows": 1,
+        "num_layers": 2,
+        "layer_map": [0, 1],
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "tensor_shapes": {name: [2, 2, 2]},
+        "tensor_dtypes": {name: "uint8"},
+        "file_hashes": {name: sha256_file(str(path))},
+    }
+    _validate_routing_trace(str(tmp_path), manifest, "tokens", 1)
+
+    routed[0, 0] = [1, 1]
+    save_file({"routed_experts": routed}, str(path))
+    manifest["file_hashes"][name] = sha256_file(str(path))
+    with pytest.raises(ValueError, match="repeats an expert"):
+        _validate_routing_trace(str(tmp_path), manifest, "tokens", 1)
+
+
 # ---------------------------------------------------------------------------
 # 1. SamplingParams validation
 # ---------------------------------------------------------------------------

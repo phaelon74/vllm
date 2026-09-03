@@ -37,6 +37,7 @@ from artifact import (  # noqa: E402 - sibling module
     candidate_identity,
     front_matter,
 )
+from compliance import LAWS_VERSION  # noqa: E402 - sibling module
 from redaction import scan_tree  # noqa: E402 - sibling module
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -158,23 +159,81 @@ def gate(
         if not entries:
             hard_stop.append(f"{model}: no candidate carries a compliance receipt")
             continue
-        bad = [name for name, receipt in entries if not receipt.get("compliant")]
+        scored: list[tuple[str, Any, str | None]] = []
+        for name, _ in entries:
+            report = _load(os.path.join(root, name, "report.json")) or {}
+            scored.append(
+                (
+                    name,
+                    report.get("mean_kld"),
+                    report.get("student_weights_sha256"),
+                )
+            )
+        collision = False
+        for index, (left, left_mean, left_digest) in enumerate(scored):
+            for right, right_mean, right_digest in scored[index + 1 :]:
+                if (
+                    left_mean is not None
+                    and right_mean is not None
+                    and left_digest
+                    and right_digest
+                    and (
+                        (left_mean == right_mean and left_digest != right_digest)
+                        or (
+                            left_mean != right_mean
+                            and left_digest == right_digest
+                        )
+                    )
+                ):
+                    hard_stop.append(
+                        f"{model}: {left} and {right} have contradictory score "
+                        "and weight identities; rescore both"
+                    )
+                    collision = True
+        if collision:
+            continue
+        bad = [
+            name
+            for name, receipt in entries
+            if not receipt.get("compliant")
+            or receipt.get("laws_version") != LAWS_VERSION
+        ]
         if bad and not skip_noncompliant:
             hard_stop.append(
-                f"{model}: not law-compliant: {', '.join(bad)}. Fix them, or pass "
-                f"--skip-noncompliant to publish only the compliant candidates."
+                f"{model}: not compliant with Law schema v{LAWS_VERSION}: "
+                f"{', '.join(bad)}. Reassemble them, or pass "
+                "--skip-noncompliant to publish only current compliant candidates."
             )
             continue
-        good = [(name, r) for name, r in entries if r.get("compliant")]
+        good = [
+            (name, receipt)
+            for name, receipt in entries
+            if receipt.get("compliant")
+            and receipt.get("laws_version") == LAWS_VERSION
+        ]
         if not good:
             hard_stop.append(f"{model}: no compliant candidate to publish")
             continue
+        declared_exclusions = []
+        exclusion_path = os.path.join(root, "excluded-candidates.json")
+        if os.path.isfile(exclusion_path):
+            try:
+                with open(exclusion_path, encoding="utf-8") as handle:
+                    declared_exclusions = (
+                        json.load(handle).get("excluded_candidates") or []
+                    )
+            except (OSError, json.JSONDecodeError) as exc:
+                hard_stop.append(
+                    f"{model}: excluded-candidates.json is unreadable: {exc}"
+                )
+                continue
         plans.append(
             {
                 "model": model,
                 "root": root,
                 "candidates": good,
                 "excluded": bad,
+                "declared_exclusions": declared_exclusions,
                 "repo": repo_name(model, good[0][1], 1),
             }
         )
@@ -233,11 +292,17 @@ def index_entries(
             if os.path.isdir(root)
             else []
         )
+        declared_exclusions = []
+        exclusion_path = os.path.join(root, "excluded-candidates.json")
+        if os.path.isfile(exclusion_path):
+            payload = _load(exclusion_path) or {}
+            declared_exclusions = payload.get("excluded_candidates") or []
         entries[model] = {
             "model": model,
             "root": root,
             "candidates": candidates,
             "excluded": [],
+            "declared_exclusions": declared_exclusions,
             "repo": repo,
         }
     return [entries[model] for model in sorted(entries)]
@@ -399,9 +464,16 @@ def build_index(
             mean = receipt.get("mean_kld")
             rel = f"models/{plan['model']}/{name}.md"
             mean_text = "n/a" if mean is None else f"{float(mean):.8f}"
+            bxq = (report.get("bxq_cell") or {}).get("mean_kld")
+            delta = report.get("routing_intervention_delta")
+            paired = ""
+            if bxq is not None:
+                paired = f", BxQ {float(bxq):.8f}"
+                if delta is not None:
+                    paired += f", QxQ-BxQ {float(delta):+.8f}"
             who = f"{author} " if author else ""
             lines.append(
-                f"- {who}[{quant}]({rel}) — mean KLD {mean_text}"
+                f"- {who}[{quant}]({rel}) — QxQ KLD {mean_text}{paired}"
             )
         if not ranked:
             lines.append(
@@ -413,6 +485,14 @@ def build_index(
                 "",
                 f"Withheld as not law-compliant: {', '.join(plan['excluded'])}.",
             ]
+        declared = plan.get("declared_exclusions") or []
+        if declared:
+            lines += ["", "Explicitly excluded pinned checkpoints:"]
+            for item in declared:
+                lines.append(
+                    f"- `{item.get('hf_repo')}@{item.get('revision')}` — "
+                    f"{item.get('reason')}"
+                )
         lines.append("")
     with open(os.path.join(staging, "README.md"), "w", encoding="utf-8",
               newline="\n") as handle:

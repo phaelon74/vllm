@@ -185,3 +185,32 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             Finalized routed states or a deferred-finalize output.
         """
         raise NotImplementedError
+
+    def apply_monolithic_routed(
+        self,
+        layer: "RoutedExperts",
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply a monolithic experts kernel with externally selected routes."""
+        if not self.is_monolithic or self.moe_kernel is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} has no active monolithic MoE kernel."
+            )
+        output = self.moe_kernel.apply_routed(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=layer.activation,
+            global_num_experts=layer.global_num_experts,
+            expert_map=layer.expert_map,
+            apply_router_weight_on_input=layer.apply_router_weight_on_input,
+        )
+        experts = self.moe_kernel.impl.fused_experts
+        capture_fn = getattr(experts, "routing_replay_capture_fn", None)
+        if capture_fn is not None:
+            capture_fn(topk_ids)
+        return output

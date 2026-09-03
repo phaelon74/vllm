@@ -17,7 +17,7 @@ cannot publish a non-compliant result.
 | `bootstrap.sh` | Creates the venv, installs this branch, fetches checkpoints |
 | `campaign.py` | Orchestrates a campaign: download, score, assemble, release, render |
 | `compliance.py` | Fail-closed law evaluation; emits the compliance receipt |
-| `artifact.py` | Renders the one-pager, the leaderboard, and `checksums.txt` |
+| `artifact.py` | Renders one-pagers, QxQ/BxQ charts, cards, the leaderboard, and checksums |
 | `publish.py` | Uploads to the Hub; refuses anything non-compliant or tampered |
 | `redaction.py` | The one secret policy shared by capture, rendering, and publish |
 | `tails.py` | Whether a mean describes the distribution or a few hundred positions |
@@ -129,7 +129,16 @@ it from is a hard error, listed by path.
 
 `campaign.py` runs the stages in the order the laws require, and each stage skips
 work whose output already exists, so an interrupted campaign resumes. Stages can
-also be run individually as `download`, `score`, `assemble`, or `release`.
+also be run individually as `download`, `smoke`, `score`, `assemble`, or
+`release`. Before a routed sweep, `smoke` runs one complete QxQ/control/BxQ
+window and checks that the candidate digest did not change:
+
+```bash
+python fidelity/campaign.py smoke --config fidelity/campaigns/qwen3.6-35b-a3b.json
+python fidelity/campaign.py smoke \
+  --config fidelity/campaigns/qwen3.6-35b-a3b.json \
+  --only-candidate Qwen3.6-35B-A3B-NVFP4
+```
 
 A candidate that fails provenance, download, or scoring is recorded and skipped.
 The rest of the sweep continues, assembly publishes whoever produced a report,
@@ -175,9 +184,9 @@ pins `hf_repo` and `revision`, and `inspect.json` is stored under
 `work/inspect/` (copied into the assembled tree) rather than only beside the
 checkpoint.
 
-Scoring also binds each report to the weights it read, hashing tensor names,
-dtypes, and shapes plus every shard's name and size from the safetensors headers.
-Law 16 requires that digest to match the published `inspect.json`, so a directory
+Scoring also binds each report to the weights it read, hashing every byte of
+every safetensors shard together with its shard name. Law 16 requires that
+content digest to match the published `inspect.json`, so a directory
 repopulated from a different repo cannot be scored under the old name, and two
 candidates that differ in weights cannot publish the same mean. A report whose
 digest disagrees with the checkpoint now on disk is refused rather than rewritten.
@@ -200,19 +209,18 @@ reduction dimension and stores one group more than it carries, vLLM allocates fo
 the unpadded width, and the expert weight loader fails on the length mismatch.
 Gemma 4's 704-wide experts do this to a 128-wide group but not to 32 or 64.
 
-Assembly charts each family as mean KLD against on-disk size, writing
-`kld-vs-size.png` beside the `kld-vs-size.json` that produced it, so a reader who
-distrusts the picture can check the numbers. Colour carries the author and shape
-carries the format, never both, so two releases from one hand read as one hand at
-different settings. A size is measured from the local shards where they exist and
-read from the Hub for the pinned revision where the leased weights are gone; the
-artifact says which, because a Hub figure describes a revision while a local one
-describes the bytes that were scored. A candidate with no size is omitted from
-the chart and the omission is counted rather than guessed at.
+Assembly charts each family against on-disk size. `qxq-vs-size.png` shows normal
+deployed QxQ KLD and `bxq-vs-size.png` shows teacher-ID-forced BxQ KLD, using
+shared Y-axis limits. `kld-vs-size.png` remains the backward-compatible deployed
+mean chart. All are rendered from `kld-vs-size.json`, so a reader can check every
+point. Colour carries the author and shape carries the format. A candidate with
+no size or no selected metric is omitted from that chart and the omission is
+counted rather than guessed at.
 
 Assembly also writes the model's own `README.md` — the card a reader of the
-published repo sees first — carrying the family's candidate table ranked by mean
-KLD, the chart, the laws version, and a YAML header. Without a header the Hub
+published repo sees first — carrying QxQ, BxQ, their paired delta, natural route
+flip rate, every available chart, the laws version, and a YAML header. Without a
+header the Hub
 serves a metadata warning in place of the card, and without a card the artifact
 is a bare file listing. Set `"license"` in the campaign config to declare one on
 the card; unset, it is left unstated rather than guessed.
@@ -378,75 +386,54 @@ captured before this policy existed becomes safe the next time it is assembled.
 
 ## Routed models: what the mean hides
 
-Routing cost saturates. A perturbation to a router logit changes an expert
-selection only when it crosses a near-tie, and how many near-ties a model has is a
-property of the model rather than of the perturbation, so an eight-bit router and a
-four-bit router cost about the same. On one MoE checkpoint:
+Law 14 measures two runs of the same quantized candidate:
 
-| Cell | MXFP8 | NVFP4 | Ratio |
-|---|---|---|---|
-| Experts only | 0.002953 | 0.106539 | 36× |
-| Router only | 0.200938 | 0.193147 | 1.0× |
-| Deployed | 0.211934 | 0.253426 | 1.2× |
+- **QxQ** is normal deployment: the student chooses expert IDs naturally and
+  computes its own gating weights.
+- **BxQ** forces the BF16 teacher's ordered expert IDs at every routed layer, but
+  the student still computes its own gating weights for those experts.
 
-The expert weights differ by a factor of 36. The deployed means differ by 1.2,
-because a routing term near 0.20 dominates both. A reader given only the deployed
-column would conclude the formats are nearly equivalent, and would be wrong by an
-order of magnitude. Two engineering conclusions follow: never quantize a router,
-since the weights are a rounding error in the parameter count and the cost barely
-improves with precision; and never rank schemes on a deployed mean.
+The first axis is routing source (`B` teacher IDs, `Q` student IDs). The second
+`Q` is the unchanged quantized candidate. It is not an experts-precision axis,
+and the first axis is not router-weight precision. `QxQ - BxQ` is the paired
+routing-intervention delta; it may have either sign and is not additive
+attribution.
 
-### Routing is not router precision
+The pair is tightly controlled. Both runs use the same tokens, reference capture,
+candidate weight digest, and report protocol. BxQ binds the exact teacher-ID trace.
+If replay needs another backend path, that path first runs without forcing and
+must reproduce deployed QxQ within the declared bound. Unsupported replay or a
+failed natural control fails compliance; it is never replaced by a QDQ estimate.
 
-The row labelled "Router only" above is a quantize-dequantize cell: it rounds the
-router's weights and measures what that costs. That is *not* the routing term, and
-reading it as one gets the mechanism backwards. Routing changes because the
-activations arriving at the router changed — quantized attention and quantized
-experts upstream have already moved the residual stream — so a checkpoint that
-ships its router in BF16 has a bit-identical router and still selects different
-experts. On such a checkpoint the router weight cell is exactly zero while the
-routing term is not.
+### Natural divergence and forced routing are different
 
-The same argument says no QDQ cell is routing-free. Rounding any weight moves the
-residual stream, and every router downstream of that change sees different inputs,
-so the experts-only cell reroutes tokens too. The artifact reports each cell's own
-selection-change rate rather than claiming any cell holds routing fixed.
+The normal QxQ run still records the student's selected experts and compares them
+with the teacher trace. Selection flip rate, position flip rate, conditional KLD,
+and per-layer rates describe natural divergence after it happened. They do not
+measure BxQ: conditioning on positions where routing happened to agree is
+selection-biased, while BxQ forces teacher IDs over every scored position.
 
-So the routing term is measured, not emulated. `--measure-routing` records the
-reference's selected experts per token and per layer in a separate pass over the
-reference — expert IDs are a few hundred megabytes against tens of gigabytes of
-hidden states, so an existing capture stays valid — and the candidate's selections
-are compared against them while it is scored. The report carries the share of
-(token, layer) selections that changed, the share of positions where any layer
-rerouted, the mean divergence where routing held against where it changed, how
-divergence grows with the number of rerouted layers, and the per-layer rate, which
-rises with depth exactly as accumulated perturbation predicts.
+The teacher supplies IDs only. Student gating weights are recomputed from student
+router logits using that model's scoring, bias, normalization, and scaling rules.
+Using teacher weights would measure a different intervention.
 
-The ranking floor is the excess that rerouting puts into the mean: the flipped
-fraction times the gap between the two conditional means. It answers "how much of
-this mean would disappear if rerouted tokens diverged no more than the rest", and
-two deployed means closer together than that do not rank anything.
+### Synthetic QDQ diagnostics are not BxQ/QxQ
 
-Law 14 makes the decomposition mandatory for any reference whose config declares
-experts. `campaign.py` detects that from the checkpoint, inspects the deployed
-candidate for its scheme and router coverage, builds the cells with `qdq.py`,
-scores them against the capture the deployed run already produced, and writes
-`attribution.json`. Compliance refuses a routed candidate that has none, one whose
-capture manifest predates routing detection, and one scored without a measured
-routing term, so a routed model cannot exempt itself by omission. The one-pager
-prints the cells, the routing divergence, and the ranking floor, and links every
-supporting report and QDQ manifest; the leaderboard carries experts-only and
-routing-term columns next to the deployed mean.
+`expert_cell`, `router_cell`, `composite_cell`, and ladder rungs create synthetic
+BF16 checkpoints with selected weights rounded through a target format. They run
+on BF16 kernels and route naturally, so they remain useful weight-rounding
+diagnostics but are never labeled BxQ or QxQ. In particular, `expert_cell` changes
+the checkpoint and allows rerouting; BxQ leaves the deployed candidate unchanged
+and forces teacher IDs.
 
-Cells are named for the component carrying the error rather than written as `B×Q`
-or `Q×B`. That notation leaves the order of the factors to the reader, and it is
-routinely read both ways, which turns a shared metric into two different metrics
-wearing one label.
+The one-pager therefore has two distinct sections: the paired QxQ/BxQ
+intervention and a synthetic QDQ table. The leaderboard shows QxQ, BxQ,
+`QxQ - BxQ`, and natural route-flip rate. QDQ values remain in their own
+diagnostic table.
 
-### Where each cell sits on the perturbation ladder
+### Where each synthetic QDQ cell sits
 
-Quantization is not the only thing between a reference and a served token. Ordered
-by what each rung adds:
+The older perturbation ladder remains a separate weight-rounding analysis:
 
 | Rung | What it adds | Cell |
 |---|---|---|
@@ -457,9 +444,8 @@ by what each rung adds:
 | 4 | A quantized KV cache | not measured |
 | 5 | Realistic batching and shapes | not measured |
 
-Rerouting is not a rung of its own, because it is not something a rung adds: every
-rung from 1 up carries it, and each cell reports its own selection-change rate. The
-routing term is measured across the deployed run and reported separately.
+Rerouting is not a rung of its own: every synthetic rung routes naturally and
+reports its own selection-change rate. None of these rungs is BxQ or QxQ.
 
 Rung 3 minus rung 2 is published as the "beyond weight rounding" term. Where the
 checkpoint quantizes activations, that term carries activation quantization as well
@@ -604,7 +590,7 @@ sweep against.
 
 A deviation needs a named approver, a written justification, and a timestamp
 (Law 13). Anything less is not an approval and the underlying failure stands.
-Only Laws 1, 8, 11, 12, 14, and 16 permit an override at all, and Law 16 permits
+Only Laws 1, 8, 11, 12, and 16 permit an override at all, and Law 16 permits
 one only for a report that carries no weight digest. A digest that contradicts the
 published checkpoint is absolute: an approval there would excuse the single error
 the law exists to catch, so it is rejected even when the approval is complete.

@@ -255,6 +255,55 @@ class TrtLlmBf16ExpertsMonolithic(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsMonol
             RoutingMethodType.Sigmoid,
         ]
 
+    def apply_routed(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+    ) -> torch.Tensor:
+        from flashinfer.fused_moe import WeightLayout
+        from flashinfer.fused_moe.core import trtllm_bf16_moe_op
+
+        if apply_router_weight_on_input:
+            raise NotImplementedError(
+                "Exact forced routing is not supported when BF16 TRTLLM MoE "
+                "applies router weights on input."
+            )
+        result = trtllm_bf16_moe_op(
+            routing_logits=None,
+            routing_bias=None,
+            topk_ids=topk_ids,
+            expert_weights=topk_weights,
+            hidden_states=hidden_states,
+            gemm1_weights=w1,
+            gemm2_weights=w2,
+            gemm1_lora_delta=None,
+            num_experts=global_num_experts,
+            top_k=topk_ids.size(1),
+            n_group=None,
+            topk_group=None,
+            intermediate_size=self.intermediate_size_per_partition,
+            local_expert_offset=self.ep_rank * self.local_num_experts,
+            local_num_experts=self.local_num_experts,
+            routed_scaling_factor=None,
+            routing_method_type=RoutingMethodType.Renormalize,
+            use_shuffled_weight=True,
+            weight_layout=WeightLayout.BlockMajorK,
+            do_finalize=True,
+            activation_type=activation_to_flashinfer_int(activation),
+            tune_max_num_tokens=fi_moe_largest_bucket(self.moe_config),
+            norm_topk_prob=False,
+            routing_replay_out=None,
+        )
+        return result[0]
+
     def apply(
         self,
         hidden_states: torch.Tensor,

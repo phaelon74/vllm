@@ -63,6 +63,7 @@ from vllm.lora.layers import BaseLayerWithLoRA, LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
+from vllm.model_executor.layers.fused_moe.forced_routing import ForcedRouting
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
     bind_routed_experts_capturer,
@@ -730,6 +731,7 @@ class GPUModelRunner(
         self._kld_lm_head_cache: dict[
             str, tuple[torch.nn.Module, torch.nn.Module]
         ] = {}
+        self._forced_routing_cache: dict[str, torch.Tensor] = {}
 
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
@@ -1365,6 +1367,8 @@ class GPUModelRunner(
                 reference_logits_path=new_req_data.reference_logits_path,
                 reference_logits_key=new_req_data.reference_logits_key,
                 kld_vocab_size=new_req_data.kld_vocab_size,
+                reference_routing_path=new_req_data.reference_routing_path,
+                reference_routing_sha256=new_req_data.reference_routing_sha256,
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -4309,6 +4313,76 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         return bool(self.discard_request_mask.np[:num_reqs].all())
 
+    def _prepare_forced_moe_routing(
+        self,
+        num_scheduled_tokens: np.ndarray,
+        num_tokens_padded: int,
+    ) -> torch.Tensor | None:
+        """Align per-request BF16 route traces with this flattened model step."""
+        from safetensors.torch import load_file
+        from vllm.v1.sample.kld import sha256_file
+
+        req_ids = self.input_batch.req_ids
+        requests = [self.requests[req_id] for req_id in req_ids]
+        enabled = [request.reference_routing_path is not None for request in requests]
+        if not any(enabled):
+            return None
+        if not all(enabled):
+            raise ValueError(
+                "BxQ routing replay cannot share a batch with natural-routing requests"
+            )
+        if self.parallel_config.data_parallel_size > 1:
+            raise NotImplementedError(
+                "BxQ routing replay currently requires data_parallel_size=1; "
+                "cross-DP trace dispatch is not implemented."
+            )
+        chunks: list[torch.Tensor] = []
+        expected_tail: tuple[int, int] | None = None
+        for req_index, (request, count) in enumerate(
+            zip(requests, num_scheduled_tokens)
+        ):
+            path = request.reference_routing_path
+            expected_sha = request.reference_routing_sha256
+            assert path is not None and expected_sha is not None
+            if sha256_file(path) != expected_sha:
+                raise ValueError(f"BxQ routing trace hash mismatch: {path}")
+            trace = self._forced_routing_cache.get(path)
+            if trace is None:
+                tensors = load_file(path, device="cpu")
+                if set(tensors) != {"routed_experts"}:
+                    raise ValueError(
+                        f"BxQ routing trace must contain only routed_experts: {path}"
+                    )
+                trace = tensors["routed_experts"].to(torch.int32)
+                if trace.ndim != 3:
+                    raise ValueError(
+                        f"BxQ routing trace must be [tokens, layers, top_k]: {path}"
+                    )
+                self._forced_routing_cache[path] = trace
+            tail = (trace.shape[1], trace.shape[2])
+            if expected_tail is not None and tail != expected_tail:
+                raise ValueError("BxQ requests in one batch use incompatible traces")
+            expected_tail = tail
+            start = int(self.input_batch.num_computed_tokens_cpu[req_index])
+            end = start + int(count)
+            if start < 0 or end > trace.shape[0]:
+                raise ValueError(
+                    f"BxQ trace {path} has {trace.shape[0]} rows but step needs "
+                    f"[{start}:{end}]"
+                )
+            chunks.append(trace[start:end])
+        forced = torch.cat(chunks, dim=0)
+        if forced.shape[0] < num_tokens_padded:
+            padding_rows = num_tokens_padded - forced.shape[0]
+            padding = torch.arange(
+                forced.shape[2], dtype=forced.dtype
+            ).view(1, 1, -1).expand(padding_rows, forced.shape[1], -1)
+            forced = torch.cat(
+                [forced, padding],
+                dim=0,
+            )
+        return forced.to(self.device, non_blocking=True)
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -4433,6 +4507,9 @@ class GPUModelRunner(
             )
 
             num_tokens_padded = batch_desc.num_tokens
+            forced_moe_routing = self._prepare_forced_moe_routing(
+                num_scheduled_tokens_np, num_tokens_padded
+            )
             num_reqs_padded = (
                 batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
             )
@@ -4579,6 +4656,11 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
                 skip_compiled=has_encoder_input,
+                additional_kwargs=(
+                    {"forced_moe_routing": ForcedRouting(forced_moe_routing)}
+                    if forced_moe_routing is not None
+                    else None
+                ),
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(

@@ -125,6 +125,66 @@ class TrtLlmMxint4ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
     def supports_routing_replay_capture(self) -> bool:
         return True
 
+    def apply_routed(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+    ) -> torch.Tensor:
+        try:
+            from flashinfer.fused_moe.core import (
+                trtllm_mxint4_block_scale_moe_op,
+            )
+        except ImportError as exc:
+            raise NotImplementedError(
+                "Installed FlashInfer does not expose exact unpacked MXINT4 routing."
+            ) from exc
+
+        if apply_router_weight_on_input:
+            raise NotImplementedError(
+                "Exact forced routing is not supported when MXINT4 TRTLLM MoE "
+                "applies router weights on input."
+            )
+        if self.w1_scale is None or self.w2_scale is None:
+            raise RuntimeError("MXINT4 forced routing requires weight scales.")
+
+        result = trtllm_mxint4_block_scale_moe_op(
+            routing_logits=None,
+            routing_bias=None,
+            topk_ids=topk_ids,
+            expert_weights=topk_weights,
+            hidden_states=hidden_states,
+            gemm1_weights=w1,
+            gemm1_weights_scale=self.w1_scale,
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
+            gemm1_lora_delta=None,
+            gemm2_weights=w2,
+            gemm2_weights_scale=self.w2_scale,
+            num_experts=global_num_experts,
+            top_k=topk_ids.size(1),
+            n_group=None,
+            topk_group=None,
+            intermediate_size=self.intermediate_size_per_partition,
+            local_expert_offset=self.ep_rank * self.local_num_experts,
+            num_local_experts=self.local_num_experts,
+            routed_scaling_factor=None,
+            routing_method_type=RoutingMethodType.Renormalize,
+            do_finalize=True,
+            tune_max_num_tokens=8192,
+            norm_topk_prob=False,
+            routing_replay_out=None,
+        )
+        return result[0] if isinstance(result, list) else result
+
     def apply(
         self,
         hidden_states: torch.Tensor,

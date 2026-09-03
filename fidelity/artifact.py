@@ -23,7 +23,7 @@ from typing import Any
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from redaction import redact_env  # noqa: E402 - sibling module
 
-LAWS_VERSION = 9
+LAWS_VERSION = 10
 PROGRAM = "Local Inference Lab"
 # Vendor calibration on packed int4. QDQ still matches format only.
 _CALIBRATED_ALGORITHMS = frozenset({"awq", "gptq", "autoround"})
@@ -202,9 +202,11 @@ def _environment(runtime_env: dict[str, Any], env_dir: str | None) -> list[str]:
             "float32 matmul precision",
             str(torch_info.get("float32_matmul_precision") or "n/a"),
         ),
-        ("TF32 (matmul / cuDNN)",
-         f"{torch_info.get('allow_tf32_matmul')} / "
-         f"{torch_info.get('allow_tf32_cudnn')}"),
+        (
+            "TF32 (matmul / cuDNN)",
+            f"{torch_info.get('allow_tf32_matmul')} / "
+            f"{torch_info.get('allow_tf32_cudnn')}",
+        ),
         (
             "torch deterministic algorithms",
             str(torch_info.get("deterministic_algorithms")),
@@ -289,60 +291,98 @@ def _files(artifact_dir: str | None, candidate: str | None) -> list[str]:
     prefix = f"{candidate}/" if candidate else ""
     entries: list[tuple[str, str]] = [
         (f"{prefix}report.md", "This document."),
-        (f"{prefix}report.json",
-         "Every statistic behind it, machine-readable: per-bucket means, "
-         "percentiles, agreement rates, and the phase timings."),
-        (f"{prefix}manifest.json",
-         "The capture manifest this result is bound to (Law 5). Scoring refuses "
-         "to run if the live configuration differs from it."),
-        (f"{prefix}compliance.json",
-         "The law-by-law receipt, including the comparability key."),
-        ("baselines/self-kld.json",
-         "The zero-baseline proof required by Law 1: the reference scored against "
-         "a capture of itself."),
-        ("suite/suite-manifest.json",
-         "The frozen evaluation input's identity: token hashes per context and per "
-         "partition, sources, strata, and the analysis/qualification split."),
-        ("suite/tokens",
-         "The token IDs themselves. These are the evaluation input, not a "
-         "description of it; retokenizing source text does not reproduce them."),
-        ("suite/sources.json",
-         "Per-context provenance: dataset, revision, licence, source unit, and the "
-         "deterministic token offset chosen within the document."),
-        ("suite/validation/capability-overlap.json",
-         "The benchmark-contamination scan and every document it blocked."),
-        ("reference/manifest.json",
-         "The reference capture's own manifest: geometry, vocabulary, storage "
-         "mode, and a hash for every tensor file."),
-        ("reference",
-         "The reusable reference distributions. Pass this directory as "
-         "`--reference-logits` to score a new candidate against the same "
-         "reference without loading the reference checkpoint."),
-        ("reference/lm_head.safetensors",
-         "The reference language-model head, which turns the stored hidden states "
-         "back into reference logits."),
-        ("environment/runtime.json",
-         "Machine-readable provenance: torch, CUDA, cuDNN, NCCL, driver, devices, "
-         "and the captured environment variables."),
-        ("environment/summary.md",
-         "The same provenance as prose, plus an index of every captured file."),
-        ("environment/toolchain-nvcc.txt",
-         "`nvcc --version` verbatim; `toolchain-gcc.txt` and `toolchain-ldd.txt` "
-         "sit beside it."),
-        ("environment/gpu-smi-query.txt",
-         "`nvidia-smi -q` verbatim: ECC state, persistence mode, clocks, and "
-         "throttle reasons, any of which can move a bitwise result."),
-        ("environment/pip-freeze.txt",
-         "Every installed package version in the scoring environment."),
-        ("environment/models",
-         "Checkpoint fingerprints: file listing, sizes, config and tokenizer "
-         "hashes, and `config.json` verbatim for each model scored."),
-        ("checksums.txt",
-         "`sha256sum --check` compatible over every other file here. This is "
-         "authoritative for integrity (Law 12)."),
-        ("LAWS.md",
-         "The laws this artifact was produced under, including the override "
-         "procedure."),
+        (
+            f"{prefix}report.json",
+            "Every statistic behind it, machine-readable: per-bucket means, "
+            "percentiles, agreement rates, and the phase timings.",
+        ),
+        (
+            f"{prefix}manifest.json",
+            "The capture manifest this result is bound to (Law 5). Scoring refuses "
+            "to run if the live configuration differs from it.",
+        ),
+        (
+            f"{prefix}compliance.json",
+            "The law-by-law receipt, including the comparability key.",
+        ),
+        (
+            "baselines/self-kld.json",
+            "The zero-baseline proof required by Law 1: the reference scored against "
+            "a capture of itself.",
+        ),
+        (
+            "suite/suite-manifest.json",
+            "The frozen evaluation input's identity: token hashes per context and per "
+            "partition, sources, strata, and the analysis/qualification split.",
+        ),
+        (
+            "suite/tokens",
+            "The token IDs themselves. These are the evaluation input, not a "
+            "description of it; retokenizing source text does not reproduce them.",
+        ),
+        (
+            "suite/sources.json",
+            "Per-context provenance: dataset, revision, licence, source unit, and the "
+            "deterministic token offset chosen within the document.",
+        ),
+        (
+            "suite/validation/capability-overlap.json",
+            "The benchmark-contamination scan and every document it blocked.",
+        ),
+        (
+            "reference/manifest.json",
+            "The reference capture's own manifest: geometry, vocabulary, storage "
+            "mode, and a hash for every tensor file.",
+        ),
+        (
+            "reference",
+            "The reusable reference distributions. Pass this directory as "
+            "`--reference-logits` to score a new candidate against the same "
+            "reference without loading the reference checkpoint.",
+        ),
+        (
+            "reference/lm_head.safetensors",
+            "The reference language-model head, which turns the stored hidden states "
+            "back into reference logits.",
+        ),
+        (
+            "environment/runtime.json",
+            "Machine-readable provenance: torch, CUDA, cuDNN, NCCL, driver, devices, "
+            "and the captured environment variables.",
+        ),
+        (
+            "environment/summary.md",
+            "The same provenance as prose, plus an index of every captured file.",
+        ),
+        (
+            "environment/toolchain-nvcc.txt",
+            "`nvcc --version` verbatim; `toolchain-gcc.txt` and `toolchain-ldd.txt` "
+            "sit beside it.",
+        ),
+        (
+            "environment/gpu-smi-query.txt",
+            "`nvidia-smi -q` verbatim: ECC state, persistence mode, clocks, and "
+            "throttle reasons, any of which can move a bitwise result.",
+        ),
+        (
+            "environment/pip-freeze.txt",
+            "Every installed package version in the scoring environment.",
+        ),
+        (
+            "environment/models",
+            "Checkpoint fingerprints: file listing, sizes, config and tokenizer "
+            "hashes, and `config.json` verbatim for each model scored.",
+        ),
+        (
+            "checksums.txt",
+            "`sha256sum --check` compatible over every other file here. This is "
+            "authoritative for integrity (Law 12).",
+        ),
+        (
+            "LAWS.md",
+            "The laws this artifact was produced under, including the override "
+            "procedure.",
+        ),
     ]
     rows = []
     for rel, purpose in entries:
@@ -397,8 +437,9 @@ def _profiles(report: dict[str, Any]) -> list[str]:
             for b in conf
         ]
         out += ["## Error by reference confidence", ""]
-        out += _table(rows, ("Reference top-1 probability", "Positions", "Share",
-                             "Mean KLD"))
+        out += _table(
+            rows, ("Reference top-1 probability", "Positions", "Share", "Mean KLD")
+        )
         out.append("")
     topk = report.get("topk_agreement") or {}
     if topk:
@@ -413,8 +454,10 @@ def _profiles(report: dict[str, Any]) -> list[str]:
 def _head_split(report: dict[str, Any], manifest: dict[str, Any]) -> list[str]:
     """Trunk versus deployed, per Law 8."""
     rows = [
-        ("Trunk (candidate hidden states, reference head)",
-         _kld(report.get("trunk_mean_kld"))),
+        (
+            "Trunk (candidate hidden states, reference head)",
+            _kld(report.get("trunk_mean_kld")),
+        ),
         ("Deployed (candidate's own head)", _kld(report.get("deployed_mean_kld"))),
         ("Head-associated delta (not additive)", _kld(report.get("head_delta_kld"))),
         ("Reference head", str((manifest.get("lm_head") or {}).get("runtime"))),
@@ -476,7 +519,7 @@ def _compliance(receipt: dict[str, Any], baseline: dict[str, Any] | None) -> lis
 
 
 def _link(cell: dict[str, Any] | None) -> str:
-    """Markdown links to a cell's published report and QDQ manifest.
+    """Markdown links to a cell's published report and optional QDQ manifest.
 
     Only relative paths are linked. A cell still carrying its work-directory path
     was not published, and a link into a path the reader does not have is worse
@@ -520,9 +563,7 @@ def _deployed_quantization(deployed: dict[str, Any]) -> list[str]:
         (
             "Declared method",
             str(
-                inspection.get("quant_method")
-                or declared.get("quant_method")
-                or "n/a"
+                inspection.get("quant_method") or declared.get("quant_method") or "n/a"
             ),
         ),
         ("Algorithm", str(algorithm or "n/a")),
@@ -552,8 +593,7 @@ def _deployed_quantization(deployed: dict[str, Any]) -> list[str]:
     partial = [name for name, _, verdict in rows if verdict == "some"]
     if partial:
         matched = sum(
-            (counts or {}).get("quantized") or 0
-            for counts in coverage.values()
+            (counts or {}).get("quantized") or 0 for counts in coverage.values()
         )
         out += [
             f"Partial coverage in {', '.join(partial)}. Component cells round "
@@ -591,18 +631,11 @@ def _beyond_rounding_what(
     Attribution files that predate `match_mode` are treated as per-component.
     """
     if partial and match_mode != "per_tensor":
-        return (
-            "not attributable: the composite cell over-rounds "
-            + ", ".join(partial)
-        )
+        return "not attributable: the composite cell over-rounds " + ", ".join(partial)
     if algorithm in _CALIBRATED_ALGORITHMS:
-        what = (
-            "calibration benefit, activation quantization, and kernel arithmetic"
-        )
+        what = "calibration benefit, activation quantization, and kernel arithmetic"
         if isinstance(engine, (int, float)) and engine < 0:
-            what += (
-                "; the deployed pack beat round-to-nearest at the same format"
-            )
+            what += "; the deployed pack beat round-to-nearest at the same format"
         return what
     return "activation quantization and kernel arithmetic"
 
@@ -624,6 +657,7 @@ def _derived_terms(
     last thing a reader saw about routing. Each row links to the section that
     derives it.
     """
+
     def share(value: Any) -> str:
         if not isinstance(value, (int, float)):
             return ""
@@ -638,9 +672,7 @@ def _derived_terms(
                 "Beyond weight rounding",
                 f"{engine:+.8f}",
                 share(engine),
-                _beyond_rounding_what(
-                    algorithm, engine, partial, match_mode
-                ),
+                _beyond_rounding_what(algorithm, engine, partial, match_mode),
                 "[Beyond weight rounding](#beyond-weight-rounding)",
             )
         )
@@ -687,16 +719,74 @@ def _derived_terms(
         "Two terms sit outside every cell above, because no cell can hold them. "
         "They are the reason the deployed mean is not a precision measurement:",
         "",
-    ] + _table(
-        rows, ("Term", "Value", "Share", "What it is", "Derived in")
-    )
+    ] + _table(rows, ("Term", "Value", "Share", "What it is", "Derived in"))
 
 
-def _attribution(receipt: dict[str, Any]) -> list[str]:
-    """Where a routed model's divergence came from, per Law 14."""
+def _paired_routing_intervention(receipt: dict[str, Any]) -> list[str]:
+    """Render the deployed QxQ run beside the teacher-ID-forced BxQ run."""
     attribution = receipt.get("attribution")
     if not isinstance(attribution, dict):
         return []
+    qxq = attribution.get("qxq_cell")
+    bxq = attribution.get("bxq_cell")
+    if not isinstance(qxq, dict) or not isinstance(bxq, dict):
+        return []
+    delta = attribution.get("routing_intervention_delta")
+    routing = receipt.get("routing") or {}
+    out = [
+        "## Routed-model intervention: QxQ and BxQ",
+        "",
+        "**The first axis is routing source; the second Q is the same unchanged "
+        "quantized candidate in both runs.** QxQ uses the student's natural "
+        "expert IDs. BxQ forces the BF16 teacher's expert IDs while the student "
+        "computes its own gating weights for those experts.",
+        "",
+    ]
+    out += _table(
+        [
+            (
+                "QxQ",
+                "student natural IDs; student gating weights",
+                _kld(qxq.get("mean_kld")),
+                _link(qxq),
+            ),
+            (
+                "BxQ",
+                "BF16 teacher IDs; student gating weights",
+                _kld(bxq.get("mean_kld")),
+                _link(bxq),
+            ),
+            (
+                "QxQ - BxQ",
+                "paired routing-intervention delta; not additive attribution",
+                "n/a" if delta is None else f"{float(delta):+.8f}",
+                "",
+            ),
+        ],
+        ("Run", "Routing", "Mean KLD", "Support"),
+    )
+    out += [
+        "",
+        f"Natural QxQ selections changed from the teacher at "
+        f"**{_pct(routing.get('selection_flip_rate'))}** of (token, layer) "
+        f"choices. BxQ protocol {bxq.get('protocol_version')}; routing trace "
+        f"`{_short(bxq.get('routing_trace_sha256'), 16)}`.",
+        "",
+    ]
+    return out
+
+
+def _attribution(receipt: dict[str, Any]) -> list[str]:
+    """Paired routed runs plus distinctly synthetic QDQ diagnostics."""
+    attribution = receipt.get("attribution")
+    if not isinstance(attribution, dict):
+        return []
+    paired = _paired_routing_intervention(receipt)
+    if not any(
+        isinstance(attribution.get(name), dict)
+        for name in ("expert_cell", "router_cell", "composite_cell")
+    ):
+        return paired
     deployed = receipt.get("mean_kld")
     expert_cell = attribution.get("expert_cell") or {}
     expert = expert_cell.get("mean_kld")
@@ -714,23 +804,19 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
     activations = inspection.get("activation_scheme") or declared.get(
         "activation_scheme"
     )
-    algorithm = (
-        attribution.get("quant_algorithm") or inspection.get("quant_algorithm")
-    )
+    algorithm = attribution.get("quant_algorithm") or inspection.get("quant_algorithm")
     composite_mode = composite.get("match_mode")
     over_rounded = composite.get("partial_components")
     if not isinstance(over_rounded, list):
         over_rounded = []
 
-    out = [
-        "## Component attribution",
+    out = paired + [
+        "## Synthetic QDQ weight-rounding diagnostics",
         "",
-        "This reference routes tokens to experts, so the deployed mean is not a "
-        "single effect. Each cell is the reference with one component rounded "
-        "through the deployed scheme and run on BF16 kernels, scored on the same "
-        "tokens against the same capture. The cells do not sum to the deployed "
-        "mean and are not meant to: once a token is routed elsewhere, degrading "
-        "the expert it no longer uses costs nothing.",
+        "These cells create synthetic BF16 checkpoints with selected weights "
+        "quantize-dequantized through the deployed format, then route naturally "
+        "on BF16 kernels. They diagnose weight rounding. They are not BxQ or "
+        "QxQ, and they do not sum to either deployed run.",
         "",
         "No cell here holds expert selection fixed. Rounding any weight changes "
         "the residual stream, and every router downstream of that change sees "
@@ -741,7 +827,7 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
         "",
     ]
     out += _deployed_quantization(attribution.get("deployed") or {})
-    out += ["### Component cells", ""]
+    out += ["### Synthetic QDQ cells", ""]
     routing = receipt.get("routing") or {}
     rows = [
         (
@@ -774,15 +860,6 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
                 _link(composite),
             )
         )
-    rows.append(
-        (
-            "Deployed",
-            "as shipped, quantized kernels",
-            _kld(deployed),
-            _pct(routing.get("selection_flip_rate")),
-            "[report.json](report.json)",
-        )
-    )
     out += _table(
         rows, ("Cell", "What it isolates", "Mean KLD", "Selections changed", "Support")
     )
@@ -938,7 +1015,7 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
 
 
 def _routing(receipt: dict[str, Any]) -> list[str]:
-    """What changing expert selection cost, measured rather than emulated."""
+    """Natural QxQ routing divergence measured against teacher selections."""
     routing = receipt.get("routing")
     if not isinstance(routing, dict) or not routing:
         return []
@@ -951,11 +1028,9 @@ def _routing(receipt: dict[str, Any]) -> list[str]:
     out = [
         "## Routing divergence",
         "",
-        f"Both runs saw the same tokens, and the candidate's routers are the "
-        f"reference's routers to the bit where the checkpoint leaves them "
-        f"unquantized. They still selected different experts, because the "
-        f"activations arriving at them were already perturbed. This section "
-        f"compares the two runs' recorded selections over "
+        f"This is the observed selection divergence in the normal QxQ run, not "
+        f"the BxQ intervention and not a QDQ router-weight cell. It compares "
+        f"the student's natural expert IDs with the teacher's recorded IDs over "
         f"{routing.get('num_layers')} routed layers, "
         f"{routing.get('num_experts_per_tok')} experts per token.",
         "",
@@ -1080,7 +1155,7 @@ def _routing(receipt: dict[str, Any]) -> list[str]:
     if rates:
         worst = max(range(len(rates)), key=lambda i: rates[i])
         early = sum(rates[: max(1, len(rates) // 4)]) / max(1, len(rates) // 4)
-        late = sum(rates[-max(1, len(rates) // 4):]) / max(1, len(rates) // 4)
+        late = sum(rates[-max(1, len(rates) // 4) :]) / max(1, len(rates) // 4)
         out += [
             f"Per-layer selection change runs from {min(rates) * 100:.2f}% to "
             f"{max(rates) * 100:.2f}% (worst at layer {worst}), averaging "
@@ -1288,9 +1363,7 @@ def _weakest_domain(receipt: dict[str, Any]) -> tuple[str | None, float | None]:
     best: tuple[str | None, float | None] = (None, None)
     for row in rows:
         mean = ((row.get("cells") or {}).get(primary) or {}).get("mean_kld")
-        if isinstance(mean, (int, float)) and (
-            best[1] is None or mean > best[1]
-        ):
+        if isinstance(mean, (int, float)) and (best[1] is None or mean > best[1]):
             best = (str(row.get("key")), float(mean))
     return best
 
@@ -1336,7 +1409,7 @@ def candidate_identity(
             quant = f"{family}-{after}" if after else rest
     prefix = f"{family}-"
     if family and quant.startswith(prefix):
-        stripped = quant[len(prefix):]
+        stripped = quant[len(prefix) :]
         if stripped:
             quant = stripped
     return family, author, quant
@@ -1376,9 +1449,17 @@ def render_leaderboard(results: list[dict[str, Any]]) -> tuple[str, list[list[An
         )
         lines.append("")
         ranked = sorted(
-            members, key=lambda m: m["report"].get("mean_kld") or float("inf")
+            members,
+            key=lambda m: (
+                ((m["receipt"].get("attribution") or {}).get("qxq_cell") or {}).get(
+                    "mean_kld"
+                )
+                or m["report"].get("mean_kld")
+                or float("inf")
+            ),
         )
         rows = []
+        qdq_rows = []
         for item in ranked:
             report = item["report"]
             compliant = item["receipt"].get("compliant", False)
@@ -1387,20 +1468,39 @@ def render_leaderboard(results: list[dict[str, Any]]) -> tuple[str, list[list[An
             if compliant and overridden:
                 status = f"yes (Law {', '.join(str(o) for o in overridden)} override)"
             attribution = item["receipt"].get("attribution") or {}
-            expert = (attribution.get("expert_cell") or {}).get("mean_kld")
-            floor = item["receipt"].get("ranking_floor")
+            qxq = (attribution.get("qxq_cell") or {}).get(
+                "mean_kld", report.get("mean_kld")
+            )
+            bxq = (attribution.get("bxq_cell") or {}).get("mean_kld")
+            delta = attribution.get("routing_intervention_delta")
+            flip_rate = (item["receipt"].get("routing") or {}).get(
+                "selection_flip_rate"
+            )
             weakest, weakest_kld = _weakest_domain(item["receipt"])
             family, author, quant = candidate_identity(
                 item["label"], item["report"].get("student_model")
             )
+            expert_qdq = (attribution.get("expert_cell") or {}).get("mean_kld")
+            composite_qdq = (attribution.get("composite_cell") or {}).get("mean_kld")
+            if expert_qdq is not None or composite_qdq is not None:
+                qdq_rows.append(
+                    (
+                        family,
+                        author or "n/a",
+                        quant,
+                        _kld(expert_qdq),
+                        _kld(composite_qdq),
+                    )
+                )
             rows.append(
                 (
                     family,
                     author or "n/a",
                     quant,
-                    _kld(report.get("mean_kld")),
-                    _kld(expert) if attribution else "n/a",
-                    _kld(floor) if floor is not None else "n/a",
+                    _kld(qxq),
+                    _kld(bxq),
+                    "n/a" if delta is None else f"{float(delta):+.8f}",
+                    _pct(flip_rate),
                     f"{weakest} {_kld(weakest_kld)}" if weakest else "n/a",
                     _kld(report.get("median_kld")),
                     _kld(report.get("p99_kld")),
@@ -1410,21 +1510,66 @@ def render_leaderboard(results: list[dict[str, Any]]) -> tuple[str, list[list[An
                     status,
                 )
             )
-            csv_rows.append([
-                key[:12], family, author, quant, item["label"],
-                report.get("mean_kld"),
-                expert, floor, weakest, weakest_kld,
-                report.get("median_kld"), report.get("p99_kld"),
-                report.get("max_kld"), report.get("top1_agreement"),
-                report.get("num_positions"), compliant,
-            ])
+            csv_rows.append(
+                [
+                    key[:12],
+                    family,
+                    author,
+                    quant,
+                    item["label"],
+                    qxq,
+                    bxq,
+                    delta,
+                    flip_rate,
+                    weakest,
+                    weakest_kld,
+                    report.get("median_kld"),
+                    report.get("p99_kld"),
+                    report.get("max_kld"),
+                    report.get("top1_agreement"),
+                    report.get("num_positions"),
+                    compliant,
+                ]
+            )
         lines += _table(
             rows,
-            ("Family", "Author", "Quant", "Mean KLD", "Experts only",
-             "Routing term", "Weakest domain", "Median", "p99", "Max", "Top-1",
-             "Positions", "Law-compliant"),
+            (
+                "Family",
+                "Author",
+                "Quant",
+                "QxQ KLD",
+                "BxQ KLD",
+                "QxQ - BxQ",
+                "Natural route flips",
+                "Weakest domain",
+                "Median",
+                "p99",
+                "Max",
+                "Top-1",
+                "Positions",
+                "Law-compliant",
+            ),
         )
         lines.append("")
+        if qdq_rows:
+            lines += [
+                "### Synthetic QDQ diagnostics",
+                "",
+                "These weight-rounding cells route naturally on synthetic BF16 "
+                "checkpoints. They are not BxQ or QxQ.",
+                "",
+                *_table(
+                    qdq_rows,
+                    (
+                        "Family",
+                        "Author",
+                        "Quant",
+                        "Experts-only QDQ",
+                        "Composite QDQ",
+                    ),
+                ),
+                "",
+            ]
         if any(_weakest_domain(m["receipt"])[0] for m in ranked):
             lines += [
                 "The weakest-domain column is the stratum with the highest mean "
@@ -1433,15 +1578,12 @@ def render_leaderboard(results: list[dict[str, Any]]) -> tuple[str, list[list[An
                 "kinds of text; each candidate's `strata.md` has the full table.",
                 "",
             ]
-        if any(m["receipt"].get("ranking_floor") for m in ranked):
+        if any((m["receipt"].get("attribution") or {}).get("bxq_cell") for m in ranked):
             lines += [
-                "Rows for routed models are ranked on the deployed mean, but a "
-                "routed model's deployed mean carries a saturating routing term "
-                "(Law 14): tokens whose expert selection changed diverge far "
-                "more than tokens whose selection survived, and that term does "
-                "not scale with precision. The routing-term column is the floor "
-                "below which two deployed means do not rank anything; compare "
-                "the experts-only column to compare quantization schemes.",
+                "Routed rows are ranked on QxQ, the unchanged candidate's normal "
+                "deployed run. BxQ forces BF16 teacher expert IDs while retaining "
+                "student gating weights; QxQ - BxQ is the paired intervention "
+                "delta. The flip rate is measured on natural QxQ routing.",
                 "",
             ]
     return "\n".join(lines).rstrip() + "\n", csv_rows
@@ -1491,8 +1633,15 @@ def _cmd_onepager(args: argparse.Namespace) -> int:
         rel = os.path.relpath(here, os.path.abspath(args.artifact_dir))
         candidate_dir = rel.replace(os.sep, "/") if rel not in (".", "..") else None
     text = render_onepager(
-        report, manifest, receipt, runtime_env, _load(args.self_report), label,
-        args.env_dir, args.artifact_dir, candidate_dir,
+        report,
+        manifest,
+        receipt,
+        runtime_env,
+        _load(args.self_report),
+        label,
+        args.env_dir,
+        args.artifact_dir,
+        candidate_dir,
     )
     _write(args.out, text)
     return 0
@@ -1501,8 +1650,10 @@ def _cmd_onepager(args: argparse.Namespace) -> int:
 def _cmd_leaderboard(args: argparse.Namespace) -> int:
     results = collect_results(args.results_root)
     if not results:
-        print(f"no results with report.json + compliance.json under "
-              f"{args.results_root}", file=sys.stderr)
+        print(
+            f"no results with report.json + compliance.json under {args.results_root}",
+            file=sys.stderr,
+        )
         return 2
     text, csv_rows = render_leaderboard(results)
     _write(args.out, text)
@@ -1510,12 +1661,27 @@ def _cmd_leaderboard(args: argparse.Namespace) -> int:
         os.makedirs(os.path.dirname(os.path.abspath(args.csv)), exist_ok=True)
         with open(args.csv, "w", encoding="utf-8", newline="") as handle:
             writer = csv.writer(handle)
-            writer.writerow(["group", "family", "author", "quant", "candidate",
-                             "mean_kld",
-                             "expert_cell_kld", "routing_term",
-                             "weakest_domain", "weakest_domain_kld",
-                             "median_kld", "p99_kld", "max_kld",
-                             "top1_agreement", "positions", "law_compliant"])
+            writer.writerow(
+                [
+                    "group",
+                    "family",
+                    "author",
+                    "quant",
+                    "candidate",
+                    "qxq_mean_kld",
+                    "bxq_mean_kld",
+                    "routing_intervention_delta",
+                    "natural_routing_flip_rate",
+                    "weakest_domain",
+                    "weakest_domain_kld",
+                    "median_kld",
+                    "p99_kld",
+                    "max_kld",
+                    "top1_agreement",
+                    "positions",
+                    "law_compliant",
+                ]
+            )
             writer.writerows(csv_rows)
         print(f"wrote {args.csv}")
     return 0
@@ -1540,9 +1706,27 @@ PLOT_MARKERS: dict[str, str] = {
 }
 _PLOT_FALLBACK = ("s", "D", "*", "h", "8", "d", "p", "<", ">")
 _PLOT_COLORS = (
-    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
-    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+    "#1f77b4",
+    "#ff7f0e",
+    "#2ca02c",
+    "#d62728",
+    "#9467bd",
+    "#8c564b",
+    "#e377c2",
+    "#7f7f7f",
+    "#bcbd22",
+    "#17becf",
 )
+PLOT_METRICS = {
+    "mean_kld": "Mean KL divergence",
+    "qxq_mean_kld": "QxQ mean KL divergence",
+    "bxq_mean_kld": "BxQ mean KL divergence",
+}
+PLOT_LEGEND_LABELS = {
+    "mean_kld": "KLD",
+    "qxq_mean_kld": "QxQ",
+    "bxq_mean_kld": "BxQ",
+}
 
 
 def _plot_shapes(kinds: list[str]) -> dict[str, str]:
@@ -1557,8 +1741,31 @@ def _plot_shapes(kinds: list[str]) -> dict[str, str]:
     return out
 
 
-def render_plot(payload: dict[str, Any], out: str) -> str | None:
-    """Scatter mean KLD against on-disk size for one family.
+def shared_plot_limits(
+    payload: dict[str, Any],
+    metrics: tuple[str, ...] = ("qxq_mean_kld", "bxq_mean_kld"),
+) -> tuple[float, float] | None:
+    """One padded Y range shared by selected metrics."""
+    values = [
+        float(q[metric])
+        for q in payload.get("quants") or []
+        for metric in metrics
+        if isinstance(q.get(metric), (int, float))
+    ]
+    if not values:
+        return None
+    pad = max(1e-3, (max(values) - min(values)) * 0.15 + 1e-3)
+    return max(0.0, min(values) - pad), max(values) + pad
+
+
+def render_plot(
+    payload: dict[str, Any],
+    out: str,
+    *,
+    metric: str = "mean_kld",
+    y_limits: tuple[float, float] | None = None,
+) -> str | None:
+    """Scatter a selected KLD metric against on-disk size for one family.
 
     Colour carries the author and shape carries the format, never both, so two
     releases from one author read as the same hand at different settings. A
@@ -1567,41 +1774,52 @@ def render_plot(payload: dict[str, Any], out: str) -> str | None:
     """
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         from matplotlib.lines import Line2D
     except ImportError:
         return "matplotlib is not installed; skipping the family plot"
 
+    if metric not in PLOT_METRICS:
+        raise ValueError(f"unsupported plot metric {metric!r}")
     points = [
-        q for q in payload.get("quants") or []
-        if q.get("disk_size_gib") and q.get("mean_kld") is not None
+        q
+        for q in payload.get("quants") or []
+        if q.get("disk_size_gib") and q.get(metric) is not None
     ]
     if not points:
-        return "no candidate has both a size and a mean KLD; skipping the plot"
+        return f"no candidate has both a size and {metric}; skipping the plot"
 
+    all_quants = payload.get("quants") or []
     colours = {
         author: _PLOT_COLORS[index % len(_PLOT_COLORS)]
         for index, author in enumerate(
-            sorted({str(q.get("creator") or "unknown") for q in points})
+            sorted({str(q.get("creator") or "unknown") for q in all_quants})
         )
     }
-    shapes = _plot_shapes([str(q.get("type") or "unknown") for q in points])
+    shapes = _plot_shapes(
+        [str(q.get("type") or "unknown") for q in all_quants]
+    )
 
     fig, ax = plt.subplots(figsize=(10, 6), facecolor=PLOT_FACE)
     ax.set_facecolor(PLOT_FACE)
     xs = [float(q["disk_size_gib"]) for q in points]
-    ys = [float(q["mean_kld"]) for q in points]
+    ys = [float(q[metric]) for q in points]
     for q, x, y in zip(points, xs, ys, strict=True):
         ax.scatter(
-            [x], [y], s=120,
+            [x],
+            [y],
+            s=120,
             c=colours[str(q.get("creator") or "unknown")],
             marker=shapes[str(q.get("type") or "unknown")],
-            edgecolors="black", linewidths=0.6, zorder=3,
+            edgecolors="black",
+            linewidths=0.6,
+            zorder=3,
         )
 
     ax.set_xlabel("File size (GiB)", fontweight="bold")
-    ax.set_ylabel("Mean KL divergence (lower is better)", fontweight="bold")
+    ax.set_ylabel(f"{PLOT_METRICS[metric]} (lower is better)", fontweight="bold")
     heading = [t for t in (payload.get("title"), payload.get("subtitle")) if t]
     if heading:
         ax.set_title("\n".join(heading), fontweight="bold", fontsize=11, pad=16)
@@ -1610,32 +1828,45 @@ def render_plot(payload: dict[str, Any], out: str) -> str | None:
         spine.set_linewidth(0.8)
         spine.set_edgecolor("black")
     x_pad = max(1.0, (max(xs) - min(xs)) * 0.12 + 0.5)
-    y_pad = max(1e-3, (max(ys) - min(ys)) * 0.15 + 1e-3)
     ax.set_xlim(min(xs) - x_pad, max(xs) + x_pad)
-    ax.set_ylim(max(0.0, min(ys) - y_pad), max(ys) + y_pad)
+    if y_limits is None:
+        y_pad = max(1e-3, (max(ys) - min(ys)) * 0.15 + 1e-3)
+        y_limits = (max(0.0, min(ys) - y_pad), max(ys) + y_pad)
+    ax.set_ylim(*y_limits)
 
     ax.legend(
         handles=[
             Line2D(
-                [0], [0],
+                [0],
+                [0],
                 color=colours[str(q.get("creator") or "unknown")],
                 marker=shapes[str(q.get("type") or "unknown")],
-                linestyle="None", markersize=9,
-                markeredgecolor="black", markeredgewidth=0.6,
-                label=f"{q.get('id') or q.get('creator')} — KLD "
-                      f"{float(q['mean_kld']):.6f}",
+                linestyle="None",
+                markersize=9,
+                markeredgecolor="black",
+                markeredgewidth=0.6,
+                label=f"{q.get('id') or q.get('creator')} — "
+                f"{PLOT_LEGEND_LABELS[metric]} "
+                f"{float(q[metric]):.6f}",
             )
-            for q in sorted(points, key=lambda q: -float(q["mean_kld"]))
+            for q in sorted(points, key=lambda q: -float(q[metric]))
         ],
-        loc="upper right", frameon=True, fancybox=False,
-        edgecolor="black", fontsize=8,
+        loc="upper right",
+        frameon=True,
+        fancybox=False,
+        edgecolor="black",
+        fontsize=8,
     )
     fig.tight_layout()
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     fig.savefig(out, dpi=150, facecolor=PLOT_FACE, bbox_inches="tight")
     plt.close(fig)
     missing = len(payload.get("quants") or []) - len(points)
-    return f"{missing} candidate(s) omitted for want of a size" if missing else None
+    return (
+        f"{missing} candidate(s) omitted for want of a size or {metric}"
+        if missing
+        else None
+    )
 
 
 def _yaml_scalar(value: Any) -> str:
@@ -1677,8 +1908,19 @@ def front_matter(fields: dict[str, Any]) -> list[str]:
 def render_card(payload: dict[str, Any], laws_version: int = LAWS_VERSION) -> str:
     """The artifact repo's own card: what this family is and how to read it."""
     title = str(payload.get("title") or "Distribution fidelity artifact")
-    quants = [q for q in payload.get("quants") or [] if q.get("mean_kld") is not None]
-    ranked = sorted(quants, key=lambda q: float(q["mean_kld"]))
+    quants = [
+        q
+        for q in payload.get("quants") or []
+        if q.get("qxq_mean_kld") is not None or q.get("mean_kld") is not None
+    ]
+    ranked = sorted(
+        quants,
+        key=lambda q: float(
+            q.get("qxq_mean_kld")
+            if q.get("qxq_mean_kld") is not None
+            else q.get("mean_kld")
+        ),
+    )
     lines = front_matter(
         {
             "pretty_name": title,
@@ -1709,31 +1951,97 @@ def render_card(payload: dict[str, Any], laws_version: int = LAWS_VERSION) -> st
         "",
     ]
     if ranked:
-        lines += ["## Candidates by mean KLD", ""]
+        lines += [
+            (
+                "## Candidates by paired routed-model fidelity"
+                if payload.get("routed")
+                else "## Candidates by QxQ fidelity (dense model)"
+            ),
+            "",
+        ]
+        if not payload.get("routed"):
+            lines += [
+                "This reference has no routed experts, so BxQ and routing "
+                "intervention metrics are not applicable.",
+                "",
+            ]
         rows = []
         for q in ranked:
             size = q.get("disk_size_gib")
+            qxq = (
+                q.get("qxq_mean_kld")
+                if q.get("qxq_mean_kld") is not None
+                else q.get("mean_kld")
+            )
+            bxq = q.get("bxq_mean_kld")
+            delta = q.get("routing_intervention_delta")
             rows.append(
                 (
                     str(q.get("id") or ""),
                     str(q.get("type") or ""),
                     "n/a" if size is None else f"{float(size):.2f} GiB",
-                    f"{float(q['mean_kld']):.8f}",
+                    _kld(qxq),
+                    _kld(bxq),
+                    "n/a" if delta is None else f"{float(delta):+.8f}",
+                    _pct(q.get("routing_flip_rate")),
                 )
             )
-        lines += _table(rows, ("Candidate", "Scheme", "On disk", "Mean KLD"))
+        lines += _table(
+            rows,
+            (
+                "Candidate",
+                "Scheme",
+                "On disk",
+                "QxQ KLD",
+                "BxQ KLD",
+                "QxQ - BxQ",
+                "Natural route flips",
+            ),
+        )
         lines.append("")
-    if os.path.basename(str(payload.get("plot") or "")):
+    charts = [
+        ("QxQ fidelity against size", "QxQ KLD", payload.get("qxq_plot")),
+        ("BxQ fidelity against size", "BxQ KLD", payload.get("bxq_plot")),
+    ]
+    if not payload.get("qxq_plot"):
+        charts.append(
+            ("Fidelity against size", "mean KLD", payload.get("plot"))
+        )
+    seen: set[str] = set()
+    for heading, alt, path in charts:
+        name = os.path.basename(str(path or ""))
+        if not name or name in seen:
+            continue
+        seen.add(name)
         lines += [
-            "## Fidelity against size",
+            f"## {heading}",
             "",
-            f"![mean KLD against on-disk size]({payload['plot']})",
+            f"![{alt} against on-disk size]({path})",
             "",
-            "The numbers behind the chart are in "
+        ]
+    if seen:
+        lines += [
+            "The numbers behind the charts are in "
             "[`kld-vs-size.json`](kld-vs-size.json), because a picture is not "
             "evidence.",
             "",
         ]
+    exclusions = payload.get("excluded_candidates") or []
+    if exclusions:
+        lines += [
+            "## Explicitly excluded checkpoints",
+            "",
+            "These pinned revisions were deliberately not scored. They are "
+            "listed so a known-bad checkpoint is never silently retried or "
+            "mistaken for an omitted result.",
+            "",
+        ]
+        for item in exclusions:
+            lines.append(
+                f"- `{item.get('hf_repo')}@{item.get('revision')}` — "
+                f"{item.get('reason')}"
+            )
+        lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -1742,6 +2050,10 @@ def _cmd_card(args: argparse.Namespace) -> int:
         payload = json.load(handle)
     if args.plot:
         payload["plot"] = args.plot
+    if args.qxq_plot:
+        payload["qxq_plot"] = args.qxq_plot
+    if args.bxq_plot:
+        payload["bxq_plot"] = args.bxq_plot
     if args.license:
         payload["license"] = args.license
     with open(args.out, "w", encoding="utf-8", newline="\n") as handle:
@@ -1753,11 +2065,121 @@ def _cmd_card(args: argparse.Namespace) -> int:
 def _cmd_plot(args: argparse.Namespace) -> int:
     with open(args.data, encoding="utf-8") as handle:
         payload = json.load(handle)
-    note = render_plot(payload, args.out)
+    limits = (
+        (float(args.y_limits[0]), float(args.y_limits[1])) if args.y_limits else None
+    )
+    note = render_plot(payload, args.out, metric=args.metric, y_limits=limits)
     if note:
         print(note, file=sys.stderr)
     if os.path.isfile(args.out):
         print(f"wrote {args.out}")
+    return 0
+
+
+def selftest() -> int:
+    """Exercise the Law 14 schema and paired artifact renderers offline."""
+    import tempfile
+
+    from compliance import Campaign, law_14_component_attribution
+
+    digest = "a" * 64
+    trace = "b" * 64
+    report = {
+        "mean_kld": 0.12,
+        "student_weights_sha256": digest,
+        "routing": {
+            "positions": 10,
+            "position_flip_rate": 0.2,
+            "selection_flip_rate": 0.1,
+            "routing_excess_mean": 0.01,
+        },
+    }
+    manifest = {
+        "token_sha256": "tokens",
+        "reference_config_sha256": "reference",
+        "reference_routing": {"num_experts": 8},
+    }
+    binding = {
+        "partition": "analysis",
+        "token_sha256": "tokens",
+        "reference_config_sha256": "reference",
+        "candidate_weights_sha256": digest,
+    }
+    attribution = {
+        "qxq_cell": {
+            **binding,
+            "mean_kld": 0.12,
+            "report": "qxq.json",
+        },
+        "bxq_cell": {
+            **binding,
+            "mean_kld": 0.08,
+            "report": "bxq.json",
+            "routing_trace_sha256": trace,
+            "routing_mode": "teacher_ids_student_weights",
+            "protocol_version": 1,
+            "routing_trace_protocol_version": 2,
+            "candidate_weights_unchanged": True,
+            "backend_evidence": {
+                "replay_supported": True,
+                "backend": "selftest",
+            },
+            "natural_control_parity": {"passed": True},
+        },
+        "routing_intervention_delta": 0.04,
+    }
+    campaign = Campaign(
+        report=report,
+        manifest=manifest,
+        manifest_path="unused",
+        attribution=attribution,
+    )
+    assert law_14_component_attribution(campaign).status == "pass"
+    attribution["bxq_cell"]["natural_control_parity"] = {"passed": False}
+    assert law_14_component_attribution(campaign).status == "fail"
+    attribution["bxq_cell"]["natural_control_parity"] = {"passed": True}
+    campaign.manifest["reference_routing"] = {}
+    assert law_14_component_attribution(campaign).status == "not_applicable"
+
+    payload = {
+        "title": "selftest",
+        "qxq_plot": "qxq-vs-size.png",
+        "bxq_plot": "bxq-vs-size.png",
+        "quants": [
+            {
+                "id": "org/a",
+                "creator": "org",
+                "type": "nvfp4",
+                "disk_size_gib": 10.0,
+                "mean_kld": 0.12,
+                "qxq_mean_kld": 0.12,
+                "bxq_mean_kld": 0.08,
+                "routing_intervention_delta": 0.04,
+                "routing_flip_rate": 0.1,
+            }
+        ],
+    }
+    limits = shared_plot_limits(payload)
+    assert limits is not None and limits[0] < 0.08 < 0.12 < limits[1]
+    card = render_card(payload)
+    assert "QxQ KLD" in card and "BxQ KLD" in card
+    assert "qxq-vs-size.png" in card and "bxq-vs-size.png" in card
+
+    laws_path = os.path.join(os.path.dirname(__file__), "LAWS.md")
+    with open(laws_path, encoding="utf-8") as handle:
+        assert f"**Laws version:** {LAWS_VERSION}" in handle.read()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for metric, name in (
+            ("mean_kld", "kld-vs-size.png"),
+            ("qxq_mean_kld", "qxq-vs-size.png"),
+            ("bxq_mean_kld", "bxq-vs-size.png"),
+        ):
+            out = os.path.join(tmp, name)
+            note = render_plot(payload, out, metric=metric, y_limits=limits)
+            if not note or "matplotlib is not installed" not in note:
+                assert os.path.isfile(out)
+    print("selftest passed")
     return 0
 
 
@@ -1792,12 +2214,27 @@ def main() -> int:
     chart = sub.add_parser("plot", help="scatter mean KLD against on-disk size")
     chart.add_argument("--data", required=True, help="family plot payload JSON")
     chart.add_argument("--out", required=True)
+    chart.add_argument(
+        "--metric",
+        choices=tuple(PLOT_METRICS),
+        default="mean_kld",
+        help="KLD field to plot; defaults to the legacy mean_kld behavior",
+    )
+    chart.add_argument(
+        "--y-limits",
+        nargs=2,
+        type=float,
+        metavar=("MIN", "MAX"),
+        help="shared Y-axis limits, used for comparable QxQ/BxQ charts",
+    )
     chart.set_defaults(func=_cmd_plot)
 
     card = sub.add_parser("card", help="render the artifact repo's own card")
     card.add_argument("--data", required=True, help="family plot payload JSON")
     card.add_argument("--out", required=True)
     card.add_argument("--plot", help="chart filename to embed, relative to the card")
+    card.add_argument("--qxq-plot", help="QxQ chart filename to embed")
+    card.add_argument("--bxq-plot", help="BxQ chart filename to embed")
     card.add_argument("--license", help="license identifier for the card metadata")
     card.set_defaults(func=_cmd_card)
 
@@ -1805,6 +2242,9 @@ def main() -> int:
     sums.add_argument("--root", required=True)
     sums.add_argument("--out")
     sums.set_defaults(func=_cmd_checksums)
+
+    test = sub.add_parser("selftest", help="exercise paired renderers offline")
+    test.set_defaults(func=lambda _args: selftest())
 
     args = parser.parse_args()
     return args.func(args)

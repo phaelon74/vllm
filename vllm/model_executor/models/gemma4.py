@@ -351,6 +351,20 @@ class Gemma4MoE(nn.Module):
                 gating_output, topk, self.per_expert_scale
             )
 
+        def forced_routing_function(
+            hidden_states: torch.Tensor,
+            gating_output: torch.Tensor,
+            forced_topk_ids: torch.Tensor,
+            renormalize: bool,
+        ) -> torch.Tensor:
+            del hidden_states
+            probabilities = torch.softmax(gating_output, dim=-1, dtype=torch.float32)
+            ids = forced_topk_ids.to(torch.int64)
+            weights = probabilities.gather(1, ids)
+            if renormalize:
+                weights = weights / weights.sum(dim=-1, keepdim=True)
+            return weights * self.per_expert_scale[ids].to(weights.dtype)
+
         # MoERunner experts with custom Gemma4 routing
         intermediate_size = getattr(
             config,
@@ -369,6 +383,7 @@ class Gemma4MoE(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
             custom_routing_function=routing_function,
+            custom_forced_routing_function=forced_routing_function,
             activation="gelu_tanh",
         )
 

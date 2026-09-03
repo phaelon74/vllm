@@ -13,7 +13,10 @@ from vllm.model_executor.layers.fused_moe.config import (
     RoutingMethodType,
     get_routing_method_type,
 )
-from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+from vllm.model_executor.layers.fused_moe.router.base_router import (
+    BaseRouter,
+    compute_forced_routing_weights,
+)
 from vllm.model_executor.layers.fused_moe.router.dsv4_topk import (
     can_use_dsv4_topk,
     dsv4_topk,
@@ -379,3 +382,23 @@ class FusedTopKBiasRouter(BaseRouter):
             topk_weights = torch.cat([topk_weights, shared_w], dim=-1)
 
         return topk_weights, topk_ids
+
+    def _compute_forced_weights(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        forced_topk_ids: torch.Tensor,
+        *,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.num_fused_shared_experts > 0:
+            raise ValueError(
+                "Forced MoE routing does not support fused shared-expert slots."
+            )
+        return compute_forced_routing_weights(
+            router_logits,
+            forced_topk_ids,
+            scoring_func=self.scoring_func,
+            renormalize=self.renormalize,
+            routed_scaling_factor=self.routed_scaling_factor,
+        )

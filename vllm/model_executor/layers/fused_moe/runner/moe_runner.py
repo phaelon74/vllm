@@ -25,6 +25,9 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
 )
+from vllm.model_executor.layers.fused_moe.forced_routing import (
+    get_forced_expert_ids,
+)
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
@@ -593,21 +596,52 @@ class MoERunner(MoERunnerInterface):
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
         )
 
+        forced_topk_ids = get_forced_expert_ids(
+            self.layer_id,
+            num_tokens=router_logits.shape[0],
+            top_k=self.moe_config.experts_per_token,
+            num_experts=self.moe_config.num_logical_experts,
+            device=router_logits.device,
+        )
+
         if self.routed_experts.quant_method.is_monolithic:
-            # Monolithic kernels: pass router_logits to routed_experts
-            fused_out = self.routed_experts.forward_monolithic(
-                x=hidden_states,
-                router_logits=router_logits,
-                input_ids=input_ids,
-            )
+            if forced_topk_ids is None:
+                fused_out = self.routed_experts.forward_monolithic(
+                    x=hidden_states,
+                    router_logits=router_logits,
+                    input_ids=input_ids,
+                )
+            else:
+                topk_weights, topk_ids = self.router.select_forced_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    forced_topk_ids=forced_topk_ids,
+                    topk_indices_dtype=torch.int32,
+                    input_ids=input_ids,
+                )
+                fused_out = self._quant_method.apply_monolithic_routed(
+                    layer=self.routed_experts,
+                    x=hidden_states,
+                    topk_weights=topk_weights.contiguous(),
+                    topk_ids=topk_ids.contiguous(),
+                )
         else:
             # Modular kernels: select experts first, then call routed_experts
-            topk_weights, topk_ids = self.router.select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                topk_indices_dtype=self._quant_method.topk_indices_dtype,
-                input_ids=input_ids,
-            )
+            if forced_topk_ids is None:
+                topk_weights, topk_ids = self.router.select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    topk_indices_dtype=self._quant_method.topk_indices_dtype,
+                    input_ids=input_ids,
+                )
+            else:
+                topk_weights, topk_ids = self.router.select_forced_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    forced_topk_ids=forced_topk_ids,
+                    topk_indices_dtype=self._quant_method.topk_indices_dtype,
+                    input_ids=input_ids,
+                )
 
             fused_out = self.routed_experts.forward_modular(
                 x=hidden_states,

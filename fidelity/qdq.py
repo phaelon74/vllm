@@ -120,7 +120,7 @@ COMPONENTS = tuple(COMPONENT_PATTERNS)
 # reading taken by an older inspector outlives the code that produced it. Bump
 # this whenever detection or classification changes and every cache that
 # predates the change is re-read instead of trusted.
-INSPECT_VERSION = 3
+INSPECT_VERSION = 4
 # Variant-path suffix; full hex lives on inspect.json and the QDQ manifest.
 MATCH_DIGEST_LEN = 12
 
@@ -872,33 +872,29 @@ def names_sha256(names: list[str] | set[str]) -> str:
 
 
 def weights_identity(model: str) -> str:
-    """Digest of the weights on disk at `model`, from headers only.
+    """Content digest of every safetensors shard at ``model``.
 
-    Two checkpoints share this digest only if they carry the same tensor names
-    at the same dtypes and shapes, sharded into files of the same names and
-    sizes. It is what binds a score to the weights that produced it: a
-    directory repopulated from a different repo cannot keep the same digest,
-    and a verbatim re-upload under a new name cannot change it.
-
-    Tensor data is not read, so this costs a directory listing and one header
-    per shard even on a checkpoint of hundreds of gigabytes.
+    The digest includes shard names and every file byte, including safetensors
+    headers. Same-geometry checkpoints with different tensor values therefore
+    cannot share a Law 16 identity.
     """
-    from safetensors import safe_open
-
-    lines: list[str] = []
+    identity = hashlib.sha256()
+    found = False
     for fname in sorted(os.listdir(model)):
         if not fname.endswith(".safetensors"):
             continue
+        found = True
         path = os.path.join(model, fname)
-        lines.append(f"{fname} {os.path.getsize(path)}")
-        with safe_open(path, framework="pt", device="cpu") as handle:
-            for key in sorted(handle.keys()):
-                sliced = handle.get_slice(key)
-                shape = ",".join(str(dim) for dim in sliced.get_shape())
-                lines.append(f"  {key} {sliced.get_dtype()} [{shape}]")
-    if not lines:
+        encoded_name = fname.encode("utf-8")
+        identity.update(len(encoded_name).to_bytes(4, "big"))
+        identity.update(encoded_name)
+        identity.update(os.path.getsize(path).to_bytes(16, "big"))
+        with open(path, "rb") as handle:
+            while chunk := handle.read(16 * 1024 * 1024):
+                identity.update(chunk)
+    if not found:
         raise SystemExit(f"no safetensors weights at {model} to bind a score to")
-    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+    return identity.hexdigest()
 
 
 def weights_bytes(model: str) -> int:
@@ -1294,7 +1290,7 @@ def convert(
     """
     import torch
     from safetensors import safe_open
-    from safetensors.torch import save_file
+    from safetensors.torch import load_file, save_file
 
     _assert_unquantized(model)
     if only is not None:
@@ -2004,7 +2000,7 @@ def selftest() -> int:
     ):
         assert scheme_block_size(scheme, None) == edge, scheme
 
-    from safetensors.torch import save_file
+    from safetensors.torch import load_file, save_file
 
     with tempfile.TemporaryDirectory() as root:
         save_file(
@@ -2079,6 +2075,17 @@ def selftest() -> int:
                 os.path.join(other, "model.safetensors"),
             )
             assert weights_identity(other) != identity, "dtype drift went unseen"
+        with tempfile.TemporaryDirectory() as other:
+            tensors = {
+                name: tensor.clone()
+                for name, tensor in load_file(
+                    os.path.join(root, "model.safetensors")
+                ).items()
+            }
+            first = next(iter(tensors.values()))
+            first.view(-1)[0] = 1
+            save_file(tensors, os.path.join(other, "model.safetensors"))
+            assert weights_identity(other) != identity, "content drift went unseen"
     print("  inspect reads packed AWQ scales and coverage denominators")
 
     # Gemma 4's moe_intermediate_size is 704, which no 128-wide grid divides.

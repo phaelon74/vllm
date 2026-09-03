@@ -161,6 +161,13 @@ class TrtLlmMxfp4ExpertsBase:
     def expects_unquantized_inputs(self) -> bool:
         return False
 
+    @staticmethod
+    def _max_supported_tokens(top_k: int, global_num_experts: int) -> int:
+        max_grid_y = 65535
+        min_tile_tokens_dim = 8
+        max_tokens = (max_grid_y - global_num_experts) * min_tile_tokens_dim // top_k
+        return max(1, min(300000, max_tokens))
+
 
 class TrtLlmMxfp4ExpertsMonolithic(
     TrtLlmMxfp4ExpertsBase, mk.FusedMoEExpertsMonolithic
@@ -202,6 +209,94 @@ class TrtLlmMxfp4ExpertsMonolithic(
     ) -> bool:
         # Kernel converts to bfloat16 internally
         return True
+
+    def apply_routed(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+    ) -> torch.Tensor:
+        from flashinfer import trtllm_fp4_block_scale_routed_moe
+
+        if apply_router_weight_on_input:
+            raise NotImplementedError(
+                "Exact forced routing is not supported when MXFP4 TRTLLM MoE "
+                "applies router weights on input."
+            )
+        max_tokens = self._max_supported_tokens(topk_ids.size(1), global_num_experts)
+        if hidden_states.shape[0] > max_tokens:
+            raise NotImplementedError(
+                "Exact forced routing for monolithic MXFP4 TRTLLM MoE does "
+                f"not support more than {max_tokens} tokens."
+            )
+
+        if a1q_scale is not None:
+            x_scale = a1q_scale.view(torch.float8_e4m3fn)
+        else:
+            if hidden_states.dtype != torch.bfloat16:
+                raise TypeError(
+                    "MXFP4 forced routing without activation scales requires "
+                    f"BF16 hidden states, got {hidden_states.dtype}."
+                )
+            x_scale = None
+        if self.w1_scale is None or self.w2_scale is None:
+            raise RuntimeError("MXFP4 forced routing requires weight scales.")
+
+        output = torch.empty(
+            *hidden_states.shape[:-1],
+            self.hidden_dim_unpadded,
+            dtype=torch.bfloat16,
+            device=hidden_states.device,
+        )
+        packed_topk = trtllm_moe_pack_topk_ids_weights(
+            topk_ids, topk_weights
+        )
+        try:
+            trtllm_fp4_block_scale_routed_moe(
+                topk_ids=packed_topk,
+                routing_bias=None,
+                hidden_states=hidden_states,
+                hidden_states_scale=x_scale,
+                gemm1_weights=w1,
+                gemm1_weights_scale=self.w1_scale,
+                gemm1_bias=self.w1_bias,
+                gemm1_alpha=self.gemm1_alpha,
+                gemm1_beta=self.gemm1_beta,
+                gemm1_clamp_limit=self.gemm1_clamp_limit,
+                gemm2_weights=w2,
+                gemm2_weights_scale=self.w2_scale,
+                gemm2_bias=self.w2_bias,
+                output1_scale_scalar=None,
+                output1_scale_gate_scalar=None,
+                output2_scale_scalar=None,
+                num_experts=global_num_experts,
+                top_k=topk_ids.size(1),
+                n_group=None,
+                topk_group=None,
+                intermediate_size=self.intermediate_size_per_partition,
+                local_expert_offset=self.ep_rank * self.local_num_experts,
+                local_num_experts=self.local_num_experts,
+                routed_scaling_factor=None,
+                routing_method_type=RoutingMethodType.Renormalize,
+                do_finalize=True,
+                enable_pdl=True,
+                activation_type=self._flashinfer_activation_type(activation),
+                output=output,
+                tune_max_num_tokens=fi_moe_largest_bucket(self.moe_config),
+            )
+        except (AssertionError, TypeError) as exc:
+            raise NotImplementedError(
+                "Installed FlashInfer does not support unpacked FP32 routing "
+                "weights for MXFP4 TRTLLM MoE."
+            ) from exc
+        return output
 
     def apply(
         self,

@@ -947,6 +947,32 @@ def inspect_model_lm_heads(model: torch.nn.Module) -> dict[str, Any]:
     }
 
 
+def inspect_model_moe_backends(model: torch.nn.Module) -> dict[str, Any]:
+    """Record the loaded MoE router and expert implementation on one worker."""
+    from vllm.model_executor.layers.fused_moe.layer import MoERunner
+
+    layers = []
+    for name, module in model.named_modules():
+        if not isinstance(module, MoERunner):
+            continue
+        quant_method = module.routed_experts.quant_method
+        kernel = getattr(quant_method, "moe_kernel", None)
+        implementation = getattr(kernel, "impl", None)
+        experts = getattr(implementation, "fused_experts", None)
+        layers.append(
+            {
+                "name": name,
+                "layer_id": module.layer_id,
+                "router": type(module.router).__name__,
+                "quant_method": type(quant_method).__name__,
+                "kernel": type(kernel).__name__ if kernel is not None else None,
+                "experts": type(experts).__name__ if experts is not None else None,
+                "monolithic": bool(quant_method.is_monolithic),
+            }
+        )
+    return {"layers": layers}
+
+
 LOGITS_PROCESSOR_IDENTITY_KEYS = (
     "type",
     "scale",

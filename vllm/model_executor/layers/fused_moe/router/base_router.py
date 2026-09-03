@@ -156,6 +156,36 @@ else:
         return topk_ids
 
 
+def compute_forced_routing_weights(
+    router_logits: torch.Tensor,
+    forced_topk_ids: torch.Tensor,
+    *,
+    scoring_func: str,
+    renormalize: bool,
+    routed_scaling_factor: float = 1.0,
+    per_expert_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute student weights for externally selected expert IDs."""
+    if scoring_func == "softmax":
+        scores = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
+    elif scoring_func == "sigmoid":
+        scores = torch.sigmoid(router_logits.float())
+    else:
+        raise ValueError(
+            f"Forced MoE routing does not support scoring function {scoring_func!r}."
+        )
+
+    topk_weights = scores.gather(1, forced_topk_ids.to(torch.int64))
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    if routed_scaling_factor != 1.0:
+        topk_weights = topk_weights * routed_scaling_factor
+    if per_expert_scale is not None:
+        expert_scales = per_expert_scale[forced_topk_ids.to(torch.int64)]
+        topk_weights = topk_weights * expert_scales.to(topk_weights.dtype)
+    return topk_weights.to(torch.float32)
+
+
 class BaseRouter(FusedMoERouter):
     """
     Base router class that provides common functionality for all router implementations.
@@ -257,6 +287,18 @@ class BaseRouter(FusedMoERouter):
         """
         raise NotImplementedError
 
+    def _compute_forced_weights(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        forced_topk_ids: torch.Tensor,
+        *,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        raise ValueError(
+            f"Forced MoE routing is not supported with router {type(self).__name__}."
+        )
+
     def _select_experts(
         self,
         hidden_states: torch.Tensor,
@@ -303,3 +345,51 @@ class BaseRouter(FusedMoERouter):
         topk_ids = self._convert_indices_dtype(topk_ids, topk_indices_dtype)
 
         return topk_weights, topk_ids
+
+    def select_forced_experts(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        forced_topk_ids: torch.Tensor,
+        topk_indices_dtype: torch.dtype | None = None,
+        *,
+        input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute student weights for supplied logical IDs, then map them."""
+        if self.eplb_state is not None:
+            raise ValueError(
+                "Forced MoE routing requires EPLB to be disabled so the BF16 "
+                "trace's logical expert IDs cannot be remapped by a changed "
+                "placement table."
+            )
+        self._validate_eplb_state()
+        expected_shape = (router_logits.shape[0], self.top_k)
+        if forced_topk_ids.shape != expected_shape:
+            raise ValueError(
+                "Forced MoE expert IDs are not aligned with router logits: "
+                f"expected {expected_shape}, got {tuple(forced_topk_ids.shape)}."
+            )
+        if forced_topk_ids.device != router_logits.device:
+            raise ValueError(
+                "Forced MoE expert IDs and router logits must share a device."
+            )
+
+        topk_weights = self._compute_forced_weights(
+            hidden_states,
+            router_logits,
+            forced_topk_ids,
+            input_ids=input_ids,
+        )
+        if topk_weights.shape != forced_topk_ids.shape:
+            raise ValueError(
+                "Forced MoE weight callback returned shape "
+                f"{tuple(topk_weights.shape)} for IDs shaped "
+                f"{tuple(forced_topk_ids.shape)}."
+            )
+
+        if self.capture_fn is not None:
+            self.capture_fn(forced_topk_ids)
+
+        topk_ids = self._apply_eplb_mapping(forced_topk_ids)
+        topk_ids = self._convert_indices_dtype(topk_ids, topk_indices_dtype)
+        return topk_weights.to(torch.float32), topk_ids

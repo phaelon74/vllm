@@ -19,13 +19,17 @@ Usage:
 import argparse
 import hashlib
 import json
+import math
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any
 
-LAWS_VERSION = 9
+LAWS_VERSION = 10
+BXQ_PROTOCOL_VERSION = 1
+ROUTING_TRACE_PROTOCOL_VERSION = 2
 
 # The identity a capture is bound to. Law 5 requires the scored report to carry
 # it; Law 12 requires the published reference to agree with it, so an artifact
@@ -39,6 +43,8 @@ BOUND_FIELDS = (
     "kld_vocab_size",
     "tensor_parallel_size",
     "enforce_eager",
+    "reference_config_sha256",
+    "reference_weights_sha256",
     "runtime",
 )
 
@@ -53,7 +59,7 @@ NOT_APPLICABLE = "not_applicable"
 # Law 16 is overridable only for a score taken before the binding existed, whose
 # weights have since been released: that evidence cannot be recovered without a
 # rescore, and the receipt must say the binding is missing rather than imply one.
-OVERRIDABLE = frozenset({1, 8, 11, 12, 14, 16})
+OVERRIDABLE = frozenset({1, 8, 11, 12, 16})
 
 
 @dataclass
@@ -135,9 +141,7 @@ def law_1_zero_baseline(c: Campaign) -> Finding:
             f"baseline ran on model_runner_v2={baseline_runner!r} but the "
             f"candidate ran on {c.report.get('model_runner_v2')!r}",
         )
-    return Finding(
-        1, title, PASS, f"self-KLD exactly 0.0 over {positions} positions"
-    )
+    return Finding(1, title, PASS, f"self-KLD exactly 0.0 over {positions} positions")
 
 
 def law_2_determinism(c: Campaign) -> Finding:
@@ -397,15 +401,11 @@ def law_11_freeze_before_qualification(c: Campaign) -> Finding:
     """Parameters are frozen on analysis before qualification is read."""
     title = "Freeze before qualification"
     if c.partition != "qualification":
-        return Finding(
-            11, title, NOT_APPLICABLE, f"partition is {c.partition!r}"
-        )
+        return Finding(11, title, NOT_APPLICABLE, f"partition is {c.partition!r}")
     receipt = c.freeze_receipt or {}
     absent = [k for k in ("timestamp", "parameters_sha256") if not receipt.get(k)]
     if absent:
-        return Finding(
-            11, title, FAIL, f"freeze receipt lacks {', '.join(absent)}"
-        )
+        return Finding(11, title, FAIL, f"freeze receipt lacks {', '.join(absent)}")
     return Finding(
         11,
         title,
@@ -445,8 +445,7 @@ def law_12_reusable_reference(c: Campaign) -> Finding:
     except (OSError, json.JSONDecodeError) as exc:
         return Finding(12, title, FAIL, f"reference manifest unreadable: {exc}")
     differing = [
-        f"{key} is {published.get(key)!r}, scored against "
-        f"{c.manifest.get(key)!r}"
+        f"{key} is {published.get(key)!r}, scored against {c.manifest.get(key)!r}"
         for key in BOUND_FIELDS
         if published.get(key) != c.manifest.get(key)
     ]
@@ -467,31 +466,49 @@ def law_12_reusable_reference(c: Campaign) -> Finding:
     )
 
 
-def _cell_comparable(cell: dict[str, Any], c: Campaign) -> str | None:
-    """Why a component cell cannot be compared to the deployed cell, or None.
-
-    A cell measured on different tokens, a different partition, or against a
-    different reference capture is not a decomposition of this number. It would
-    look like one on a one-pager, which is the failure worth preventing.
-    """
+def _paired_cell_problem(
+    cell: Any,
+    c: Campaign,
+) -> str | None:
+    """Why a QxQ/BxQ cell is not bound to this deployed candidate."""
     if not isinstance(cell, dict):
-        return "is not an object"
+        return "is missing or is not an object"
     if not isinstance(cell.get("mean_kld"), (int, float)):
         return "carries no mean_kld"
+    if not isinstance(cell.get("report"), str) or not cell["report"]:
+        return "carries no report"
+    if c.artifact_dir:
+        candidate_dir = os.path.dirname(c.manifest_path)
+        support = os.path.join(candidate_dir, cell["report"])
+        if not os.path.isfile(support):
+            return f"report path {cell['report']!r} is not published"
+    if cell.get("qdq_manifest") or cell.get("variant"):
+        return "is a synthetic QDQ diagnostic, not a deployed-candidate run"
     for field_name, expected in (
         ("partition", c.partition),
         ("token_sha256", c.manifest.get("token_sha256")),
         ("reference_config_sha256", c.manifest.get("reference_config_sha256")),
+        ("candidate_weights_sha256", c.report.get("student_weights_sha256")),
     ):
         actual = cell.get(field_name)
-        if expected is not None and actual != expected:
+        if expected is None:
+            return f"cannot bind {field_name}: the deployed run records none"
+        if actual != expected:
             return f"{field_name} is {actual!r}, deployed is {expected!r}"
     return None
 
 
+def _same_number(left: Any, right: Any) -> bool:
+    return (
+        isinstance(left, (int, float))
+        and isinstance(right, (int, float))
+        and math.isclose(float(left), float(right), rel_tol=1e-12, abs_tol=1e-12)
+    )
+
+
 def law_14_component_attribution(c: Campaign) -> Finding:
-    """A routed model's number is attributed to router and experts separately."""
-    title = "Component attribution"
+    """A routed model carries paired natural and teacher-ID-forced runs."""
+    title = "Routed-model intervention"
     if "reference_routing" not in c.manifest:
         return Finding(
             14,
@@ -503,82 +520,215 @@ def law_14_component_attribution(c: Campaign) -> Finding:
         )
     routing = c.manifest.get("reference_routing")
     if not routing or not routing.get("num_experts"):
-        return Finding(
-            14, title, NOT_APPLICABLE, "reference declares no experts"
-        )
+        return Finding(14, title, NOT_APPLICABLE, "reference declares no experts")
     experts = routing["num_experts"]
     if not c.attribution:
         return Finding(
             14,
             title,
             FAIL,
-            f"reference routes over {experts} experts, so a single mean cannot "
-            f"be published: no attribution supplied (build the cells with "
-            f"fidelity/qdq.py)",
+            f"reference routes over {experts} experts, but no paired QxQ/BxQ "
+            f"attribution was supplied",
         )
 
-    expert_cell = c.attribution.get("expert_cell")
-    if not isinstance(expert_cell, dict):
-        return Finding(14, title, FAIL, "attribution has no expert_cell")
-    problem = _cell_comparable(expert_cell, c)
-    if problem:
-        return Finding(14, title, FAIL, f"expert_cell {problem}")
+    qxq = c.attribution.get("qxq_cell")
+    bxq = c.attribution.get("bxq_cell")
+    for name, cell in (("qxq_cell", qxq), ("bxq_cell", bxq)):
+        problem = _paired_cell_problem(cell, c)
+        if problem:
+            return Finding(14, title, FAIL, f"{name} {problem}")
+    assert isinstance(qxq, dict) and isinstance(bxq, dict)
 
-    # Routing divergence is a measurement, not a cell: the candidate's routers
-    # can be bit-identical to the reference's and still select other experts,
-    # because the activations reaching them were perturbed upstream. No
-    # weight-rounding cell can produce this number, so it is required directly.
-    routing = c.report.get("routing")
+    if not _same_number(qxq["mean_kld"], c.report.get("mean_kld")):
+        return Finding(
+            14,
+            title,
+            FAIL,
+            "qxq_cell is not the deployed candidate's natural-routing mean",
+        )
+    if bxq.get("routing_mode") != "teacher_ids_student_weights":
+        return Finding(
+            14,
+            title,
+            FAIL,
+            "bxq_cell routing_mode must be 'teacher_ids_student_weights'",
+        )
+    if bxq.get("protocol_version") != BXQ_PROTOCOL_VERSION:
+        return Finding(
+            14,
+            title,
+            FAIL,
+            f"bxq_cell protocol_version is {bxq.get('protocol_version')!r}, "
+            f"expected {BXQ_PROTOCOL_VERSION}",
+        )
+    if bxq.get("routing_trace_protocol_version") != ROUTING_TRACE_PROTOCOL_VERSION:
+        return Finding(
+            14,
+            title,
+            FAIL,
+            "bxq_cell carries an unsupported routing trace protocol",
+        )
+    trace = bxq.get("routing_trace_sha256")
+    if (
+        not isinstance(trace, str)
+        or len(trace) != 64
+        or any(char not in "0123456789abcdef" for char in trace.lower())
+    ):
+        return Finding(
+            14,
+            title,
+            FAIL,
+            "bxq_cell has no complete routing_trace_sha256 binding",
+        )
+    trace_manifest = bxq.get("routing_trace_manifest")
+    if not isinstance(trace_manifest, str) or not trace_manifest:
+        return Finding(
+            14,
+            title,
+            FAIL,
+            "bxq_cell has no published routing trace manifest",
+        )
+    if c.artifact_dir:
+        trace_path = os.path.join(
+            os.path.dirname(c.manifest_path), trace_manifest
+        )
+        if not os.path.isfile(trace_path):
+            return Finding(
+                14,
+                title,
+                FAIL,
+                f"routing trace path {trace_manifest!r} is not published",
+            )
+        if _sha256_file(trace_path) != trace:
+            return Finding(
+                14,
+                title,
+                FAIL,
+                "published routing trace manifest does not match its digest",
+            )
+        try:
+            with open(trace_path, encoding="utf-8") as handle:
+                trace_payload = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            return Finding(
+                14,
+                title,
+                FAIL,
+                f"published routing trace manifest is unreadable: {exc}",
+            )
+        if (
+            trace_payload.get("reference_weights_sha256")
+            != c.manifest.get("reference_weights_sha256")
+            or trace_payload.get("capture_manifest_sha256")
+            != _sha256_file(c.manifest_path)
+            or trace_payload.get("token_sha256")
+            != c.manifest.get("token_sha256")
+        ):
+            return Finding(
+                14,
+                title,
+                FAIL,
+                "published routing trace is not bound to this reference capture",
+            )
+        file_hashes = trace_payload.get("file_hashes")
+        if (
+            not isinstance(file_hashes, dict)
+            or len(file_hashes) != trace_payload.get("rows")
+            or set(file_hashes) != set(trace_payload.get("tensor_shapes") or {})
+            or set(file_hashes) != set(trace_payload.get("tensor_dtypes") or {})
+            or len(trace_payload.get("layer_map") or [])
+            != trace_payload.get("num_layers")
+        ):
+            return Finding(
+                14,
+                title,
+                FAIL,
+                "published routing trace has an incomplete payload manifest",
+            )
+        trace_root = os.path.dirname(trace_path)
+        for name, expected in file_hashes.items():
+            payload_path = os.path.join(trace_root, name)
+            if (
+                name != os.path.basename(name)
+                or not os.path.isfile(payload_path)
+                or _sha256_file(payload_path) != expected
+            ):
+                return Finding(
+                    14,
+                    title,
+                    FAIL,
+                    f"published routing payload {name!r} fails its hash",
+                )
+
+    backend = bxq.get("backend_evidence")
+    backend_identity = (
+        backend.get("backend") or backend.get("name") or backend.get("kernel")
+        if isinstance(backend, dict)
+        else None
+    )
+    if (
+        not isinstance(backend, dict)
+        or backend.get("replay_supported") is not True
+        or not backend_identity
+    ):
+        return Finding(
+            14,
+            title,
+            FAIL,
+            "bxq_cell lacks backend evidence for exact expert-ID replay",
+        )
+    control = bxq.get("natural_control_parity") or bxq.get("control_evidence")
+    if not isinstance(control, dict) or control.get("passed") is not True:
+        return Finding(
+            14,
+            title,
+            FAIL,
+            "bxq_cell natural-routing backend control did not establish parity",
+        )
+    if bxq.get("candidate_weights_unchanged") is not True:
+        return Finding(
+            14,
+            title,
+            FAIL,
+            "bxq_cell does not prove the candidate weight digest stayed unchanged",
+        )
+
+    delta = c.attribution.get("routing_intervention_delta")
+    expected_delta = float(qxq["mean_kld"]) - float(bxq["mean_kld"])
+    if not _same_number(delta, expected_delta):
+        return Finding(
+            14,
+            title,
+            FAIL,
+            f"routing_intervention_delta is {delta!r}, expected "
+            f"QxQ - BxQ = {expected_delta:.8f}",
+        )
+
+    natural_routing = c.report.get("routing")
     state = routing_floor_state(c.report)
-    if state == "unmeasured":
+    flip_rate = (
+        natural_routing.get("selection_flip_rate")
+        if isinstance(natural_routing, dict)
+        else None
+    )
+    if state == "unmeasured" or not isinstance(flip_rate, (int, float)):
         return Finding(
             14,
             title,
             FAIL,
             f"reference routes over {experts} experts but the run measured no "
-            f"routing divergence; rescore with --measure-routing. Router "
-            f"weight precision is not a substitute: an unquantized router "
-            f"still receives perturbed activations",
+            f"natural routing divergence",
         )
-    floor = routing_floor(c.report)
-    flip_rate = float(routing.get("selection_flip_rate") or 0.0)
-    if state == "saturated":
-        floor_detail = (
-            "ranking floor undefined: every scored position rerouted, so no "
-            "held-routing population remains to compare against"
-        )
-    elif state == "routing_held":
-        floor_detail = "ranking floor 0.0: expert selection survived everywhere"
-    else:
-        floor_detail = f"ranking floor {float(floor):.8f}"
-
-    router_cell = c.attribution.get("router_cell")
-    if not isinstance(router_cell, dict):
-        return Finding(14, title, FAIL, "attribution has no router_cell")
-    if router_cell.get("status") == NOT_APPLICABLE:
-        if not router_cell.get("evidence"):
-            return Finding(
-                14,
-                title,
-                FAIL,
-                "router_cell is not_applicable but cites no inspection "
-                "evidence that the deployed checkpoint leaves the router "
-                "unquantized",
-            )
-        router_detail = "router weights unquantized"
-    else:
-        problem = _cell_comparable(router_cell, c)
-        if problem:
-            return Finding(14, title, FAIL, f"router_cell {problem}")
-        router_detail = f"router weight rounding {float(router_cell['mean_kld']):.8f}"
 
     return Finding(
         14,
         title,
         PASS,
-        f"experts {float(expert_cell['mean_kld']):.8f}, {router_detail}; "
-        f"selections changed at {flip_rate * 100:.3f}% of (token, layer) "
-        f"choices; {floor_detail}",
+        f"QxQ {float(qxq['mean_kld']):.8f}, "
+        f"BxQ {float(bxq['mean_kld']):.8f}, "
+        f"QxQ - BxQ {expected_delta:+.8f}; natural selections changed at "
+        f"{float(flip_rate) * 100:.3f}% of (token, layer) choices; "
+        f"trace {trace[:16]}",
     )
 
 
@@ -589,8 +739,7 @@ def _scored_strata(c: Campaign) -> tuple[set[str], int]:
     silently drops a domain cannot pass by declaring a smaller suite.
     """
     contexts = {
-        int(entry["context_id"]): entry
-        for entry in (c.suite or {}).get("contexts", [])
+        int(entry["context_id"]): entry for entry in (c.suite or {}).get("contexts", [])
     }
     found: set[str] = set()
     matched = 0
@@ -609,9 +758,7 @@ def law_15_domain_disclosure(c: Campaign) -> Finding:
     title = "Domain disclosure"
     strata = (c.suite or {}).get("strata") if c.suite else None
     if not strata or len(strata) < 2:
-        return Finding(
-            15, title, NOT_APPLICABLE, "the suite declares no domain strata"
-        )
+        return Finding(15, title, NOT_APPLICABLE, "the suite declares no domain strata")
     records = c.report.get("per_context")
     if not records:
         return Finding(
@@ -860,13 +1007,11 @@ def evaluate(c: Campaign) -> list[Finding]:
                     finding.approval = approval
                     if law == 1:
                         finding.detail += (
-                            f"; nondeterminism floor from repeat captures: "
-                            f"{spread:.8f}"
+                            f"; nondeterminism floor from repeat captures: {spread:.8f}"
                         )
             elif approval is not None:
                 finding.detail += (
-                    " (an approval was supplied but this failure permits no "
-                    "override)"
+                    " (an approval was supplied but this failure permits no override)"
                 )
             elif c.approvals.get(str(law)) or c.approvals.get(f"law_{law}"):
                 incomplete_approvals.append(law)

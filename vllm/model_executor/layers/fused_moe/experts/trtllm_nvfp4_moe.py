@@ -508,6 +508,99 @@ class TrtLlmNvFp4ExpertsMonolithic(
     ) -> bool:
         return router_logits_dtype in [torch.bfloat16, torch.float32]
 
+    def apply_routed(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+    ) -> torch.Tensor:
+        import flashinfer
+
+        if apply_router_weight_on_input:
+            raise NotImplementedError(
+                "Exact forced routing is not supported when NVFP4 TRTLLM MoE "
+                "applies router weights on input."
+            )
+        if hidden_states.shape[0] > self._get_chunk_size():
+            raise NotImplementedError(
+                "Exact forced routing for monolithic NVFP4 TRTLLM MoE does "
+                f"not support more than {self._get_chunk_size()} tokens."
+            )
+        if self.per_token_activation:
+            hidden_states, block_scale, per_token_scale = (
+                self._quantize_per_token_input(hidden_states)
+            )
+        else:
+            if a1q_scale is None:
+                raise RuntimeError(
+                    "NVFP4 forced routing requires activation block scales."
+                )
+            block_scale, per_token_scale = a1q_scale, None
+
+        packed_topk = trtllm_moe_pack_topk_ids_weights(
+            topk_ids, topk_weights
+        )
+        output = torch.empty(
+            hidden_states.shape[0],
+            self.hidden_dim,
+            dtype=torch.bfloat16,
+            device=hidden_states.device,
+        )
+        try:
+            flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe(
+                topk_ids=packed_topk,
+                routing_bias=None,
+                hidden_states=hidden_states,
+                hidden_states_scale=block_scale.view(torch.float8_e4m3fn).reshape(
+                    *hidden_states.shape[:-1], -1
+                ),
+                gemm1_weights=w1,
+                gemm1_weights_scale=self.quant_config.w1_scale.view(
+                    torch.float8_e4m3fn
+                ),
+                gemm1_bias=None,
+                gemm1_alpha=self.gemm1_alpha,
+                gemm1_beta=self.gemm1_beta,
+                gemm1_clamp_limit=self.gemm1_clamp_limit,
+                gemm2_weights=w2,
+                gemm2_weights_scale=self.quant_config.w2_scale.view(
+                    torch.float8_e4m3fn
+                ),
+                gemm2_bias=None,
+                output1_scale_scalar=self.g1_scale_c,
+                output1_scale_gate_scalar=self.quant_config.g1_alphas,
+                output2_scale_scalar=self.quant_config.g2_alphas,
+                num_experts=global_num_experts,
+                top_k=topk_ids.size(1),
+                n_group=None,
+                topk_group=None,
+                intermediate_size=self.intermediate_size_per_partition,
+                local_expert_offset=self.ep_rank * self.local_num_experts,
+                local_num_experts=self.local_num_experts,
+                routed_scaling_factor=None,
+                routing_method_type=RoutingMethodType.Renormalize,
+                do_finalize=True,
+                activation_type=activation_to_flashinfer_int(activation),
+                per_token_scale=per_token_scale,
+                output=output,
+                tune_max_num_tokens=min(
+                    fi_moe_largest_bucket(self.moe_config), self._get_chunk_size()
+                ),
+            )
+        except (AssertionError, TypeError) as exc:
+            raise NotImplementedError(
+                "Installed FlashInfer does not support unpacked FP32 routing "
+                "weights for NVFP4 TRTLLM MoE."
+            ) from exc
+        return output
+
     def apply(
         self,
         hidden_states: torch.Tensor,

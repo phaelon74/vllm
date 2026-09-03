@@ -80,6 +80,8 @@ class Request:
         reference_logits_path: str | None = None,
         reference_logits_key: str | None = None,
         kld_vocab_size: int | None = None,
+        reference_routing_path: str | None = None,
+        reference_routing_sha256: str | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
     ) -> None:
@@ -189,6 +191,8 @@ class Request:
         self.reference_logits_path: str | None = reference_logits_path
         self.reference_logits_key: str | None = reference_logits_key
         self.kld_vocab_size: int | None = kld_vocab_size
+        self.reference_routing_path: str | None = reference_routing_path
+        self.reference_routing_sha256: str | None = reference_routing_sha256
 
         # Multi-modal related
         self.mm_features = mm_features or []
@@ -270,6 +274,8 @@ class Request:
             reference_logits_path=request.reference_logits_path,
             reference_logits_key=request.reference_logits_key,
             kld_vocab_size=request.kld_vocab_size,
+            reference_routing_path=request.reference_routing_path,
+            reference_routing_sha256=request.reference_routing_sha256,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
         )

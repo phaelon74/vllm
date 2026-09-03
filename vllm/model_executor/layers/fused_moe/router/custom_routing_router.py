@@ -17,6 +17,7 @@ class CustomRoutingRouter(BaseRouter):
         top_k: int,
         global_num_experts: int,
         custom_routing_function: Callable,
+        custom_forced_routing_function: Callable | None = None,
         eplb_state: EplbLayerState | None = None,
         renormalize: bool = True,
     ):
@@ -26,6 +27,7 @@ class CustomRoutingRouter(BaseRouter):
             eplb_state=eplb_state,
         )
         self.custom_routing_function = custom_routing_function
+        self.custom_forced_routing_function = custom_forced_routing_function
         self.renormalize = renormalize
 
     @property
@@ -62,3 +64,23 @@ class CustomRoutingRouter(BaseRouter):
         return topk_weights.to(torch.float32), topk_ids.to(
             torch.int32 if indices_type is None else indices_type
         )
+
+    def _compute_forced_weights(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        forced_topk_ids: torch.Tensor,
+        *,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.custom_forced_routing_function is None:
+            raise ValueError(
+                "Forced MoE routing is not supported by this custom router; "
+                "provide custom_forced_routing_function when constructing it."
+            )
+        return self.custom_forced_routing_function(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            forced_topk_ids=forced_topk_ids,
+            renormalize=self.renormalize,
+        ).to(torch.float32)

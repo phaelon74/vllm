@@ -28,6 +28,7 @@ Ordering is enforced, not suggested: the zero baseline gates every candidate
 """
 
 import argparse
+import hashlib
 import glob
 import json
 import math
@@ -66,6 +67,9 @@ FP32_COPIES = 4
 # Peak vs live tensors; expandable_segments keeps this from growing further.
 ALLOCATOR_SLACK = 1.25
 TP_CANDIDATES = (1, 2, 4, 8)
+PAIRED_ROUTED_SCORE_PROTOCOL_VERSION = 1
+ROUTING_TRACE_PROTOCOL_VERSION = 2
+_REFERENCE_WEIGHT_DIGESTS: dict[str, str] = {}
 
 
 class CampaignError(Exception):
@@ -86,6 +90,14 @@ class Candidate:
     path: str
     hf_repo: str | None = None
     revision: str | None = None
+
+
+@dataclass
+class ExcludedCandidate:
+    hf_repo: str
+    revision: str
+    reason: str
+    model: str | None = None
 
 
 @dataclass
@@ -125,10 +137,54 @@ class Config:
     # candidate at a time during score and deletes those weights afterwards.
     fetch: str = "upfront"
     tensor_parallel_size: int | None = None
+    excluded_candidates: list[ExcludedCandidate] = field(default_factory=list)
     # Declared, never guessed: what a published artifact may be reused for is the
     # publisher's decision, and an unset license is left unset on the card.
     license: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+
+
+def _paired_report_is_current(report: dict[str, Any]) -> bool:
+    qxq = report.get("qxq_cell")
+    bxq = report.get("bxq_cell")
+    trace = bxq.get("routing_trace_sha256") if isinstance(bxq, dict) else None
+    trace_manifest = (
+        bxq.get("routing_trace_manifest") if isinstance(bxq, dict) else None
+    )
+    control = bxq.get("natural_control_parity") if isinstance(bxq, dict) else None
+    backend = bxq.get("backend_evidence") if isinstance(bxq, dict) else None
+    digest = report.get("student_weights_sha256")
+    return (
+        report.get("paired_routing_protocol_version")
+        == PAIRED_ROUTED_SCORE_PROTOCOL_VERSION
+        and isinstance(report.get("reference_weights_sha256"), str)
+        and len(report["reference_weights_sha256"]) == 64
+        and isinstance(qxq, dict)
+        and isinstance(bxq, dict)
+        and isinstance(qxq.get("mean_kld"), (int, float))
+        and isinstance(bxq.get("mean_kld"), (int, float))
+        and isinstance(report.get("routing_intervention_delta"), (int, float))
+        and isinstance(report.get("routing"), dict)
+        and bxq.get("protocol_version") == PAIRED_ROUTED_SCORE_PROTOCOL_VERSION
+        and bxq.get("routing_trace_protocol_version")
+        == ROUTING_TRACE_PROTOCOL_VERSION
+        and isinstance(trace, str)
+        and len(trace) == 64
+        and isinstance(trace_manifest, str)
+        and os.path.isfile(trace_manifest)
+        and isinstance(control, dict)
+        and control.get("passed") is True
+        and isinstance(backend, dict)
+        and backend.get("replay_supported") is True
+        and isinstance(digest, str)
+        and len(digest) == 64
+        and qxq.get("candidate_weights_sha256") == digest
+        and bxq.get("candidate_weights_sha256") == digest
+        and bxq.get("reference_weights_sha256")
+        == report.get("reference_weights_sha256")
+        and qxq.get("candidate_weights_unchanged") is True
+        and bxq.get("candidate_weights_unchanged") is True
+    )
 
 
 def load_config(path: str) -> Config:
@@ -156,8 +212,50 @@ def load_config(path: str) -> Config:
         )
     known = {f for f in Config.__dataclass_fields__ if f not in {"models", "extra"}}
     kwargs = {k: v for k, v in raw.items() if k in known}
+    kwargs["excluded_candidates"] = [
+        ExcludedCandidate(
+            hf_repo=item["hf_repo"],
+            revision=item["revision"],
+            reason=item["reason"],
+            model=item.get("model"),
+        )
+        for item in raw.get("excluded_candidates", [])
+    ]
     kwargs["extra"] = {k: v for k, v in raw.items() if k not in known and k != "models"}
-    return Config(models=models, **kwargs)
+    config = Config(models=models, **kwargs)
+    active = {
+        (candidate.hf_repo, candidate.revision)
+        for model in config.models
+        for candidate in model.candidates
+    }
+    overlap = [
+        item.hf_repo
+        for item in config.excluded_candidates
+        if (item.hf_repo, item.revision) in active
+    ]
+    if overlap:
+        raise SystemExit(
+            "candidate is both active and excluded at the same revision: "
+            + ", ".join(overlap)
+        )
+    model_names = {model.name for model in config.models}
+    unknown_models = {
+        item.model
+        for item in config.excluded_candidates
+        if item.model is not None and item.model not in model_names
+    }
+    if unknown_models:
+        raise SystemExit(
+            "excluded candidate names unknown model(s): "
+            + ", ".join(sorted(unknown_models))
+        )
+    if len(config.models) > 1 and any(
+        item.model is None for item in config.excluded_candidates
+    ):
+        raise SystemExit(
+            "excluded candidates in a multi-model campaign must name their model"
+        )
+    return config
 
 
 def resolve_python() -> str:
@@ -860,6 +958,27 @@ def bind_weights(
     return digest
 
 
+def reference_weights_identity(path: str) -> str:
+    """Hash a campaign reference once; it is immutable for the process."""
+    absolute = os.path.abspath(path)
+    digest = _REFERENCE_WEIGHT_DIGESTS.get(absolute)
+    if digest is None:
+        sys.path.insert(0, HERE)
+        import qdq
+
+        digest = qdq.weights_identity(absolute)
+        _REFERENCE_WEIGHT_DIGESTS[absolute] = digest
+    return digest
+
+
+def file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def weight_collisions(
     scored: list[tuple[str, Any, str | None]],
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
@@ -870,7 +989,8 @@ def weight_collisions(
     twice, and both numbers are refused because nothing says which directory
     the scorer actually read. Two candidates that share a digest are the same
     weights under two names, which is a real finding about the upstream repos
-    rather than a defect here, so they are reported and published once.
+    rather than a defect here only when their scores also agree. Byte-identical
+    weights with conflicting means are equally impossible and are refused.
 
     Returns (impossible, duplicates), each a list of name pairs.
     """
@@ -880,7 +1000,14 @@ def weight_collisions(
         for other, other_mean, other_digest in scored[i + 1:]:
             same_weights = bool(digest) and digest == other_digest
             if same_weights:
-                duplicates.append((name, other))
+                if (
+                    isinstance(mean, (int, float))
+                    and isinstance(other_mean, (int, float))
+                    and mean == other_mean
+                ):
+                    duplicates.append((name, other))
+                else:
+                    impossible.append((name, other))
             elif (
                 isinstance(mean, (int, float))
                 and mean == other_mean
@@ -902,6 +1029,8 @@ def score_one(
     suite_limit: int | None = None,
     capture_label: str | None = None,
     measure_routing: bool = False,
+    paired_routing: bool = False,
+    bind_reference_weights: bool = False,
     plan_from: str | None = None,
 ) -> tuple[str, str]:
     """Score one pair. Returns (report_path, capture_dir).
@@ -923,9 +1052,24 @@ def score_one(
     os.makedirs(os.path.dirname(report), exist_ok=True)
 
     if os.path.isfile(report):
-        print(f"=== {tag} already scored")
-        bind_weights(report, student, observed=False)
-        return report, capture
+        with open(report, encoding="utf-8") as handle:
+            cached = json.load(handle)
+        routing_current = (
+            _paired_report_is_current(cached)
+            if paired_routing
+            else not measure_routing or isinstance(cached.get("routing"), dict)
+        )
+        reference_current = (
+            not (bind_reference_weights or measure_routing)
+            or cached.get("reference_weights_sha256")
+            == reference_weights_identity(teacher)
+        )
+        if routing_current and reference_current:
+            print(f"=== {tag} already scored")
+            bind_weights(report, student, observed=False)
+            return report, capture
+        print(f"=== {tag} uses historical score bindings; rescoring")
+        os.unlink(report)
 
     capture_environment(config, python)
 
@@ -956,6 +1100,13 @@ def score_one(
                 "--dataset-config", config.dataset_config]
     if decompose:
         cmd.append("--decompose-head")
+    if bind_reference_weights or measure_routing:
+        cmd += [
+            "--reference-weights-sha256",
+            reference_weights_identity(teacher),
+        ]
+    if paired_routing and not measure_routing:
+        raise CampaignError("paired routing requires routing measurement")
     if measure_routing:
         # Reference selections live beside the shared capture, so the extra
         # reference pass is paid once per model rather than once per cell.
@@ -966,6 +1117,8 @@ def score_one(
                 config.work, "captures", f"{capture_label or label}{suffix}-routing"
             ),
         ]
+        if paired_routing:
+            cmd.append("--paired-routing")
 
     print(f"=== {tag} (TP={tp} util={util:.2f} kv={kv:.2f} GiB)")
     rc = _run(cmd, log_path=log, env={
@@ -1271,8 +1424,23 @@ def attribute_model(
         return cell
 
     with open(deployed_report, encoding="utf-8") as handle:
-        deployed_mean = json.load(handle).get("mean_kld")
+        deployed_payload = json.load(handle)
+    deployed_mean = deployed_payload.get("mean_kld")
+    qxq_cell = deployed_payload.get("qxq_cell")
+    bxq_cell = deployed_payload.get("bxq_cell")
+    if not isinstance(qxq_cell, dict) or not isinstance(bxq_cell, dict):
+        raise CampaignError(
+            f"{deployed.name} lacks the paired QxQ/BxQ routing report required "
+            f"by protocol v{PAIRED_ROUTED_SCORE_PROTOCOL_VERSION}"
+        )
     attribution: dict[str, Any] = {
+        "paired_routing_protocol_version": PAIRED_ROUTED_SCORE_PROTOCOL_VERSION,
+        "qxq_cell": qxq_cell,
+        "bxq_cell": bxq_cell,
+        "routing_intervention_delta": deployed_payload.get(
+            "routing_intervention_delta"
+        ),
+        "natural_routing_divergence": deployed_payload.get("routing"),
         "deployed": {
             "candidate": deployed.name,
             "scheme": deployed_scheme,
@@ -1424,27 +1592,59 @@ def qdq_routing(reference_path: str) -> dict[str, Any] | None:
     return None
 
 
-def _report_exists(config: Config, cand: Candidate) -> bool:
-    """True when a deployed report for this candidate is already on disk.
-
-    Tags are `{name}-v{runner}-tp...`, so the prefix is `name + "-v"` rather
-    than `name`, which would also match a longer sibling label.
-    """
-    root = os.path.join(config.work, "reports")
-    if not os.path.isdir(root):
-        return False
-    prefix = cand.name + "-v"
-    return any(
-        name.startswith(prefix) and name.endswith(".json")
-        for name in os.listdir(root)
-    )
-
-
-def _candidate_complete(config: Config, cand: Candidate, routed: bool) -> bool:
-    if not _report_exists(config, cand):
-        return False
+def _candidate_complete(
+    config: Config,
+    model: Model,
+    cand: Candidate,
+    routed: bool,
+) -> bool:
     if not routed:
-        return True
+        return _find(config.work, cand.name + "-v") is not None
+    report = score_report(
+        config,
+        cand.name,
+        cand.path,
+        model.reference_path,
+        config.rows,
+    )
+    if not os.path.isfile(report):
+        return False
+    try:
+        with open(report, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not _paired_report_is_current(payload):
+        return False
+    qxq = payload["qxq_cell"]
+    reference_config = os.path.join(model.reference_path, "config.json")
+    if (
+        payload.get("num_rows") != config.rows
+        or payload.get("context_length") != config.context_length
+        or payload.get("candidate_hf_repo") != cand.hf_repo
+        or payload.get("candidate_revision") != cand.revision
+        or payload.get("reference_weights_sha256")
+        != reference_weights_identity(model.reference_path)
+        or qxq.get("partition") != config.partition
+        or not os.path.isfile(reference_config)
+        or qxq.get("reference_config_sha256") != file_sha256(reference_config)
+    ):
+        return False
+    if config.suite_dir:
+        suite_manifest = os.path.join(
+            config.suite_dir, "suite-manifest.json"
+        )
+        with open(suite_manifest, encoding="utf-8") as handle:
+            suite = json.load(handle)
+        expected_token_sha256 = (
+            suite.get("partition_token_sha256") or {}
+        ).get(config.partition)
+        if (
+            not expected_token_sha256
+            or qxq.get("token_sha256") != expected_token_sha256
+        ):
+            return False
+    bind_weights(report, cand.path, observed=False)
     return os.path.isfile(
         os.path.join(config.work, "attribution", f"{cand.name}.json")
     )
@@ -1502,6 +1702,9 @@ def _score_candidate(
     routed: bool,
 ) -> None:
     """Provenance, score, attribute. Raises CampaignError on a candidate fault."""
+    sys.path.insert(0, HERE)
+    import qdq
+
     prov_path = os.path.join(config.work, "provenance", f"{cand.name}.json")
     try:
         identity = _provenance.compare(model.reference_path, cand.path)
@@ -1519,17 +1722,53 @@ def _score_candidate(
         python, cand.path, inspect_record(config.work, cand.name)
     )
     refuse_if_unloadable(cand.path)
+    try:
+        before_digest = qdq.weights_identity(cand.path)
+    except SystemExit as exc:
+        raise CampaignError(f"cannot bind candidate weights before scoring: {exc}") from exc
 
     report, capture = score_one(
         config, python, cand.name, cand.path, model.reference_path,
         config.rows, decompose=config.storage != "logits",
         capture_label=f"{model.name}-ref",
         measure_routing=routed,
+        paired_routing=routed,
     )
+    try:
+        after_digest = qdq.weights_identity(cand.path)
+    except SystemExit as exc:
+        raise CampaignError(f"cannot bind candidate weights after scoring: {exc}") from exc
+    if after_digest != before_digest:
+        raise CampaignError(
+            f"{cand.name} weights changed during scoring: "
+            f"{before_digest[:16]} -> {after_digest[:16]}"
+        )
     try:
         with open(report, encoding="utf-8") as handle:
             payload = json.load(handle)
         payload["candidate_provenance"] = identity
+        payload["candidate_hf_repo"] = cand.hf_repo
+        payload["candidate_revision"] = cand.revision
+        if routed:
+            manifest_path = os.path.join(capture, "manifest.json")
+            with open(manifest_path, encoding="utf-8") as handle:
+                capture_manifest = json.load(handle)
+            payload["candidate_weights_before_sha256"] = before_digest
+            payload["candidate_weights_after_sha256"] = after_digest
+            for key in ("qxq_cell", "bxq_cell"):
+                cell = payload.get(key)
+                if not isinstance(cell, dict):
+                    raise CampaignError(
+                        f"paired routed report has no complete {key}"
+                    )
+                cell["candidate_weights_sha256"] = before_digest
+                cell["candidate_weights_unchanged"] = True
+                cell["report"] = report
+                cell["partition"] = config.partition
+                cell["token_sha256"] = capture_manifest.get("token_sha256")
+                cell["reference_config_sha256"] = capture_manifest.get(
+                    "reference_config_sha256"
+                )
         with open(report, "w", encoding="utf-8", newline="\n") as handle:
             json.dump(payload, handle, indent=2)
             handle.write("\n")
@@ -1580,6 +1819,16 @@ def cmd_score(config: Config, python: str) -> int:
 
     for model in config.models:
         print(f"\n##### {model.name}")
+        exclusions = [
+            item
+            for item in config.excluded_candidates
+            if item.model in (None, model.name)
+        ]
+        for item in exclusions:
+            print(
+                f"EXCLUDED {item.hf_repo}@{item.revision}: {item.reason}",
+                file=sys.stderr,
+            )
         if not os.path.isdir(model.reference_path):
             if not model.reference_repo:
                 raise SystemExit(
@@ -1600,6 +1849,7 @@ def cmd_score(config: Config, python: str) -> int:
                 config, python, f"{model.name}-self", model.reference_path,
                 model.reference_path, 1, decompose=False,
                 suite_limit=1 if config.suite_dir else None,
+                bind_reference_weights=routed,
             )
         except CampaignError as exc:
             raise SystemExit(
@@ -1622,12 +1872,26 @@ def cmd_score(config: Config, python: str) -> int:
         routed = bool(qdq_routing(model.reference_path))
 
         for cand in model.candidates:
-            if _candidate_complete(config, cand, routed):
+            if routed:
+                try:
+                    ensure_candidate_weights(config, cand)
+                except CampaignError as exc:
+                    print(f"FAILED  {cand.name}: {exc}", file=sys.stderr)
+                    failed.append(f"{model.name}/{cand.name}")
+                    continue
+            try:
+                complete = _candidate_complete(config, model, cand, routed)
+            except CampaignError as exc:
+                print(f"FAILED  {cand.name}: {exc}", file=sys.stderr)
+                failed.append(f"{model.name}/{cand.name}")
+                continue
+            if complete:
                 print(f"=== {cand.name} already scored")
                 maybe_release(config, cand)
                 continue
             try:
-                ensure_candidate_weights(config, cand)
+                if not routed:
+                    ensure_candidate_weights(config, cand)
                 _score_candidate(config, python, model, cand, routed)
             except CandidateRefused as exc:
                 print(f"REFUSED {cand.name}: {exc}", file=sys.stderr)
@@ -1653,6 +1917,98 @@ def cmd_score(config: Config, python: str) -> int:
     return 0
 
 
+def cmd_smoke(
+    config: Config,
+    python: str,
+    wanted_candidates: set[str],
+) -> int:
+    """Run one paired window per selected routed candidate before a campaign."""
+    import qdq
+
+    known = {
+        candidate.name for model in config.models for candidate in model.candidates
+    }
+    unknown = sorted(wanted_candidates - known)
+    if unknown:
+        raise SystemExit(
+            "--only-candidate names unknown candidate(s): " + ", ".join(unknown)
+        )
+    preflight_suite(config)
+    attempted = 0
+    refused: list[str] = []
+    for model in config.models:
+        if not os.path.isdir(model.reference_path):
+            if not model.reference_repo or fetch_checkpoint(
+                model.reference_repo,
+                model.reference_path,
+                model.reference_revision,
+            ) != 0:
+                raise SystemExit(f"cannot fetch smoke-test reference {model.name}")
+        routed = bool(qdq_routing(model.reference_path))
+        if not routed:
+            print(f"SKIP     {model.name}: dense reference has no BxQ smoke test")
+            continue
+        for candidate in model.candidates:
+            if wanted_candidates and candidate.name not in wanted_candidates:
+                continue
+            attempted += 1
+            ensure_candidate_weights(config, candidate)
+            inspect_checkpoint(
+                python,
+                candidate.path,
+                inspect_record(config.work, candidate.name),
+            )
+            try:
+                refuse_if_unloadable(candidate.path)
+            except CandidateRefused as exc:
+                print(f"SMOKE REFUSED {candidate.name}: {exc}")
+                refused.append(candidate.name)
+                maybe_release(config, candidate)
+                continue
+            before = qdq.weights_identity(candidate.path)
+            report, _ = score_one(
+                config,
+                python,
+                f"__bxq_smoke__{candidate.name}",
+                candidate.path,
+                model.reference_path,
+                1,
+                decompose=False,
+                suite_limit=1,
+                capture_label=f"{model.name}-bxq-smoke-ref",
+                measure_routing=True,
+                paired_routing=True,
+            )
+            after = qdq.weights_identity(candidate.path)
+            if before != after:
+                raise SystemExit(
+                    f"SMOKE FAIL {candidate.name}: candidate weights changed"
+                )
+            with open(report, encoding="utf-8") as handle:
+                payload = json.load(handle)
+            qxq = payload.get("qxq_cell") or {}
+            bxq = payload.get("bxq_cell") or {}
+            control = bxq.get("natural_control_parity") or {}
+            if not (
+                isinstance(qxq.get("mean_kld"), (int, float))
+                and isinstance(bxq.get("mean_kld"), (int, float))
+                and control.get("passed") is True
+            ):
+                raise SystemExit(
+                    f"SMOKE FAIL {candidate.name}: incomplete paired report {report}"
+                )
+            print(
+                f"SMOKE PASS {candidate.name}: "
+                f"QxQ={qxq['mean_kld']:.8f} BxQ={bxq['mean_kld']:.8f} "
+                f"delta={payload['routing_intervention_delta']:+.8f}"
+            )
+            maybe_release(config, candidate)
+    if wanted_candidates and attempted == 0:
+        print("SMOKE FAIL: selected candidates have no routed reference", file=sys.stderr)
+        return 1
+    return 1 if refused else 0
+
+
 def _find(work: str, pattern: str) -> str | None:
     """Locate a produced artifact by tag prefix, newest first."""
     root = os.path.join(work, "reports")
@@ -1663,6 +2019,63 @@ def _find(work: str, pattern: str) -> str | None:
         reverse=True,
     )
     return os.path.join(root, matches[0]) if matches else None
+
+
+def _assembled_report(
+    config: Config,
+    model: Model,
+    cand: Candidate,
+) -> str | None:
+    """Resolve one exact report; never guess among prefix-compatible runs."""
+    attribution = os.path.join(
+        config.work, "attribution", f"{cand.name}.json"
+    )
+    if os.path.isfile(attribution):
+        with open(attribution, encoding="utf-8") as handle:
+            deployed = (json.load(handle).get("deployed") or {}).get("report")
+        if (
+            isinstance(deployed, str)
+            and os.path.isfile(deployed)
+            and os.path.basename(deployed).startswith(cand.name + "-v")
+        ):
+            with open(deployed, encoding="utf-8") as handle:
+                report = json.load(handle)
+            qxq = report.get("qxq_cell") or {}
+            if (
+                report.get("num_rows") == config.rows
+                and report.get("context_length") == config.context_length
+                and report.get("candidate_hf_repo") == cand.hf_repo
+                and report.get("candidate_revision") == cand.revision
+                and report.get("reference_weights_sha256")
+                == reference_weights_identity(model.reference_path)
+                and qxq.get("partition") == config.partition
+            ):
+                return deployed
+        raise CampaignError(
+            f"{cand.name} attribution does not bind one existing deployed report"
+        )
+
+    root = os.path.join(config.work, "reports")
+    if not os.path.isdir(root):
+        return None
+    candidates = []
+    for name in os.listdir(root):
+        if not name.startswith(cand.name + "-v") or not name.endswith(".json"):
+            continue
+        path = os.path.join(root, name)
+        with open(path, encoding="utf-8") as handle:
+            report = json.load(handle)
+        if (
+            report.get("num_rows") == config.rows
+            and report.get("context_length") == config.context_length
+        ):
+            candidates.append(path)
+    if len(candidates) > 1:
+        raise CampaignError(
+            f"{cand.name} has {len(candidates)} reports matching the active "
+            "geometry and no attribution binding; rescore or remove stale runs"
+        )
+    return candidates[0] if candidates else None
 
 
 def _reference_identity(path: str) -> dict[str, Any] | None:
@@ -1688,6 +2101,8 @@ def _reference_identity(path: str) -> dict[str, Any] | None:
             "kld_vocab_size",
             "tensor_parallel_size",
             "enforce_eager",
+            "reference_config_sha256",
+            "reference_weights_sha256",
             "runtime",
         )
     }
@@ -1746,6 +2161,7 @@ def _publish_attribution(src: str, cand_dir: str) -> None:
     with open(src, encoding="utf-8") as handle:
         attribution = json.load(handle)
     support = os.path.join(cand_dir, "attribution")
+    shutil.rmtree(support, ignore_errors=True)
     os.makedirs(support, exist_ok=True)
 
     def publish(cell: dict[str, Any]) -> None:
@@ -1766,6 +2182,70 @@ def _publish_attribution(src: str, cand_dir: str) -> None:
         cell = attribution.get(key)
         if isinstance(cell, dict):
             publish(cell)
+    for key in ("qxq_cell", "bxq_cell"):
+        cell = attribution.get(key)
+        if isinstance(cell, dict):
+            cell["report"] = "report.json"
+            trace_manifest = cell.get("routing_trace_manifest")
+            if trace_manifest and os.path.isfile(trace_manifest):
+                trace_root = os.path.join(support, "routing")
+                os.makedirs(trace_root, exist_ok=True)
+                with open(trace_manifest, encoding="utf-8") as handle:
+                    trace = json.load(handle)
+                with open(
+                    os.path.join(cand_dir, "manifest.json"), encoding="utf-8"
+                ) as handle:
+                    capture_manifest = json.load(handle)
+                if (
+                    trace.get("reference_weights_sha256")
+                    != capture_manifest.get("reference_weights_sha256")
+                    or trace.get("capture_manifest_sha256")
+                    != file_sha256(os.path.join(cand_dir, "manifest.json"))
+                ):
+                    raise CampaignError(
+                        "routing trace is not bound to the published reference "
+                        "capture"
+                    )
+                file_hashes = trace.get("file_hashes")
+                if not isinstance(file_hashes, dict) or not file_hashes:
+                    raise CampaignError(
+                        "routing trace manifest carries no payload hashes"
+                    )
+                trace_files = [
+                    os.path.basename(trace_manifest),
+                    *file_hashes.keys(),
+                ]
+                for name in trace_files:
+                    if name != os.path.basename(name):
+                        raise CampaignError(
+                            f"routing trace contains unsafe path {name!r}"
+                        )
+                    source = os.path.join(os.path.dirname(trace_manifest), name)
+                    expected = file_hashes.get(name)
+                    if not os.path.isfile(source):
+                        raise CampaignError(
+                            f"routing trace payload {name} is missing"
+                        )
+                    if expected and file_sha256(source) != expected:
+                        raise CampaignError(
+                            f"routing trace payload {name} fails its manifest hash"
+                        )
+                    target = os.path.join(trace_root, name)
+                    if os.path.exists(target):
+                        continue
+                    try:
+                        os.link(source, target)
+                    except OSError:
+                        shutil.copy2(source, target)
+                    if expected and file_sha256(target) != expected:
+                        raise CampaignError(
+                            f"published routing trace payload {name} changed in copy"
+                        )
+                cell["routing_trace_manifest"] = (
+                    f"attribution/routing/{os.path.basename(trace_manifest)}"
+                )
+            else:
+                cell.pop("routing_trace_manifest", None)
     for entry in attribution.get("ladder") or []:
         if isinstance(entry, dict):
             publish(entry)
@@ -1894,12 +2374,27 @@ def _snapshot_candidate(cand_dir: str) -> dict[str, bytes] | None:
         if os.path.isfile(path):
             with open(path, "rb") as handle:
                 held[name] = handle.read()
+    support = os.path.join(cand_dir, "attribution")
+    if os.path.isdir(support):
+        for root, _, files in os.walk(support):
+            for name in files:
+                path = os.path.join(root, name)
+                rel = os.path.relpath(path, cand_dir)
+                with open(path, "rb") as handle:
+                    held[rel] = handle.read()
     return held
 
 
 def _restore_candidate(cand_dir: str, held: dict[str, bytes]) -> None:
+    shutil.rmtree(os.path.join(cand_dir, "attribution"), ignore_errors=True)
+    for name in PUBLISHED_FILES:
+        path = os.path.join(cand_dir, name)
+        if name not in held and os.path.isfile(path):
+            os.remove(path)
     for name, data in held.items():
-        with open(os.path.join(cand_dir, name), "wb") as handle:
+        path = os.path.join(cand_dir, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
             handle.write(data)
 
 
@@ -1932,18 +2427,57 @@ def _scrub_environment(env_dir: str) -> None:
 def cmd_assemble(config: Config, python: str, force: bool = False) -> int:
     """Build the library tree, then checksums, then receipts, then documents."""
     reverted: list[str] = []
+    all_failures: list[str] = []
     for model in config.models:
         model_root = os.path.join(config.library, model.name)
         os.makedirs(model_root, exist_ok=True)
         preserved: dict[str, dict[str, bytes]] = {}
-
-        found = [
-            (cand, report)
-            for cand in model.candidates
-            for report in [_find(config.work, cand.name)]
-            if report
+        exclusions = [
+            {
+                "hf_repo": item.hf_repo,
+                "revision": item.revision,
+                "reason": item.reason,
+            }
+            for item in config.excluded_candidates
+            if item.model in (None, model.name)
         ]
-        baseline = _find(config.work, f"{model.name}-self")
+        exclusion_path = os.path.join(model_root, "excluded-candidates.json")
+        if exclusions:
+            with open(exclusion_path, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump(
+                    {
+                        "schema_version": 1,
+                        "model": model.name,
+                        "excluded_candidates": exclusions,
+                    },
+                    handle,
+                    indent=2,
+                    sort_keys=True,
+                )
+                handle.write("\n")
+        elif os.path.exists(exclusion_path):
+            os.unlink(exclusion_path)
+
+        found = []
+        for cand in model.candidates:
+            try:
+                report = _assembled_report(config, model, cand)
+            except (CampaignError, OSError, json.JSONDecodeError) as exc:
+                all_failures.append(f"{model.name}/{cand.name}")
+                print(f"FAILED   {cand.name}: {exc}", file=sys.stderr)
+                continue
+            if report:
+                found.append((cand, report))
+        baseline = score_report(
+            config,
+            f"{model.name}-self",
+            model.reference_path,
+            model.reference_path,
+            1,
+            suite_limit=1 if config.suite_dir else None,
+        )
+        if not os.path.isfile(baseline):
+            baseline = None
 
         env_src = os.path.join(config.work, "environment")
         env_dst = os.path.join(model_root, "environment")
@@ -2122,9 +2656,9 @@ def cmd_assemble(config: Config, python: str, force: bool = False) -> int:
             )
         for left, right in impossible:
             print(
-                f"IMPOSSIBLE {left} and {right} carry different weights and the "
-                f"same mean KLD, so at least one was scored against the other's "
-                f"checkpoint. Both are refused; rescore them.",
+                f"IMPOSSIBLE {left} and {right} have contradictory score and "
+                "weight identities, so at least one binding is wrong. Both are "
+                "refused; rescore them.",
                 file=sys.stderr,
             )
             failures.extend([left, right])
@@ -2135,6 +2669,7 @@ def cmd_assemble(config: Config, python: str, force: bool = False) -> int:
         _run([python, os.path.join(HERE, "artifact.py"), "checksums",
               "--root", model_root])
         if failures:
+            all_failures.extend(f"{model.name}/{name}" for name in failures)
             print(f"NOT LAW-COMPLIANT: {', '.join(failures)}", file=sys.stderr)
 
     _run([
@@ -2150,8 +2685,7 @@ def cmd_assemble(config: Config, python: str, force: bool = False) -> int:
             f"{', '.join(reverted)}",
             file=sys.stderr,
         )
-        return 1
-    return 0
+    return 1 if all_failures else 0
 
 
 def cmd_release(config: Config) -> int:
@@ -2252,6 +2786,33 @@ def selftest() -> int:
         assert inspect_checkpoint(sys.executable, cache_dir, durable) is None
         assert not os.path.isfile(durable)
 
+        config_path = os.path.join(tmp, "excluded.json")
+        with open(config_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "name": "excluded",
+                    "library": os.path.join(tmp, "library"),
+                    "work": work,
+                    "excluded_candidates": [
+                        {
+                            "hf_repo": "org/bad",
+                            "revision": "deadbeef",
+                            "reason": "emits non-finite hidden states",
+                        }
+                    ],
+                    "models": [
+                        {
+                            "name": "family",
+                            "reference": {"path": ref},
+                            "candidates": [],
+                        }
+                    ],
+                },
+                handle,
+            )
+        excluded_config = load_config(config_path)
+        assert excluded_config.excluded_candidates[0].revision == "deadbeef"
+
     rows = _parse_smi_rows(
         "0, GPU-aaa, 97887, 97000\n1, GPU-bbb, 97887, 1000\n"
     )
@@ -2321,6 +2882,38 @@ def selftest() -> int:
         {"mean_kld": 0.05, "variant": "b", "report": "s"},
     )
     assert len(already) == 1
+
+    digest = "d" * 64
+    with tempfile.NamedTemporaryFile() as trace:
+        paired = {
+            "paired_routing_protocol_version": (
+                PAIRED_ROUTED_SCORE_PROTOCOL_VERSION
+            ),
+            "reference_weights_sha256": "f" * 64,
+            "student_weights_sha256": digest,
+            "routing": {"selection_flip_rate": 0.1},
+            "routing_intervention_delta": 0.01,
+            "qxq_cell": {
+                "mean_kld": 0.1,
+                "candidate_weights_sha256": digest,
+                "candidate_weights_unchanged": True,
+            },
+            "bxq_cell": {
+                "mean_kld": 0.09,
+                "protocol_version": PAIRED_ROUTED_SCORE_PROTOCOL_VERSION,
+                "routing_trace_protocol_version": ROUTING_TRACE_PROTOCOL_VERSION,
+                "routing_trace_sha256": "e" * 64,
+                "routing_trace_manifest": trace.name,
+                "reference_weights_sha256": "f" * 64,
+                "natural_control_parity": {"passed": True},
+                "backend_evidence": {"replay_supported": True},
+                "candidate_weights_sha256": digest,
+                "candidate_weights_unchanged": True,
+            },
+        }
+        assert _paired_report_is_current(paired)
+        del paired["bxq_cell"]["routing_trace_sha256"]
+        assert not _paired_report_is_current(paired)
 
     from artifact import (
         _beyond_rounding_what,
@@ -2399,6 +2992,11 @@ def selftest() -> int:
     ])
     assert impossible == [("mse", "plain")], impossible
     assert duplicates == [("rebrand", "original")], duplicates
+    impossible, duplicates = weight_collisions([
+        ("same-a", 0.1, "d" * 64),
+        ("same-b", 0.2, "d" * 64),
+    ])
+    assert impossible == [("same-a", "same-b")] and not duplicates
     # An unbound report cannot be accused of either.
     assert weight_collisions([("a", 0.1, None), ("b", 0.1, None)]) == ([], [])
 
@@ -2659,7 +3257,26 @@ def _plot_family(
             "type": inspection.get("detected_scheme") or "unquantized",
             "disk_size_gib": round(size / 2**30, 3) if size else None,
             "size_source": inspection.get("weights_bytes_source"),
-            "mean_kld": report.get("mean_kld"),
+            "mean_kld": (report.get("qxq_cell") or {}).get(
+                "mean_kld", report.get("mean_kld")
+            ),
+            "qxq_mean_kld": (report.get("qxq_cell") or {}).get(
+                "mean_kld", report.get("mean_kld")
+            ),
+            "bxq_mean_kld": (report.get("bxq_cell") or {}).get("mean_kld"),
+            "routing_intervention_delta": report.get(
+                "routing_intervention_delta"
+            ),
+            "routing_flip_rate": (report.get("routing") or {}).get(
+                "selection_flip_rate"
+            ),
+            "bxq_omission_reason": (
+                None
+                if report.get("bxq_cell")
+                else "dense reference (QxQ only)"
+                if not qdq_routing(model.reference_path)
+                else "no valid protocol-v1 paired BxQ report"
+            ),
         })
     if not quants:
         return
@@ -2678,18 +3295,58 @@ def _plot_family(
     payload = {
         "title": f"{model.name} quantization analysis",
         "subtitle": "Mean KL divergence against on-disk size",
+        "routed": bool(qdq_routing(model.reference_path)),
         "quants": quants,
+        "excluded_candidates": [
+            {
+                "hf_repo": item.hf_repo,
+                "revision": item.revision,
+                "reason": item.reason,
+            }
+            for item in config.excluded_candidates
+            if item.model in (None, model.name)
+        ],
     }
     data = os.path.join(model_root, "kld-vs-size.json")
     with open(data, "w", encoding="utf-8", newline="\n") as handle:
         json.dump(payload, handle, indent=2)
         handle.write("\n")
-    chart = os.path.join(model_root, "kld-vs-size.png")
+    values = [
+        float(quant[metric])
+        for quant in quants
+        for metric in ("qxq_mean_kld", "bxq_mean_kld")
+        if isinstance(quant.get(metric), (int, float))
+    ]
+    limits: list[str] = []
+    if values:
+        pad = max(1e-3, (max(values) - min(values)) * 0.15 + 1e-3)
+        limits = [
+            "--y-limits",
+            str(max(0.0, min(values) - pad)),
+            str(max(values) + pad),
+        ]
+    qxq_chart = os.path.join(model_root, "qxq-vs-size.png")
     _run([
         python, os.path.join(HERE, "artifact.py"), "plot",
         "--data", data,
-        "--out", chart,
+        "--out", qxq_chart,
+        "--metric", "qxq_mean_kld",
+        *limits,
     ])
+    chart = os.path.join(model_root, "kld-vs-size.png")
+    if os.path.isfile(qxq_chart):
+        shutil.copy2(qxq_chart, chart)
+    bxq_chart = os.path.join(model_root, "bxq-vs-size.png")
+    if any(isinstance(quant.get("bxq_mean_kld"), (int, float)) for quant in quants):
+        _run([
+            python, os.path.join(HERE, "artifact.py"), "plot",
+            "--data", data,
+            "--out", bxq_chart,
+            "--metric", "bxq_mean_kld",
+            *limits,
+        ])
+    elif os.path.exists(bxq_chart):
+        os.unlink(bxq_chart)
     # The card is the first thing a reader of the published repo sees. Written
     # here so checksums cover it and so a repo is never served as a bare file
     # listing under a metadata warning.
@@ -2700,6 +3357,10 @@ def _plot_family(
     ]
     if os.path.isfile(chart):
         card += ["--plot", "kld-vs-size.png"]
+    if os.path.isfile(qxq_chart):
+        card += ["--qxq-plot", "qxq-vs-size.png"]
+    if os.path.isfile(bxq_chart):
+        card += ["--bxq-plot", "bxq-vs-size.png"]
     if config.license:
         card += ["--license", config.license]
     _run(card)
@@ -2755,7 +3416,15 @@ def main() -> int:
     parser.add_argument(
         "stage",
         nargs="?",
-        choices=("download", "score", "assemble", "all", "release", "sizes"),
+        choices=(
+            "download",
+            "smoke",
+            "score",
+            "assemble",
+            "all",
+            "release",
+            "sizes",
+        ),
     )
     parser.add_argument("--config")
     parser.add_argument(
@@ -2765,6 +3434,12 @@ def main() -> int:
         "that fails a law",
     )
     parser.add_argument("--selftest", action="store_true")
+    parser.add_argument(
+        "--only-candidate",
+        action="append",
+        default=[],
+        help="with smoke, test only this candidate name; repeatable",
+    )
     args = parser.parse_args()
 
     if args.selftest:
@@ -2800,6 +3475,8 @@ def main() -> int:
     lock = hold_work_lock(config.work)
     try:
         score_rc = 0
+        if args.stage == "smoke":
+            return cmd_smoke(config, python, set(args.only_candidate))
         if args.stage in ("score", "all"):
             score_rc = cmd_score(config, python)
         if args.stage in ("assemble", "all"):

@@ -54,6 +54,7 @@ def create_fused_moe_router(
     e_score_correction_bias: torch.Tensor | None = None,
     # custom routing parameters
     custom_routing_function: Callable | None = None,
+    custom_forced_routing_function: Callable | None = None,
     # eplb parameters
     eplb_state: EplbLayerState | None = None,
     # zero expert parameters
@@ -94,6 +95,8 @@ def create_fused_moe_router(
 
     Custom routing arguments:
         custom_routing_function: Optional custom routing function
+        custom_forced_routing_function: Optional callback that computes routing
+            weights from student logits for externally supplied expert IDs
 
     EPLB arguments:
         eplb_state: Optional EplbLayerState, None when EPLB is disabled.
@@ -110,6 +113,10 @@ def create_fused_moe_router(
     Returns:
         An instance of the appropriate FusedMoERouter subclass
     """
+    if custom_forced_routing_function is not None and custom_routing_function is None:
+        raise ValueError(
+            "custom_forced_routing_function requires custom_routing_function."
+        )
 
     routing_strategy = envs.VLLM_MOE_ROUTING_SIMULATION_STRATEGY
     if routing_strategy != "":
@@ -194,6 +201,7 @@ def create_fused_moe_router(
             global_num_experts=global_num_experts,
             eplb_state=eplb_state,
             custom_routing_function=custom_routing_function,
+            custom_forced_routing_function=custom_forced_routing_function,
             renormalize=renormalize,
         )
 

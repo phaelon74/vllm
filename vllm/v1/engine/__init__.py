@@ -134,6 +134,12 @@ class EngineCoreRequest(
     kld_vocab_size: int | None = None
     """Unpadded tokenizer vocab size; KLD softmax truncates to this."""
 
+    reference_routing_path: str | None = None
+    """Versioned BF16 logical expert-ID trace for BxQ scoring."""
+
+    reference_routing_sha256: str | None = None
+    """Expected SHA256 of the routing trace file."""
+
     # Per-position mask for mixed-mode inputs (e.g chat completion with
     # prompt_embeds content parts). `True` means the position is a real
     # token ID; `False` means the position uses a pre-computed entry from

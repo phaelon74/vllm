@@ -1093,6 +1093,25 @@ class FusedMoEExpertsMonolithic(FusedMoEExperts):
         """
         raise NotImplementedError
 
+    def apply_routed(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+    ) -> torch.Tensor:
+        """Run this monolithic experts implementation with external routing."""
+        raise NotImplementedError(
+            "Exact forced routing is not supported with monolithic experts "
+            f"{type(self).__name__}."
+        )
+
 
 ################################################################################
 # Kernel
@@ -1595,6 +1614,91 @@ class FusedMoEKernelMonolithicImpl:
             return fused_out
         return self.prepare_finalize.finalize(fused_out)
 
+    def apply_routed(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+    ) -> torch.Tensor:
+        parallel_config = self.fused_experts.moe_config.moe_parallel_config
+        if (
+            parallel_config.dp_size != 1
+            or parallel_config.ep_size != 1
+            or parallel_config.pcp_size != 1
+            or parallel_config.is_sequence_parallel
+        ):
+            raise NotImplementedError(
+                "Exact forced routing for monolithic MoE kernels does not "
+                "support DP, EP, PCP, or sequence-parallel token dispatch."
+            )
+        if hidden_states.ndim != 2:
+            raise ValueError(
+                "Exact forced routing requires 2D hidden states; "
+                f"got shape {tuple(hidden_states.shape)}."
+            )
+        if self.fused_experts.moe_config.should_defer_moe_finalize(
+            hidden_states.shape[0]
+        ):
+            raise NotImplementedError(
+                "Exact forced routing for monolithic MoE kernels does not "
+                "support deferred finalize."
+            )
+        expected_shape = (
+            hidden_states.shape[0],
+            self.fused_experts.moe_config.experts_per_token,
+        )
+        if topk_ids.shape != expected_shape:
+            raise ValueError(
+                "Exact forced routing IDs must match tokens and top-k; "
+                f"expected {expected_shape}, got {tuple(topk_ids.shape)}."
+            )
+        if topk_weights.shape != expected_shape:
+            raise ValueError(
+                "Exact forced routing weights must match expert IDs; "
+                f"expected {expected_shape}, got {tuple(topk_weights.shape)}."
+            )
+        if topk_ids.dtype != torch.int32 or topk_weights.dtype != torch.float32:
+            raise TypeError(
+                "Exact forced routing requires int32 IDs and float32 weights; "
+                f"got {topk_ids.dtype} and {topk_weights.dtype}."
+            )
+        if (
+            topk_ids.device != hidden_states.device
+            or topk_weights.device != hidden_states.device
+        ):
+            raise ValueError(
+                "Exact forced routing IDs, weights, and hidden states must share "
+                "a device."
+            )
+        if not topk_ids.is_contiguous() or not topk_weights.is_contiguous():
+            raise ValueError("Exact forced routing IDs and weights must be contiguous.")
+
+        a1q, a1q_scale, _ = self.prepare_finalize.prepare(
+            hidden_states,
+            router_logits=topk_weights,
+            quant_config=self.fused_experts.quant_config,
+            defer_input_quant=self.fused_experts.expects_unquantized_inputs,
+        )
+        fused_out = self.fused_experts.apply_routed(
+            hidden_states=a1q,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=activation,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            a1q_scale=a1q_scale,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+        )
+        return self.prepare_finalize.finalize(fused_out)
+
 
 @final
 class FusedMoEKernel:
@@ -1712,6 +1816,31 @@ class FusedMoEKernel:
             e_score_correction_bias=e_score_correction_bias,
             routed_scaling_factor=routed_scaling_factor,
             topk_group=topk_group,
+        )
+
+    def apply_routed(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+    ) -> torch.Tensor:
+        assert isinstance(self.impl, FusedMoEKernelMonolithicImpl)
+        return self.impl.apply_routed(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=activation,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            apply_router_weight_on_input=apply_router_weight_on_input,
         )
 
     def apply(
