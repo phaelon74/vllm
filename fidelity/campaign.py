@@ -1936,7 +1936,11 @@ def cmd_assemble(config: Config, python: str, force: bool = False) -> int:
                 inspect_src = os.path.join(cand.path, "inspect.json")
             if os.path.isfile(inspect_src):
                 shutil.copy2(inspect_src, os.path.join(cand_dir, "inspect.json"))
-                _ensure_weights_size(cand, os.path.join(cand_dir, "inspect.json"))
+            # Whether or not a fresh inspection landed: an older one carries no
+            # size, and the Hub can still answer for the revision it names.
+            published_inspect = os.path.join(cand_dir, "inspect.json")
+            if os.path.isfile(published_inspect):
+                _ensure_weights_size(cand, published_inspect)
             prov_src = os.path.join(
                 config.work, "provenance", f"{cand.name}.json"
             )
