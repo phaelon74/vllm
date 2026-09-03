@@ -959,6 +959,11 @@ def inspect_model_moe_backends(model: torch.nn.Module) -> dict[str, Any]:
         kernel = getattr(quant_method, "moe_kernel", None)
         implementation = getattr(kernel, "impl", None)
         experts = getattr(implementation, "fused_experts", None)
+        routing_method = getattr(
+            experts,
+            "routing_method_type",
+            getattr(experts, "routing_method", None),
+        )
         layers.append(
             {
                 "name": name,
@@ -968,6 +973,9 @@ def inspect_model_moe_backends(model: torch.nn.Module) -> dict[str, Any]:
                 "kernel": type(kernel).__name__ if kernel is not None else None,
                 "experts": type(experts).__name__ if experts is not None else None,
                 "monolithic": bool(quant_method.is_monolithic),
+                "routing_method": getattr(routing_method, "name", str(routing_method)),
+                "renormalize": getattr(module.router, "renormalize", None),
+                "scoring_func": getattr(module.router, "scoring_func", None),
             }
         )
     return {"layers": layers}
