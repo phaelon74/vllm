@@ -1433,9 +1433,13 @@ def _decompose_head_kld(
                 raise RuntimeError("Trunk KLD returned no worker results")
             agreement = worker_agreement(per_worker)
             if not agreement["agrees"]:
+                fault = (
+                    "Trunk KLD is not a number"
+                    if agreement.get("nonfinite")
+                    else "Trunk KLD differs across workers"
+                )
                 raise RuntimeError(
-                    f"Trunk KLD differs across workers on window {idx}: "
-                    f"{agreement['detail']}"
+                    f"{fault} on window {idx}: {agreement['detail']}"
                 )
             if agreement["max_abs_delta"] > worst_agreement.get(
                 "max_abs_delta", 0.0

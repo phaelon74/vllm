@@ -99,6 +99,27 @@ WORKER_KLD_ABS_TOLERANCE = 1e-5
 WORKER_KLD_MEAN_REL_TOLERANCE = 1e-7
 
 
+def nonfinite_summary(result: KLDResult) -> str:
+    """Where a KLD payload is not a number, or "" when every value is finite.
+
+    A NaN compares unequal to itself, so it masquerades as a disagreement
+    between two workers that in fact computed the identical thing. Naming it
+    directly is what separates a scoring fault from a sharding fault.
+    """
+    import math
+
+    parts = []
+    for field in ("kld_ref_to_model", "kld_model_to_ref", "ref_top1_prob"):
+        values = getattr(result, field)
+        bad = [i for i, v in enumerate(values) if not math.isfinite(float(v))]
+        if bad:
+            parts.append(
+                f"{field}: {len(bad)} of {len(values)} not finite, first at "
+                f"position {bad[0]} ({values[bad[0]]!r})"
+            )
+    return "; ".join(parts)
+
+
 def worker_agreement(per_worker: Sequence[KLDResult]) -> dict[str, Any]:
     """How far tensor-parallel workers disagree about the same trunk KLD.
 
@@ -110,6 +131,25 @@ def worker_agreement(per_worker: Sequence[KLDResult]) -> dict[str, Any]:
     if not per_worker:
         raise ValueError("worker agreement needs at least one worker result")
     first = per_worker[0]
+    # Checked before any comparison: a NaN is unequal to itself and would be
+    # reported as workers disagreeing about a number neither of them produced.
+    unfinite = nonfinite_summary(first)
+    if unfinite:
+        return {
+            "agrees": False,
+            "workers": len(per_worker),
+            "max_abs_delta": 0.0,
+            "mean_abs_delta": 0.0,
+            "mean_rel_delta": 0.0,
+            "top1_flips": 0,
+            "nonfinite": unfinite,
+            "detail": (
+                f"the KLD is not a number, on every worker alike - {unfinite}. "
+                f"This is a scoring fault, not a disagreement between ranks: "
+                f"logits that overflow or a hidden state carrying NaN produce "
+                f"it. Nothing here can be published."
+            ),
+        }
     detail = ""
     worst_abs = 0.0
     worst_field = ""
@@ -680,12 +720,29 @@ def compute_trunk_kld_in_model(
     chunks: list[KLDResult] = []
     for start in range(0, student.shape[0], position_chunk):
         stop = min(start + position_chunk, student.shape[0])
-        student_logits = replay_lm_head_in_model(
-            model, replay_state, student[start:stop].to(device)
-        )
-        teacher_logits = replay_lm_head_in_model(
-            model, replay_state, teacher[start:stop].to(device)
-        )
+        student_slice = student[start:stop].to(device)
+        teacher_slice = teacher[start:stop].to(device)
+        student_logits = replay_lm_head_in_model(model, replay_state, student_slice)
+        teacher_logits = replay_lm_head_in_model(model, replay_state, teacher_slice)
+        # Raised here, where the values that produced it are still in hand. A NaN
+        # discovered later is only a NaN; discovered here it says which side went
+        # bad and how large the hidden states were that took it there.
+        for label, hidden, logits in (
+            ("student", student_slice, student_logits),
+            ("teacher", teacher_slice, teacher_logits),
+        ):
+            finite = torch.isfinite(logits)
+            if not bool(finite.all()):
+                bad = int((~finite).sum())
+                raise ValueError(
+                    f"{label} logits are not finite at positions "
+                    f"{start}-{stop}: {bad} of {logits.numel()} values, from "
+                    f"hidden states with max magnitude "
+                    f"{float(hidden.abs().max()):.4g} in {hidden.dtype} through "
+                    f"a {replay_state[1].params_dtype} head. A 4-bit or 8-bit "
+                    f"trunk that leaves the hidden scale far from the "
+                    f"reference's overflows the head's dtype here."
+                )
         chunks.append(
             compute_kld_chunk(student_logits, teacher_logits, kld_vocab_size)
         )

@@ -661,6 +661,21 @@ class TestWorkerAgreement:
         assert found["agrees"], found["detail"]
         assert found["top1_flips"] == 1
 
+    def test_a_nan_is_named_not_read_as_a_disagreement(self):
+        """A NaN is unequal to itself, so it impersonates a worker disagreement."""
+        from vllm.v1.sample.kld import worker_agreement
+
+        nan = float("nan")
+        found = worker_agreement(
+            [self._result([1.0, nan]), self._result([1.0, nan])]
+        )
+        assert not found["agrees"]
+        assert found["nonfinite"], found
+        assert "not a number" in found["detail"]
+        assert "position 1" in found["detail"]
+        # Never blamed on the ranks, which computed the identical value.
+        assert "disagreement between ranks" not in found["detail"].split("not a")[0]
+
     def test_a_single_worker_agrees_exactly(self):
         from vllm.v1.sample.kld import worker_agreement
 
