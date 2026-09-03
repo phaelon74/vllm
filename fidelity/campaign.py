@@ -125,6 +125,9 @@ class Config:
     # candidate at a time during score and deletes those weights afterwards.
     fetch: str = "upfront"
     tensor_parallel_size: int | None = None
+    # Declared, never guessed: what a published artifact may be reused for is the
+    # publisher's decision, and an unset license is left unset on the card.
+    license: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -2642,11 +2645,25 @@ def _plot_family(
     with open(data, "w", encoding="utf-8", newline="\n") as handle:
         json.dump(payload, handle, indent=2)
         handle.write("\n")
+    chart = os.path.join(model_root, "kld-vs-size.png")
     _run([
         python, os.path.join(HERE, "artifact.py"), "plot",
         "--data", data,
-        "--out", os.path.join(model_root, "kld-vs-size.png"),
+        "--out", chart,
     ])
+    # The card is the first thing a reader of the published repo sees. Written
+    # here so checksums cover it and so a repo is never served as a bare file
+    # listing under a metadata warning.
+    card = [
+        python, os.path.join(HERE, "artifact.py"), "card",
+        "--data", data,
+        "--out", os.path.join(model_root, "README.md"),
+    ]
+    if os.path.isfile(chart):
+        card += ["--plot", "kld-vs-size.png"]
+    if config.license:
+        card += ["--license", config.license]
+    _run(card)
 
 
 def cmd_sizes(config: Config) -> int:

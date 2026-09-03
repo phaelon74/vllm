@@ -210,6 +210,13 @@ artifact says which, because a Hub figure describes a revision while a local one
 describes the bytes that were scored. A candidate with no size is omitted from
 the chart and the omission is counted rather than guessed at.
 
+Assembly also writes the model's own `README.md` — the card a reader of the
+published repo sees first — carrying the family's candidate table ranked by mean
+KLD, the chart, the laws version, and a YAML header. Without a header the Hub
+serves a metadata warning in place of the card, and without a card the artifact
+is a bare file listing. Set `"license"` in the campaign config to declare one on
+the card; unset, it is left unstated rather than guessed.
+
 Every model in a campaign is ingested, scored, and assembled by the identical
 code path. That is the point: a comparison between two candidates means nothing
 if anything about the procedure differed between them.
@@ -236,7 +243,8 @@ failures because the checker verifies the assembled artifact:
    baselines, per-candidate reports.
 5. Write `checksums.txt` over the assembled tree.
 6. Run `compliance.py` per candidate, writing `results/<candidate>/compliance.json`.
-7. Render one-pagers, then the leaderboard.
+7. Render one-pagers, then the family chart, the model's own card, then the
+   leaderboard.
 8. Publish.
 
 Steps 5 and 6 cannot be swapped. Law 12 verifies that `checksums.txt` and the

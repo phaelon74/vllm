@@ -1632,6 +1632,105 @@ def render_plot(payload: dict[str, Any], out: str) -> str | None:
     return f"{missing} candidate(s) omitted for want of a size" if missing else None
 
 
+def front_matter(fields: dict[str, Any]) -> list[str]:
+    """A minimal YAML header for a Hub repo card.
+
+    A repo without one is served with a metadata warning in place of the card's
+    own summary, which is the first thing a reader sees. Only flat scalars and
+    lists of scalars are emitted, which is all a card needs and keeps this from
+    becoming a YAML writer.
+    """
+    out = ["---"]
+    for key, value in fields.items():
+        if value is None or value == [] or value == "":
+            continue
+        if isinstance(value, list):
+            out.append(f"{key}:")
+            out += [f"- {item}" for item in value]
+        elif isinstance(value, bool):
+            out.append(f"{key}: {'true' if value else 'false'}")
+        else:
+            out.append(f"{key}: {value}")
+    out += ["---", ""]
+    return out
+
+
+def render_card(payload: dict[str, Any], laws_version: int = LAWS_VERSION) -> str:
+    """The artifact repo's own card: what this family is and how to read it."""
+    title = str(payload.get("title") or "Distribution fidelity artifact")
+    quants = [q for q in payload.get("quants") or [] if q.get("mean_kld") is not None]
+    ranked = sorted(quants, key=lambda q: float(q["mean_kld"]))
+    lines = front_matter(
+        {
+            "pretty_name": title,
+            "tags": [
+                "quantization",
+                "kl-divergence",
+                "distribution-fidelity",
+                "evaluation",
+            ],
+            "license": payload.get("license"),
+        }
+    )
+    lines += [
+        f"# {title}",
+        "",
+        str(payload.get("subtitle") or ""),
+        "",
+        f"Scored under the distribution-fidelity laws, version {laws_version}. "
+        f"Read [`LAWS.md`](LAWS.md) first: these numbers are comparable only "
+        f"within this artifact's token suite, geometry, and runtime identity, "
+        f"and not against any number produced elsewhere.",
+        "",
+        "Each candidate directory holds its one-pager (`report.md`), its raw "
+        "report, its compliance receipt, and its Law 14 attribution where one "
+        "was produced. `reference/` carries the reusable teacher tensors and "
+        "head, so a third party can score a new candidate without loading the "
+        "reference checkpoint. `checksums.txt` covers every file here.",
+        "",
+    ]
+    if ranked:
+        lines += ["## Candidates by mean KLD", ""]
+        rows = []
+        for q in ranked:
+            size = q.get("disk_size_gib")
+            rows.append(
+                (
+                    str(q.get("id") or ""),
+                    str(q.get("type") or ""),
+                    "n/a" if size is None else f"{float(size):.2f} GiB",
+                    f"{float(q['mean_kld']):.8f}",
+                )
+            )
+        lines += _table(rows, ("Candidate", "Scheme", "On disk", "Mean KLD"))
+        lines.append("")
+    if os.path.basename(str(payload.get("plot") or "")):
+        lines += [
+            "## Fidelity against size",
+            "",
+            f"![mean KLD against on-disk size]({payload['plot']})",
+            "",
+            "The numbers behind the chart are in "
+            "[`kld-vs-size.json`](kld-vs-size.json), because a picture is not "
+            "evidence.",
+            "",
+        ]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _cmd_card(args: argparse.Namespace) -> int:
+    with open(args.data, encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if args.plot:
+        payload["plot"] = args.plot
+    if args.license:
+        payload["license"] = args.license
+    with open(args.out, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(render_card(payload))
+    print(f"wrote {args.out}")
+    return 0
+
+
 def _cmd_plot(args: argparse.Namespace) -> int:
     with open(args.data, encoding="utf-8") as handle:
         payload = json.load(handle)
@@ -1675,6 +1774,13 @@ def main() -> int:
     chart.add_argument("--data", required=True, help="family plot payload JSON")
     chart.add_argument("--out", required=True)
     chart.set_defaults(func=_cmd_plot)
+
+    card = sub.add_parser("card", help="render the artifact repo's own card")
+    card.add_argument("--data", required=True, help="family plot payload JSON")
+    card.add_argument("--out", required=True)
+    card.add_argument("--plot", help="chart filename to embed, relative to the card")
+    card.add_argument("--license", help="license identifier for the card metadata")
+    card.set_defaults(func=_cmd_card)
 
     sums = sub.add_parser("checksums", help="hash every file in an artifact")
     sums.add_argument("--root", required=True)

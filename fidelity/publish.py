@@ -32,7 +32,11 @@ import tempfile
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from artifact import candidate_identity  # noqa: E402 - sibling module
+from artifact import (  # noqa: E402 - sibling module
+    LAWS_VERSION,
+    candidate_identity,
+    front_matter,
+)
 from redaction import scan_tree  # noqa: E402 - sibling module
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -303,7 +307,28 @@ def build_index(
         if os.path.isfile(src):
             shutil.copy2(src, os.path.join(staging, name))
 
-    lines = [
+    leaderboard = os.path.isfile(os.path.join(staging, "leaderboard.csv"))
+    lines = front_matter(
+        {
+            "pretty_name": "Local Inference Lab: distribution-fidelity index",
+            "tags": [
+                "quantization",
+                "kl-divergence",
+                "distribution-fidelity",
+                "evaluation",
+            ],
+            # Points the dataset viewer at the one tabular file here, so it shows
+            # the leaderboard instead of waiting on files that are prose.
+            "configs": None,
+        }
+    )
+    if leaderboard:
+        lines[-2:-2] = [
+            "configs:",
+            "- config_name: leaderboard",
+            "  data_files: leaderboard.csv",
+        ]
+    lines += [
         "# Local Inference Lab: distribution-fidelity index",
         "",
         "Every published one-pager, with a pointer to the full artifact that "
@@ -311,9 +336,10 @@ def build_index(
         "reference tensors, so a third party can score a new candidate without "
         "loading the reference checkpoint.",
         "",
-        "Read [`LAWS.md`](LAWS.md) before comparing anything here. Numbers are "
-        "comparable only within a single artifact's suite, geometry, and runtime "
-        "identity.",
+        f"Read [`LAWS.md`](LAWS.md), currently version {LAWS_VERSION}, before "
+        f"comparing anything here. Numbers are comparable only within a single "
+        f"artifact's suite, geometry, and runtime identity. Each one-pager cites "
+        f"the laws version it was scored under, which is not always the newest.",
         "",
     ]
     for plan in index_entries(library, plans, read_ledger(library)):
@@ -426,6 +452,14 @@ def selftest() -> None:
         try:
             listed = staged_index_models(staging)
             assert listed == {"Qwen3.6-27B", "Qwen3.8-27B"}, listed
+            # A card without YAML metadata is served as a warning, so the
+            # header must be present and must open the file.
+            with open(
+                os.path.join(staging, "README.md"), encoding="utf-8"
+            ) as handle:
+                readme = handle.read()
+            assert readme.startswith("---\n"), readme[:40]
+            assert "pretty_name:" in readme.split("---")[1]
             # An index that would unlist a published model is refusable.
             assert not (listed - {"Qwen3.6-27B", "Qwen3.8-27B"})
             assert sorted({"Qwen3.8-27B"} - {"Qwen3.6-27B"}) == ["Qwen3.8-27B"]
