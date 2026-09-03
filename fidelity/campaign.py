@@ -400,6 +400,29 @@ def inspect_record(work: str, name: str) -> str:
     return os.path.join(work, "inspect", f"{name}.json")
 
 
+def _inspect_is_current(path: str) -> bool:
+    """Whether `path` holds an inspection this inspector would still stand by.
+
+    A cached reading is only worth reusing if the code that produced it agrees
+    with the code about to trust it. One written before a detection fix is
+    silently wrong, which is worse than absent.
+    """
+    import qdq as _qdq
+    try:
+        with open(path, encoding="utf-8") as handle:
+            record = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return False
+    if record.get("inspect_version") == _qdq.INSPECT_VERSION:
+        return True
+    print(
+        f"=== re-inspecting: {path} was written by inspector "
+        f"{record.get('inspect_version', 'unversioned')}, this is "
+        f"{_qdq.INSPECT_VERSION}"
+    )
+    return False
+
+
 def inspect_checkpoint(
     python: str, path: str, durable: str | None = None
 ) -> str | None:
@@ -412,14 +435,14 @@ def inspect_checkpoint(
     dest = durable or cache
     if durable:
         os.makedirs(os.path.dirname(os.path.abspath(durable)), exist_ok=True)
-        if os.path.isfile(durable):
+        if _inspect_is_current(durable):
             print(f"=== inspect already at {durable}")
             return durable
-        if os.path.isfile(cache):
+        if _inspect_is_current(cache):
             shutil.copy2(cache, durable)
             print(f"=== inspect copied {cache} -> {durable}")
             return durable
-    elif os.path.isfile(cache):
+    elif _inspect_is_current(cache):
         print(f"=== inspect already at {cache}")
         return cache
     cmd = [

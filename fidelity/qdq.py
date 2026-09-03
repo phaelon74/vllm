@@ -81,8 +81,10 @@ COMPONENT_PATTERNS: dict[str, tuple[str, ...]] = {
         r"\.block_sparse_moe\.experts\.",
         r"\.feed_forward\.experts\.",
         # Gemma 4 has no MoE wrapper module: the fused stacks sit directly on the
-        # layer as `layers.N.experts.gate_up_proj`.
+        # layer as `layers.N.experts.gate_up_proj`. Some exporters reintroduce a
+        # wrapper of their own when they unfuse the stack per expert.
         r"\.layers\.\d+\.experts\.",
+        r"\.moe\.experts\.",
     ),
     "shared_expert": (
         r"\.mlp\.shared_expert\.",
@@ -114,6 +116,11 @@ NEVER = (
 )
 
 COMPONENTS = tuple(COMPONENT_PATTERNS)
+# An inspection is cached beside the checkpoint and in the work tree, so a
+# reading taken by an older inspector outlives the code that produced it. Bump
+# this whenever detection or classification changes and every cache that
+# predates the change is re-read instead of trusted.
+INSPECT_VERSION = 2
 # Variant-path suffix; full hex lives on inspect.json and the QDQ manifest.
 MATCH_DIGEST_LEN = 12
 
@@ -853,6 +860,20 @@ _FUSED_EXPERT_MEMBERS: dict[str, tuple[str, ...]] = {
 
 _EXPERT_STACK = re.compile(r"^(?P<prefix>.+\.experts)\.(?P<leaf>[^.]+)$")
 
+# The module a checkpoint hangs its experts off is the exporter's choice, not a
+# property of the model: the same weight is `layers.N.experts.<e>...` in one pack
+# and `layers.N.moe.experts.<e>...` in another. Comparing a pack's names against
+# the reference's own means erasing that choice from both sides first.
+_EXPERT_WRAPPER = re.compile(
+    r"\.(?:moe|mlp|block_sparse_moe|feed_forward)\.experts\."
+)
+
+
+def canonical_expert_name(name: str) -> str:
+    """`name` with any MoE wrapper module between the layer and `experts`
+    removed, so two exporters' names for one weight compare equal."""
+    return _EXPERT_WRAPPER.sub(".experts.", name)
+
 
 def _fused_constituents(name: str, shape: tuple[int, ...]) -> set[str] | None:
     """Per-expert names carried by a fused expert stack, or None if not one.
@@ -872,7 +893,7 @@ def _fused_constituents(name: str, shape: tuple[int, ...]) -> set[str] | None:
         return None
     prefix = hit.group("prefix")
     return {
-        f"{prefix}.{index}.{member}.weight"
+        canonical_expert_name(f"{prefix}.{index}.{member}.weight")
         for index in range(shape[0])
         for member in members
     }
@@ -886,14 +907,20 @@ def resolve_matched(
     Names present in the reference resolve to themselves. A per-expert name
     resolves to the fused stack that holds it. A stack the pack covers only in
     part is refused: rounding it whole would over-round the experts the pack
-    left alone, and rounding it in part is not a tensor-level operation.
+    left alone, and rounding it in part is not a tensor-level operation. Both
+    sides are compared with any MoE wrapper module erased, so a pack that keeps
+    its experts under `moe.` still resolves against a reference that does not.
     """
     wanted = {
-        name for name in matched if classify(name, selected) is not None
+        canonical_expert_name(name)
+        for name in matched
+        if classify(name, selected) is not None
     }
     shapes = _component_shapes(reference, selected)
-    resolved = wanted & set(shapes)
-    remaining = wanted - resolved
+    resolved = {
+        name for name in shapes if canonical_expert_name(name) in wanted
+    }
+    remaining = wanted - {canonical_expert_name(name) for name in resolved}
     partial: list[tuple[str, int, int]] = []
     for name, shape in sorted(shapes.items()):
         members = _fused_constituents(name, shape)
@@ -1039,6 +1066,7 @@ def inspect(model: str) -> dict[str, Any]:
 
     return {
         "model": os.path.abspath(model),
+        "inspect_version": INSPECT_VERSION,
         "weights_sha256": weights_identity(model),
         "quant_method": quant.get("quant_method"),
         "declared": {
@@ -1762,6 +1790,16 @@ def selftest() -> int:
         for e in range(128)
         for leaf in ("gate_proj", "up_proj")
     }
+    # An exporter that unfuses Gemma's stack may put the experts back under a
+    # wrapper the reference does not have.
+    wrapped = "model.language_model.layers.0.moe.experts.7.gate_proj.weight"
+    assert classify(wrapped, COMPONENTS) == "experts"
+    assert canonical_expert_name(wrapped) == (
+        "model.language_model.layers.0.experts.7.gate_proj.weight"
+    )
+    assert canonical_expert_name(
+        "model.layers.0.mlp.experts.3.down_proj.weight"
+    ) == "model.layers.0.experts.3.down_proj.weight"
     print("  Gemma 4 experts, router, dense MLP, and vision tower classify")
 
     # A pack that keeps its experts fused names the operand with no `.weight`.
@@ -1978,6 +2016,18 @@ def selftest() -> int:
         }
         assert match_digest(fused, {"quantized_names": sorted(per_expert)},
                             ("experts",)) is None
+        # The same weights under a wrapper the reference lacks must land on the
+        # same stacks, and therefore on the same cell.
+        wrapped_experts = {
+            name.replace(".mlp.experts.", ".moe.experts.") for name in per_expert
+        }
+        assert resolve_matched(fused, ("experts",), wrapped_experts) == {
+            f"{stem}.gate_up_proj",
+            f"{stem}.down_proj",
+        }
+        assert match_digest(
+            fused, {"quantized_names": sorted(wrapped_experts)}, ("experts",)
+        ) is None
         try:
             resolve_matched(
                 fused, ("experts",), per_expert - {f"{stem}.1.up_proj.weight"}
