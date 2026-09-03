@@ -44,6 +44,9 @@ from vllm.model_executor.layers.fused_moe.router.router_factory import (
     create_fused_moe_router,
 )
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+from vllm.model_executor.layers.fused_moe.utils import (
+    trtllm_moe_pack_topk_ids_weights,
+)
 from vllm.transformers_utils.model_arch_config_convertor import (
     ModelArchConfigConvertorBase,
 )
@@ -559,7 +562,7 @@ def test_monolithic_kernel_forwards_exact_routing_tensors():
     assert output is routed_output
 
 
-def test_trtllm_fp8_forced_route_uses_public_unpacked_api():
+def test_trtllm_fp8_forced_route_uses_public_packed_api():
     import flashinfer
 
     experts = object.__new__(TrtLlmFp8ExpertsMonolithic)
@@ -608,9 +611,10 @@ def test_trtllm_fp8_forced_route_uses_public_unpacked_api():
         )
 
     routed = routed_moe.call_args.kwargs
-    routed_ids, routed_weights = routed["topk_ids"]
-    assert routed_ids is topk_ids
-    assert routed_weights is topk_weights
+    expected_routes = trtllm_moe_pack_topk_ids_weights(
+        topk_ids, topk_weights
+    )
+    torch.testing.assert_close(routed["topk_ids"], expected_routes)
     assert "routing_logits" not in routed
     assert routed["routing_method_type"] == RoutingMethodType.RenormalizeNaive
     assert output is expected

@@ -480,8 +480,11 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
             weight_layout = WeightLayout.BlockMajorK
             hidden_states_scale = prepare_deepseek_fp8_x_sf(hidden_states, a1q_scale)
 
+        packed_topk = trtllm_moe_pack_topk_ids_weights(
+            topk_ids, topk_weights
+        )
         kwargs = dict(
-            topk_ids=(topk_ids, topk_weights),
+            topk_ids=packed_topk,
             routing_bias=None,
             hidden_states=hidden_states,
             hidden_states_scale=hidden_states_scale,
@@ -517,8 +520,8 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
             )
         except (AttributeError, TypeError) as exc:
             raise NotImplementedError(
-                "Installed FlashInfer does not support unpacked FP32 routing "
-                "weights for block-scale FP8 TRTLLM MoE."
+                "Installed FlashInfer does not support packed pre-routing for "
+                "block-scale FP8 TRTLLM MoE."
             ) from exc
         return result[0] if isinstance(result, list) else result
 
@@ -633,9 +636,12 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
                 f"Exact forced routing does not support {activation} with "
                 "per-tensor FP8 TRTLLM MoE."
             )
+        packed_topk = trtllm_moe_pack_topk_ids_weights(
+            topk_ids, topk_weights
+        )
         try:
             result = flashinfer.fused_moe.trtllm_fp8_per_tensor_scale_routed_moe(
-                topk_ids=(topk_ids, topk_weights),
+                topk_ids=packed_topk,
                 routing_bias=None,
                 hidden_states=hidden_states,
                 gemm1_weights=w1,

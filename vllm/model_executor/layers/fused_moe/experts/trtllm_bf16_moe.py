@@ -276,9 +276,12 @@ class TrtLlmBf16ExpertsMonolithic(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsMonol
                 "Exact forced routing is not supported when BF16 TRTLLM MoE "
                 "applies router weights on input."
             )
+        packed_topk = trtllm_moe_pack_topk_ids_weights(
+            topk_ids, topk_weights
+        )
         try:
             result = flashinfer.fused_moe.trtllm_bf16_routed_moe(
-                topk_ids=(topk_ids, topk_weights),
+                topk_ids=packed_topk,
                 hidden_states=hidden_states,
                 gemm1_weights=w1,
                 gemm2_weights=w2,
@@ -301,8 +304,8 @@ class TrtLlmBf16ExpertsMonolithic(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsMonol
             )
         except (AttributeError, TypeError) as exc:
             raise NotImplementedError(
-                "Installed FlashInfer does not support unpacked FP32 routing "
-                "weights for BF16 TRTLLM MoE."
+                "Installed FlashInfer does not support packed pre-routing for "
+                "BF16 TRTLLM MoE."
             ) from exc
         return result[0] if isinstance(result, list) else result
 
