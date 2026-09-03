@@ -556,6 +556,31 @@ def _int4_from_compressed_tensors(quant: dict[str, Any]) -> dict[str, Any] | Non
     return None
 
 
+def _sidecar_quant_config(model: str) -> dict[str, Any]:
+    """A quantization config kept beside config.json rather than inside it.
+
+    NVIDIA's modelopt exports declare the format in `hf_quant_config.json` and
+    leave `config.json` silent about it. Read only as a fallback, so a config
+    that declares its own format is never second-guessed by a stale sidecar.
+    """
+    path = os.path.join(model, "hf_quant_config.json")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    inner = payload.get("quantization")
+    quant = inner if isinstance(inner, dict) else payload
+    if not quant.get("quant_method"):
+        quant = dict(quant)
+        quant["quant_method"] = "modelopt"
+    return quant
+
+
 def _nvfp4_declared_scheme(quant: dict[str, Any]) -> dict[str, Any] | None:
     """NVFP4 declared by a config, or None.
 
@@ -1005,7 +1030,7 @@ def inspect(model: str) -> dict[str, Any]:
         raise SystemExit(f"no config.json at {model}")
     with open(config_path, encoding="utf-8") as handle:
         config = json.load(handle)
-    quant = config.get("quantization_config") or {}
+    quant = config.get("quantization_config") or _sidecar_quant_config(model)
     reason = unloadable_reason_from_config(config)
     quark_scheme = _quark_declared_scheme(quant)
     _refuse_mixed_bit_widths(quant)
@@ -1497,7 +1522,28 @@ def selftest() -> int:
     ) is None
     assert _nvfp4_declared_scheme({"quant_method": "fp8"}) is None
     assert scheme_block_size("nvfp4", 16) == 16
+    # NVIDIA declares the format beside config.json, not inside it. Undetected,
+    # the packed weight's half-width last dim makes its 16-wide scale look like
+    # an 8-wide FP8 block.
+    with tempfile.TemporaryDirectory() as sidecar:
+        with open(
+            os.path.join(sidecar, "hf_quant_config.json"),
+            "w", encoding="utf-8", newline="\n",
+        ) as handle:
+            json.dump(
+                {
+                    "producer": {"name": "modelopt"},
+                    "quantization": {"quant_algo": "NVFP4", "group_size": 16},
+                },
+                handle,
+            )
+        found = _nvfp4_declared_scheme(_sidecar_quant_config(sidecar))
+        assert found is not None and found["scheme"] == "nvfp4", found
+        assert found["group_size"] == 16, found
+    with tempfile.TemporaryDirectory() as bare:
+        assert _sidecar_quant_config(bare) == {}
     print("  NVFP4 is detected from compressed-tensors and modelopt configs")
+    print("  NVFP4 is detected from a hf_quant_config.json sidecar")
 
     # A 16-bit override names a module left alone, which is how AutoRound
     # spells "int4-mixed"; every such module carries no scale and drops out of
