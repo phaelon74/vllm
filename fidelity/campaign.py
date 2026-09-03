@@ -1995,9 +1995,10 @@ def cmd_assemble(config: Config, python: str, force: bool = False) -> int:
                 shutil.copy2(inspect_src, os.path.join(cand_dir, "inspect.json"))
             # Whether or not a fresh inspection landed: an older one carries no
             # size, and the Hub can still answer for the revision it names.
-            published_inspect = os.path.join(cand_dir, "inspect.json")
-            if os.path.isfile(published_inspect):
-                _ensure_weights_size(cand, published_inspect)
+            # Called whether or not a record landed: the size is answerable from
+            # the pinned revision alone, so a family with no inspection at all
+            # still charts.
+            _ensure_weights_size(cand, os.path.join(cand_dir, "inspect.json"))
             prov_src = os.path.join(
                 config.work, "provenance", f"{cand.name}.json"
             )
@@ -2576,7 +2577,12 @@ def _ensure_weights_size(cand: Candidate, inspection: str) -> None:
         with open(inspection, encoding="utf-8") as handle:
             record = json.load(handle)
     except (OSError, json.JSONDecodeError):
-        return
+        # A family assembled before inspections were published has no record to
+        # amend, but the size is answerable from the pinned revision alone. The
+        # record is started here carrying only what is known. It deliberately
+        # omits `inspect_version`, so nothing downstream mistakes a size for an
+        # inspection of the weights.
+        record = {}
     if record.get("weights_bytes"):
         return
     try:
@@ -2591,7 +2597,9 @@ def _ensure_weights_size(cand: Candidate, inspection: str) -> None:
             record["weights_bytes_source"] = "hub"
         else:
             return
-    except (OSError, SystemExit) as exc:
+    except Exception as exc:
+        # Any Hub or filesystem trouble costs one point on a chart, so it is
+        # reported and stepped over rather than ending the assembly.
         print(f"WARNING  no size for {cand.name}: {exc}", file=sys.stderr)
         return
     with open(inspection, "w", encoding="utf-8", newline="\n") as handle:
@@ -2636,6 +2644,18 @@ def _plot_family(
         })
     if not quants:
         return
+    sized = [q for q in quants if q["disk_size_gib"] is not None]
+    scored = [q for q in quants if q["mean_kld"] is not None]
+    if not (sized and scored):
+        # Name what is missing, so an empty chart points at the cause instead of
+        # sending someone back through the pipeline to find it.
+        print(
+            f"WARNING  {model.name}: {len(sized)} of {len(quants)} candidates "
+            f"have a size and {len(scored)} have a mean KLD, so no chart can be "
+            f"drawn. A size comes from the local shards or from the pinned "
+            f"revision on the Hub; check inspect.json beside each report.",
+            file=sys.stderr,
+        )
     payload = {
         "title": f"{model.name} quantization analysis",
         "subtitle": "Mean KL divergence against on-disk size",
