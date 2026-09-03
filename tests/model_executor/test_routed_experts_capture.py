@@ -18,6 +18,9 @@ from vllm.model_executor.layers.fused_moe.experts.trtllm_fp8_moe import (
     TrtLlmFp8ExpertsMonolithic,
 )
 from vllm.model_executor.layers.fused_moe.forced_routing import (
+    prepare_flashinfer_forced_topk_weights,
+)
+from vllm.model_executor.layers.fused_moe.forced_routing import (
     FORCED_ROUTING_KEY,
     ForcedRouting,
 )
@@ -44,9 +47,6 @@ from vllm.model_executor.layers.fused_moe.router.router_factory import (
     create_fused_moe_router,
 )
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
-from vllm.model_executor.layers.fused_moe.utils import (
-    trtllm_moe_pack_topk_ids_weights,
-)
 from vllm.transformers_utils.model_arch_config_convertor import (
     ModelArchConfigConvertorBase,
 )
@@ -582,6 +582,7 @@ def test_trtllm_fp8_forced_route_uses_public_packed_api():
 
     topk_ids = torch.tensor([[2, 0]], dtype=torch.int32)
     topk_weights = torch.tensor([[0.75, 0.25]], dtype=torch.float32)
+    packed_routes = torch.tensor([[1, 2]], dtype=torch.int32)
     expected = torch.empty(1, 4)
     target = "trtllm_fp8_block_scale_routed_moe"
 
@@ -597,6 +598,11 @@ def test_trtllm_fp8_forced_route_uses_public_packed_api():
             "trtllm_fp8_moe.fi_moe_largest_bucket",
             return_value=1,
         ),
+        patch(
+            "vllm.model_executor.layers.fused_moe.experts."
+            "trtllm_fp8_moe.trtllm_moe_pack_topk_ids_weights",
+            return_value=packed_routes,
+        ) as pack_routes,
     ):
         output = experts._apply_block_scale_routed(
             hidden_states=torch.empty(1, 4),
@@ -611,13 +617,27 @@ def test_trtllm_fp8_forced_route_uses_public_packed_api():
         )
 
     routed = routed_moe.call_args.kwargs
-    expected_routes = trtllm_moe_pack_topk_ids_weights(
-        topk_ids, topk_weights
-    )
-    torch.testing.assert_close(routed["topk_ids"], expected_routes)
+    pack_routes.assert_called_once_with(topk_ids, topk_weights)
+    torch.testing.assert_close(routed["topk_ids"], packed_routes)
     assert "routing_logits" not in routed
     assert routed["routing_method_type"] == RoutingMethodType.RenormalizeNaive
     assert output is expected
+
+
+def test_flashinfer_forced_weights_use_selected_logits_softmax():
+    router_logits = torch.tensor([[8.0, -3.0, 5.0, 1.0]], dtype=torch.bfloat16)
+    topk_ids = torch.tensor([[2, 0]], dtype=torch.int32)
+    fallback = torch.zeros(1, 2)
+
+    actual = prepare_flashinfer_forced_topk_weights(
+        router_logits=router_logits,
+        topk_ids=topk_ids,
+        topk_weights=fallback,
+        routing_method=RoutingMethodType.RenormalizeNaive,
+    )
+
+    expected = torch.softmax(torch.tensor([[5.0, 8.0]]), dim=-1)
+    torch.testing.assert_close(actual, expected)
 
 
 @pytest.mark.parametrize(

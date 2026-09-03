@@ -11,6 +11,9 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     RoutingMethodType,
 )
+from vllm.model_executor.layers.fused_moe.forced_routing import (
+    prepare_flashinfer_forced_topk_weights,
+)
 from vllm.model_executor.layers.fused_moe.utils import (
     trtllm_moe_pack_topk_ids_weights,
 )
@@ -44,6 +47,20 @@ class TrtLlmMxint4ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
         self.local_num_experts = moe_config.num_local_experts
         self.ep_rank = moe_config.ep_rank
         self.routing_method = moe_config.routing_method
+
+    def prepare_forced_topk_weights(
+        self,
+        *,
+        router_logits: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        return prepare_flashinfer_forced_topk_weights(
+            router_logits=router_logits,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            routing_method=self.routing_method,
+        )
 
     @staticmethod
     def _supports_current_device() -> bool:

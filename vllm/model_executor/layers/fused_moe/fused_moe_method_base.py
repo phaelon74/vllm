@@ -190,6 +190,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         self,
         layer: "RoutedExperts",
         x: torch.Tensor,
+        router_logits: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
@@ -197,6 +198,14 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         if not self.is_monolithic or self.moe_kernel is None:
             raise NotImplementedError(
                 f"{type(self).__name__} has no active monolithic MoE kernel."
+            )
+        experts = self.moe_kernel.impl.fused_experts
+        prepare_weights = getattr(experts, "prepare_forced_topk_weights", None)
+        if prepare_weights is not None:
+            topk_weights = prepare_weights(
+                router_logits=router_logits,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
             )
         output = self.moe_kernel.apply_routed(
             hidden_states=x,
@@ -209,7 +218,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             expert_map=layer.expert_map,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
         )
-        experts = self.moe_kernel.impl.fused_experts
         capture_fn = getattr(experts, "routing_replay_capture_fn", None)
         if capture_fn is not None:
             capture_fn(topk_ids)

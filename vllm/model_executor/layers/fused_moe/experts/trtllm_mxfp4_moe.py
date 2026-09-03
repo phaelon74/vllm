@@ -11,6 +11,9 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     RoutingMethodType,
 )
+from vllm.model_executor.layers.fused_moe.forced_routing import (
+    prepare_flashinfer_forced_topk_weights,
+)
 from vllm.model_executor.layers.fused_moe.moe_output import (
     UnfinalizedMoEOutput,
     convert_flashinfer_moe_output,
@@ -119,6 +122,20 @@ class TrtLlmMxfp4ExpertsBase:
                 device=device,
             )
             self.gemm1_clamp_limit = None
+
+    def prepare_forced_topk_weights(
+        self,
+        *,
+        router_logits: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        return prepare_flashinfer_forced_topk_weights(
+            router_logits=router_logits,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            routing_method=self.routing_method_type,
+        )
 
     @staticmethod
     def _supports_current_device() -> bool:

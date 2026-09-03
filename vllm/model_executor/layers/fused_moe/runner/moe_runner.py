@@ -622,6 +622,7 @@ class MoERunner(MoERunnerInterface):
                 fused_out = self._quant_method.apply_monolithic_routed(
                     layer=self.routed_experts,
                     x=hidden_states,
+                    router_logits=router_logits,
                     topk_weights=topk_weights.contiguous(),
                     topk_ids=topk_ids.contiguous(),
                 )

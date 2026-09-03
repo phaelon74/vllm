@@ -9,6 +9,7 @@ from vllm.forward_context import (
     get_forward_context,
     is_forward_context_available,
 )
+from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 
 FORCED_ROUTING_KEY = "forced_moe_routing"
 
@@ -19,6 +20,23 @@ _INTEGER_DTYPES = {
     torch.int64,
     torch.uint8,
 }
+
+
+def prepare_flashinfer_forced_topk_weights(
+    *,
+    router_logits: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    routing_method: RoutingMethodType,
+) -> torch.Tensor:
+    """Match FlashInfer's native numerical policy for forced routes."""
+    if routing_method not in {
+        RoutingMethodType.Renormalize,
+        RoutingMethodType.RenormalizeNaive,
+    }:
+        return topk_weights
+    selected_logits = router_logits.gather(1, topk_ids.to(torch.int64))
+    return torch.softmax(selected_logits, dim=-1, dtype=torch.float32)
 
 
 @dataclass(frozen=True)
