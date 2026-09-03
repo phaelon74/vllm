@@ -62,6 +62,19 @@ identical mean. A version-7 report whose weights were released cannot be bound
 after the fact; it publishes under a recorded Law 13 deviation saying so, or it
 is rescored.
 
+Version 9 states what agreement between tensor-parallel workers means, under
+Law 8. Versions 1 through 8 required the workers to return identical floats for
+the trunk KLD, which no correct multi-worker run can do: each rank multiplies its
+own slice of the vocabulary on its own device, and a sum over the vocabulary
+amplifies the last-bit difference in the gathered logits. Every tensor-parallel
+candidate was therefore refused for a fault it did not have, and the refusal
+reported no numbers, so the cause stayed hidden. Version 9 requires agreement to
+a stated bound, publishes the observed divergence beside the figure so no reader
+takes more precision from the digits than was measured, and refuses a real
+disagreement with the field, the position, and both values named. A version-8
+receipt from a single-worker run becomes a version-9 receipt by reassembling it;
+a multi-worker candidate that version 8 refused must be scored.
+
 These laws govern every distribution-fidelity measurement this program
 publishes. They are not guidance. The pipeline refuses to produce or upload an
 artifact that violates one, and the only way past a refusal is a recorded,
@@ -256,6 +269,25 @@ and the detected head state for reference and candidate.
 **Override.** Permitted under Law 13 when the candidate's head is proven
 bit-identical to the reference's, in which case the delta is necessarily zero and
 the second scoring pass buys no information.
+
+### Agreement, not identity, across tensor-parallel workers
+
+The trunk figure is computed on every tensor-parallel worker from the same three
+files, so the workers cross-check each other: if a rank installed the reference
+head wrongly or holds the wrong shard, its answer diverges. But the workers are
+not required to produce identical floats, and demanding that they do is wrong.
+Each rank multiplies its own slice of the vocabulary on its own device, and the
+gathered logits differ in their last bits; a sum over a quarter-million-token
+vocabulary amplifies that difference into the KLD.
+
+So the contract is agreement to a stated bound — currently `1e-5` absolute per
+position and `1e-7` relative on the mean. Within it, the run proceeds, the trunk
+figure is rank 0's, and the one-pager states how far the ranks actually diverged,
+so nobody reads more precision into the digits than was measured. Beyond it, the
+ranks disagree about the model rather than about rounding, and scoring refuses
+naming the field, the position, and both values. A top-1 flip between ranks is
+disclosed and counted rather than refused: an argmax over two near-tied logits
+can flip on last-bit noise without either rank being wrong.
 
 ## Law 9 — Tail and depth disclosure
 

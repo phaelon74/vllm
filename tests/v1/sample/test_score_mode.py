@@ -595,3 +595,75 @@ def test_shared_helper_is_deterministic():
     b = compute_kld_chunk(model.clone(), ref.clone(), kld_vocab_size=40)
     assert a.kld_ref_to_model == b.kld_ref_to_model
     assert a.ref_top1 == b.ref_top1
+
+
+class TestWorkerAgreement:
+    """Tensor-parallel workers scoring the same files must agree, not match bits.
+
+    Each rank multiplies its own vocab shard on its own device, so demanding
+    bit-identical floats fails a correct run; accepting any gap hides a sharding
+    fault. These pin the boundary and the disclosure.
+    """
+
+    @staticmethod
+    def _result(klds: list[float], top1: list[int] | None = None):
+        from vllm.v1.sample.kld import KLDResult
+
+        n = len(klds)
+        return KLDResult(
+            list(klds),
+            list(klds),
+            [0.5] * n,
+            list(top1) if top1 is not None else [1] * n,
+            [1] * n,
+            [[1] * 5 for _ in range(n)],
+        )
+
+    def test_last_bit_noise_is_accepted_and_reported(self):
+        from vllm.v1.sample.kld import worker_agreement
+
+        base = [1.25, 0.5, 2.0]
+        noisy = [1.25 + 1e-8, 0.5, 2.0 - 1e-8]
+        found = worker_agreement([self._result(base), self._result(noisy)])
+        assert found["agrees"], found["detail"]
+        assert 0.0 < found["max_abs_delta"] < 1e-5
+        assert "agree to" in found["detail"]
+
+    def test_a_real_disagreement_is_refused_with_the_field_and_values(self):
+        from vllm.v1.sample.kld import worker_agreement
+
+        found = worker_agreement(
+            [self._result([1.0, 1.0]), self._result([1.0, 2.0])]
+        )
+        assert not found["agrees"]
+        # The message must name where and by how much, or the failure is
+        # undiagnosable from a log.
+        assert "position 1" in found["detail"]
+        assert "kld_ref_to_model" in found["detail"]
+        assert "sharding" in found["detail"]
+
+    def test_workers_scoring_different_position_counts_never_pass(self):
+        from vllm.v1.sample.kld import worker_agreement
+
+        found = worker_agreement([self._result([1.0, 1.0]), self._result([1.0])])
+        assert not found["agrees"]
+        assert "did not score the same work" in found["detail"]
+
+    def test_a_top1_flip_is_disclosed_not_refused(self):
+        from vllm.v1.sample.kld import worker_agreement
+
+        found = worker_agreement(
+            [
+                self._result([1.0, 1.0], top1=[7, 7]),
+                self._result([1.0, 1.0], top1=[7, 8]),
+            ]
+        )
+        assert found["agrees"], found["detail"]
+        assert found["top1_flips"] == 1
+
+    def test_a_single_worker_agrees_exactly(self):
+        from vllm.v1.sample.kld import worker_agreement
+
+        found = worker_agreement([self._result([1.0, 2.0])])
+        assert found["agrees"]
+        assert found["max_abs_delta"] == 0.0

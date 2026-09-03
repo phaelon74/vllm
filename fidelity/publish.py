@@ -187,7 +187,114 @@ def gate(
     return plans, hard_stop
 
 
-def build_index(library: str, plans: list[dict[str, Any]], namespace: str) -> str:
+LEDGER = "published.json"
+
+
+def read_ledger(library: str) -> dict[str, str]:
+    """Model to artifact repo for everything this library has published.
+
+    The index names every artifact ever published, not the ones a single run
+    happened to touch, so publishing one family must never unlist another.
+    """
+    payload = _load(os.path.join(library, LEDGER)) or {}
+    published = payload.get("published")
+    return dict(published) if isinstance(published, dict) else {}
+
+
+def write_ledger(library: str, entries: dict[str, str]) -> None:
+    with open(
+        os.path.join(library, LEDGER), "w", encoding="utf-8", newline="\n"
+    ) as handle:
+        json.dump({"published": dict(sorted(entries.items()))}, handle, indent=2)
+        handle.write("\n")
+
+
+def index_entries(
+    library: str, plans: list[dict[str, Any]], ledger: dict[str, str]
+) -> list[dict[str, Any]]:
+    """This run's plans plus every previously published model, deduplicated.
+
+    A previously published model is re-read from the library so its listing is
+    rebuilt rather than remembered. If its directory is gone, the entry survives
+    with its artifact link alone: a stale listing is recoverable, an erased one
+    is not.
+    """
+    entries = {plan["model"]: plan for plan in plans}
+    for model, repo in sorted(ledger.items()):
+        if model in entries:
+            continue
+        root = os.path.join(library, model)
+        candidates = (
+            [pair for pair in candidates_of(root) if pair[1].get("compliant")]
+            if os.path.isdir(root)
+            else []
+        )
+        entries[model] = {
+            "model": model,
+            "root": root,
+            "candidates": candidates,
+            "excluded": [],
+            "repo": repo,
+        }
+    return [entries[model] for model in sorted(entries)]
+
+
+def index_models_in(text: str) -> set[str]:
+    """Model names an index README lists, one per `## ` heading."""
+    return {
+        line[3:].strip()
+        for line in text.splitlines()
+        if line.startswith("## ") and line[3:].strip()
+    }
+
+
+def ledger_from_index_text(text: str) -> dict[str, str]:
+    """Model to repo pairs recovered from an index README.
+
+    Lets a lost or pre-ledger publication record be rebuilt from the index that
+    documented it, including an earlier revision fetched from the Hub.
+    """
+    found: dict[str, str] = {}
+    model: str | None = None
+    for line in text.splitlines():
+        if line.startswith("## "):
+            model = line[3:].strip() or None
+        elif model and line.startswith("Artifact: [`"):
+            repo = line.split("`")[1].strip()
+            if "/" in repo:
+                found[model] = repo.split("/", 1)[1]
+            model = None
+    return found
+
+
+def staged_index_models(staging: str) -> set[str]:
+    with open(os.path.join(staging, "README.md"), encoding="utf-8") as handle:
+        return index_models_in(handle.read())
+
+
+def remote_index_models(repo_id: str) -> set[str] | None:
+    """Models listed by the index already on the Hub, or None if unreadable.
+
+    Read so that an index which would drop a published entry can be refused
+    before it is uploaded. None means the question could not be asked, which is
+    not the same as an empty index and must never be read as permission to shrink.
+    """
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        return None
+    try:
+        path = hf_hub_download(repo_id, "README.md", repo_type="dataset")
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+    except Exception:
+        return None
+    return index_models_in(text)
+
+
+def build_index(
+    library: str, plans: list[dict[str, Any]], namespace: str
+) -> str:
     """Stage the small, findable index: one-pagers, leaderboard, laws."""
     staging = tempfile.mkdtemp(prefix="lil-index-")
     shutil.copy2(os.path.join(HERE, "LAWS.md"), os.path.join(staging, "LAWS.md"))
@@ -209,7 +316,7 @@ def build_index(library: str, plans: list[dict[str, Any]], namespace: str) -> st
         "identity.",
         "",
     ]
-    for plan in plans:
+    for plan in index_entries(library, plans, read_ledger(library)):
         dataset = f"{namespace}/{plan['repo']}"
         lines += [
             f"## {plan['model']}",
@@ -241,6 +348,11 @@ def build_index(library: str, plans: list[dict[str, Any]], namespace: str) -> st
             who = f"{author} " if author else ""
             lines.append(
                 f"- {who}[{quant}]({rel}) — mean KLD {mean_text}"
+            )
+        if not ranked:
+            lines.append(
+                "Published previously; the library no longer holds a copy, so "
+                "only the artifact link is listed here."
             )
         if plan["excluded"]:
             lines += [
@@ -281,8 +393,54 @@ def upload(local: str, repo_id: str, private: bool, message: str) -> None:
     print(f"published https://huggingface.co/datasets/{repo_id}")
 
 
+def selftest() -> None:
+    """Pin the index's cumulative contract and the ledger's recovery path."""
+    old_index = (
+        "# index\n\n"
+        "## Qwen3.8-27B\n\n"
+        "Artifact: [`phaedawg/qwen3.8-27b-distribution-fidelity-768x2048-v1`]"
+        "(https://huggingface.co/x)\n\n"
+        "- RedHatAI [FP8](models/Qwen3.8-27B/a.md) - mean KLD 0.1\n\n"
+    )
+    recovered = ledger_from_index_text(old_index)
+    assert recovered == {
+        "Qwen3.8-27B": "qwen3.8-27b-distribution-fidelity-768x2048-v1"
+    }, recovered
+
+    with tempfile.TemporaryDirectory() as library:
+        write_ledger(library, recovered)
+        assert read_ledger(library) == recovered
+        plans = [
+            {
+                "model": "Qwen3.6-27B",
+                "root": os.path.join(library, "Qwen3.6-27B"),
+                "candidates": [("FP8", {"compliant": True, "mean_kld": 0.25})],
+                "excluded": [],
+                "repo": "qwen3.6-27b-distribution-fidelity-768x2048-v1",
+            }
+        ]
+        # Publishing one family must relist every family published before it.
+        entries = index_entries(library, plans, read_ledger(library))
+        assert [e["model"] for e in entries] == ["Qwen3.6-27B", "Qwen3.8-27B"]
+        staging = build_index(library, plans, "phaedawg")
+        try:
+            listed = staged_index_models(staging)
+            assert listed == {"Qwen3.6-27B", "Qwen3.8-27B"}, listed
+            # An index that would unlist a published model is refusable.
+            assert not (listed - {"Qwen3.6-27B", "Qwen3.8-27B"})
+            assert sorted({"Qwen3.8-27B"} - {"Qwen3.6-27B"}) == ["Qwen3.8-27B"]
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+    print("  the index relists every previously published model")
+    print("  a publication record is recoverable from an index README")
+    print("selftest passed")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    if "--selftest" in sys.argv:
+        selftest()
+        return 0
     parser.add_argument("--library", required=True, help="assembled library root")
     parser.add_argument(
         "--namespace",
@@ -311,6 +469,16 @@ def main() -> int:
         action="store_true",
         help="publish only the small index, not the multi-gigabyte artifacts",
     )
+    parser.add_argument(
+        "--seed-ledger",
+        metavar="README",
+        help="recover the publication record from an index README, then exit",
+    )
+    parser.add_argument(
+        "--allow-index-removals",
+        action="store_true",
+        help="permit an index that unlists a previously published model",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -319,6 +487,20 @@ def main() -> int:
             "no --namespace given and $LIL_HF_NAMESPACE is unset. This is "
             "deliberate: the publication namespace is never guessed."
         )
+
+    if args.seed_ledger:
+        with open(args.seed_ledger, encoding="utf-8") as handle:
+            recovered = ledger_from_index_text(handle.read())
+        if not recovered:
+            raise SystemExit(f"no artifact links found in {args.seed_ledger}")
+        ledger = read_ledger(args.library)
+        added = {k: v for k, v in recovered.items() if k not in ledger}
+        ledger.update(recovered)
+        write_ledger(args.library, ledger)
+        for model, repo in sorted(recovered.items()):
+            mark = "+" if model in added else " "
+            print(f"LEDGER  {mark} {model} -> {repo}")
+        return 0
 
     plans, refused = gate(args.library, args.skip_noncompliant, args.only)
     for plan in plans:
@@ -331,7 +513,27 @@ def main() -> int:
 
     index = build_index(args.library, plans, args.namespace)
     index_repo = f"{args.namespace}/{args.index_name}"
-    print(f"INDEX    {index_repo} staged at {index}")
+    staged = staged_index_models(index)
+    print(f"INDEX    {index_repo} lists {len(staged)} model(s), "
+          f"staged at {index}")
+
+    # The index is cumulative. A ledger can be lost with a re-cloned library, so
+    # the published index itself is asked what it lists, and an upload that would
+    # unlist anything is refused rather than quietly narrowing the record.
+    remote = remote_index_models(index_repo)
+    if remote is None:
+        print("INDEX    could not read the published index to compare against")
+    else:
+        dropped = sorted(remote - staged)
+        if dropped and not args.allow_index_removals:
+            raise SystemExit(
+                f"refusing to publish an index that unlists "
+                f"{', '.join(dropped)}. The published index is cumulative. "
+                f"Either publish from a library that still holds those models, "
+                f"or pass --allow-index-removals to withdraw them deliberately."
+            )
+        if dropped:
+            print(f"INDEX    withdrawing {', '.join(dropped)} on request")
 
     if args.dry_run:
         print("\ndry run: nothing uploaded")
@@ -345,6 +547,11 @@ def main() -> int:
                 args.private,
                 f"Publish {plan['model']} distribution-fidelity artifact",
             )
+        # Recorded before the index goes up, so a failed index upload still
+        # leaves the artifact accounted for and the next run relists it.
+        ledger = read_ledger(args.library)
+        ledger.update({plan["model"]: plan["repo"] for plan in plans})
+        write_ledger(args.library, ledger)
     upload(index, index_repo, args.private, "Update distribution-fidelity index")
     shutil.rmtree(index, ignore_errors=True)
     if refused:

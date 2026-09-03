@@ -120,7 +120,7 @@ COMPONENTS = tuple(COMPONENT_PATTERNS)
 # reading taken by an older inspector outlives the code that produced it. Bump
 # this whenever detection or classification changes and every cache that
 # predates the change is re-read instead of trusted.
-INSPECT_VERSION = 2
+INSPECT_VERSION = 3
 # Variant-path suffix; full hex lives on inspect.json and the QDQ manifest.
 MATCH_DIGEST_LEN = 12
 

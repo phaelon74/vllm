@@ -1388,6 +1388,7 @@ def _decompose_head_kld(
     from vllm.v1.sample.kld import (
         compute_trunk_kld_in_model,
         summarize_kld_rows,
+        worker_agreement,
     )
 
     if capture_kind != "hidden":
@@ -1399,6 +1400,7 @@ def _decompose_head_kld(
         raise FileNotFoundError(f"Missing teacher head at {head_path}")
     print("Phase 2b: trunk KLD (shared teacher head)...")
     trunk_chunks = []
+    worst_agreement: dict[str, Any] = {}
     hidden_params = SamplingParams(
         prompt_logprobs=1,
         max_tokens=1,
@@ -1429,8 +1431,16 @@ def _decompose_head_kld(
             )
             if not per_worker:
                 raise RuntimeError("Trunk KLD returned no worker results")
-            if any(result != per_worker[0] for result in per_worker[1:]):
-                raise RuntimeError("Trunk KLD differs across workers")
+            agreement = worker_agreement(per_worker)
+            if not agreement["agrees"]:
+                raise RuntimeError(
+                    f"Trunk KLD differs across workers on window {idx}: "
+                    f"{agreement['detail']}"
+                )
+            if agreement["max_abs_delta"] > worst_agreement.get(
+                "max_abs_delta", 0.0
+            ):
+                worst_agreement = agreement
             trunk_chunks.append(per_worker[0])
             # A window's hidden states and the logits derived from them are
             # gigabytes. Held across a thousand windows, the freed-but-reserved
@@ -1443,10 +1453,24 @@ def _decompose_head_kld(
         score_from=score_from,
         context_length=context_length,
     )
-    return {
+    out: dict[str, Any] = {
         "trunk_mean_kld": trunk_report["mean_kld"],
         "trunk_report": trunk_report,
     }
+    if worst_agreement:
+        # Carried into the report so the artifact can say how far the ranks
+        # diverged rather than implying they were bit-identical.
+        out["trunk_worker_agreement"] = {
+            key: worst_agreement[key]
+            for key in (
+                "workers",
+                "max_abs_delta",
+                "mean_abs_delta",
+                "mean_rel_delta",
+                "top1_flips",
+            )
+        }
+    return out
 
 
 def _probe_first_window(
@@ -1654,6 +1678,13 @@ def _print_kld_report(report: dict[str, Any]) -> None:
             "  Trunk mean KLD (shared teacher head): "
             f"{report['trunk_mean_kld']:.8f}"
         )
+        pact = report.get("trunk_worker_agreement")
+        if pact and pact.get("workers", 1) > 1:
+            print(
+                f"  Trunk cross-worker agreement: {pact['workers']} workers "
+                f"within {pact['max_abs_delta']:.3e} per position, "
+                f"{pact['mean_rel_delta']:.3e} relative on the mean"
+            )
         print(
             "  Deployed mean KLD (student logits): "
             f"{report['deployed_mean_kld']:.8f}"

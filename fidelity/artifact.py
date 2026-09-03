@@ -23,7 +23,7 @@ from typing import Any
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from redaction import redact_env  # noqa: E402 - sibling module
 
-LAWS_VERSION = 8
+LAWS_VERSION = 9
 PROGRAM = "Local Inference Lab"
 # Vendor calibration on packed int4. QDQ still matches format only.
 _CALIBRATED_ALGORITHMS = frozenset({"awq", "gptq", "autoround"})
@@ -420,7 +420,20 @@ def _head_split(report: dict[str, Any], manifest: dict[str, Any]) -> list[str]:
         ("Reference head", str((manifest.get("lm_head") or {}).get("runtime"))),
         ("Candidate head", str(report.get("student_lm_head"))),
     ]
-    return ["## Trunk versus head", "", *_table(rows, ("Component", "Value")), ""]
+    out = ["## Trunk versus head", "", *_table(rows, ("Component", "Value")), ""]
+    pact = report.get("trunk_worker_agreement") or {}
+    if pact.get("workers", 1) > 1:
+        # Each rank multiplies its own vocab shard, so the trunk number is one
+        # rank's. Saying so keeps the digits from implying more than was measured.
+        out += [
+            f"Scored across {pact['workers']} tensor-parallel workers, which "
+            f"agreed to {pact['max_abs_delta']:.2e} per position and "
+            f"{pact['mean_rel_delta']:.2e} relative on the mean. The trunk "
+            f"figure is rank 0's; the digits beyond that agreement are not "
+            f"meaningful.",
+            "",
+        ]
+    return out
 
 
 def _compliance(receipt: dict[str, Any], baseline: dict[str, Any] | None) -> list[str]:

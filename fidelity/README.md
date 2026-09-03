@@ -346,6 +346,15 @@ no candidate carries a receipt, or if any candidate is not law-compliant.
 ones in the index. A refusal is reflected in the exit status even when other
 models publish, so automation cannot mistake a partial publish for a clean one.
 
+`--only MODEL` publishes one model and holds the rest, for a family that became
+ready after the others. The index stays cumulative regardless: it lists every
+model the library has ever published, recorded in `published.json` and rebuilt
+from the library each time, so publishing one family never unlists another.
+Before the index goes up, the published index is read back and an upload that
+would unlist anything is refused — `--allow-index-removals` withdraws an entry
+deliberately. If the record is lost, `--seed-ledger README.md` rebuilds it from
+any revision of the published index.
+
 Every text file in the artifact is also scanned two ways: for recognizable
 credential shapes — Hugging Face, GitHub, and OpenAI-style tokens, AWS keys,
 private key blocks — and, in JSON, for any field whose name *is* a credential's

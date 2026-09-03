@@ -88,6 +88,104 @@ def iter_eval_rows(
     return windows
 
 
+# Every tensor-parallel worker computes the trunk KLD from the same three files,
+# so their answers cross-check that the replay head was installed identically on
+# each rank. They are not required to be bit-identical: each rank multiplies its
+# own vocab shard on its own device, and the gathered logits carry float32 noise
+# in the last bits, which a sum over the vocabulary can amplify. These bound the
+# noise that a correct run can produce; a disagreement above them means the ranks
+# disagree about the model, not about rounding.
+WORKER_KLD_ABS_TOLERANCE = 1e-5
+WORKER_KLD_MEAN_REL_TOLERANCE = 1e-7
+
+
+def worker_agreement(per_worker: Sequence[KLDResult]) -> dict[str, Any]:
+    """How far tensor-parallel workers disagree about the same trunk KLD.
+
+    Returns the largest divergence observed, whether it is within tolerance, and
+    a description naming the field and position that diverged most. The
+    description is the point: a bare inequality tells nobody whether two ranks
+    differ in the last bit of a float or by a factor of two.
+    """
+    if not per_worker:
+        raise ValueError("worker agreement needs at least one worker result")
+    first = per_worker[0]
+    detail = ""
+    worst_abs = 0.0
+    worst_field = ""
+    worst_pos = -1
+    worst_pair: tuple[float, float] = (0.0, 0.0)
+    top1_flips = 0
+
+    for rank, other in enumerate(per_worker[1:], start=1):
+        for field in ("kld_ref_to_model", "kld_model_to_ref", "ref_top1_prob"):
+            mine = getattr(first, field)
+            theirs = getattr(other, field)
+            if len(mine) != len(theirs):
+                return {
+                    "agrees": False,
+                    "workers": len(per_worker),
+                    "detail": (
+                        f"rank 0 scored {len(mine)} positions but rank {rank} "
+                        f"scored {len(theirs)} for {field}. The ranks did not "
+                        f"score the same work, so no tolerance applies."
+                    ),
+                }
+            for pos, (a, b) in enumerate(zip(mine, theirs)):
+                delta = abs(float(a) - float(b))
+                if delta > worst_abs:
+                    worst_abs = delta
+                    worst_field = f"{field} (rank {rank})"
+                    worst_pos = pos
+                    worst_pair = (float(a), float(b))
+        # An argmax over near-tied logits can flip on last-bit noise, so a flip
+        # is counted and disclosed rather than treated as a disagreement.
+        top1_flips += sum(
+            1 for a, b in zip(first.model_top1, other.model_top1) if a != b
+        )
+
+    means = [
+        (sum(w.kld_ref_to_model) / len(w.kld_ref_to_model))
+        if w.kld_ref_to_model
+        else 0.0
+        for w in per_worker
+    ]
+    base = means[0]
+    mean_abs = max(abs(m - base) for m in means)
+    mean_rel = mean_abs / abs(base) if base else mean_abs
+
+    agrees = (
+        worst_abs <= WORKER_KLD_ABS_TOLERANCE
+        and mean_rel <= WORKER_KLD_MEAN_REL_TOLERANCE
+    )
+    if worst_abs:
+        detail = (
+            f"{len(per_worker)} workers agree to {worst_abs:.3e} absolute "
+            f"(worst at {worst_field} position {worst_pos}: "
+            f"{worst_pair[0]!r} vs {worst_pair[1]!r}); mean trunk KLD differs "
+            f"by {mean_abs:.3e} ({mean_rel:.3e} relative); "
+            f"{top1_flips} top-1 flip(s)"
+        )
+    else:
+        detail = f"{len(per_worker)} workers agree exactly"
+    if not agrees:
+        detail += (
+            f". Tolerance is {WORKER_KLD_ABS_TOLERANCE:.0e} absolute per "
+            f"position and {WORKER_KLD_MEAN_REL_TOLERANCE:.0e} relative on the "
+            f"mean. A gap this wide is a sharding or head-replay fault, not "
+            f"float noise."
+        )
+    return {
+        "agrees": agrees,
+        "workers": len(per_worker),
+        "max_abs_delta": worst_abs,
+        "mean_abs_delta": mean_abs,
+        "mean_rel_delta": mean_rel,
+        "top1_flips": top1_flips,
+        "detail": detail,
+    }
+
+
 def concat_kld_results(chunks: Sequence[KLDResult]) -> KLDResult:
     out = empty_kld_result()
     for chunk in chunks:
