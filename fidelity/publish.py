@@ -110,7 +110,9 @@ def repo_name(model: str, receipt: dict[str, Any], version: int) -> str:
 
 
 def gate(
-    library: str, skip_noncompliant: bool
+    library: str,
+    skip_noncompliant: bool,
+    only: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Decide what may publish. Refuses rather than publishing a bad number.
 
@@ -120,8 +122,16 @@ def gate(
     """
     plans: list[dict[str, Any]] = []
     hard_stop: list[str] = []
+    wanted = set(only or ())
+    seen: set[str] = set()
     for root in model_roots(library):
         model = os.path.basename(root)
+        seen.add(model)
+        # An explicit selection is a decision about what is ready, so a name that
+        # matches nothing is an error rather than a quiet publish of the rest.
+        if wanted and model not in wanted:
+            print(f"HELD     {model}: not named by --only")
+            continue
         leaked = scan_tree(root)
         if leaked:
             # Never overridable and never skippable. A published credential cannot
@@ -163,6 +173,12 @@ def gate(
                 "excluded": bad,
                 "repo": repo_name(model, good[0][1], 1),
             }
+        )
+    unknown = sorted(wanted - seen)
+    if unknown:
+        raise SystemExit(
+            f"--only names {', '.join(unknown)}, which is not in {library}. "
+            f"Present: {', '.join(sorted(seen))}"
         )
     for line in hard_stop:
         print(f"REFUSED  {line}", file=sys.stderr)
@@ -278,6 +294,12 @@ def main() -> int:
         default=DEFAULT_INDEX,
         help=f"repo holding the one-pagers and leaderboard (default {DEFAULT_INDEX})",
     )
+    parser.add_argument(
+        "--only",
+        action="append",
+        metavar="MODEL",
+        help="publish just this model directory; repeatable. Others are held.",
+    )
     parser.add_argument("--private", action="store_true")
     parser.add_argument(
         "--skip-noncompliant",
@@ -298,7 +320,7 @@ def main() -> int:
             "deliberate: the publication namespace is never guessed."
         )
 
-    plans, refused = gate(args.library, args.skip_noncompliant)
+    plans, refused = gate(args.library, args.skip_noncompliant, args.only)
     for plan in plans:
         print(
             f"PUBLISH  {plan['model']} -> {args.namespace}/{plan['repo']} "

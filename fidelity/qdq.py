@@ -556,6 +556,63 @@ def _int4_from_compressed_tensors(quant: dict[str, Any]) -> dict[str, Any] | Non
     return None
 
 
+def quant_sections(model: str, config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every place a checkpoint might declare its quantization, in priority order.
+
+    Vendors disagree about where the declaration lives and what nests it: inside
+    `config.json`, under `text_config`, in a `hf_quant_config.json` sidecar, and
+    sometimes under a `quantization` child of any of those. Reading one location
+    means a checkpoint that declares itself plainly can still be misread from its
+    tensor shapes, so gather them all and let the first that resolves win.
+    """
+    sections: list[dict[str, Any]] = []
+
+    def add(candidate: Any) -> None:
+        if not isinstance(candidate, dict) or not candidate:
+            return
+        sections.append(candidate)
+        inner = candidate.get("quantization")
+        if isinstance(inner, dict) and inner:
+            merged = dict(inner)
+            # The method usually sits outside the section that names the algorithm.
+            merged.setdefault("quant_method", candidate.get("quant_method"))
+            sections.append(merged)
+
+    add(config.get("quantization_config"))
+    text = config.get("text_config")
+    if isinstance(text, dict):
+        add(text.get("quantization_config"))
+    add(_sidecar_quant_config(model))
+    return [section for section in sections if section]
+
+
+def _two_level_scaled(model: str) -> bool:
+    """Whether any operand carries two levels of weight scale.
+
+    NVFP4 is alone among the formats here in scaling twice: an FP8 scale per
+    16-element block and one scalar over the tensor. Every FP8 granularity and
+    every int4 grouping scales once. Reading the structure rather than the
+    paperwork is what makes detection survive a vendor's choice of config key.
+    """
+    from safetensors import safe_open
+
+    keys: set[str] = set()
+    for name in sorted(os.listdir(model)):
+        if not name.endswith(".safetensors"):
+            continue
+        with safe_open(os.path.join(model, name), framework="pt", device="cpu") as f:
+            keys.update(f.keys())
+    seconds = {
+        key for key in keys
+        if key.endswith(".weight_scale_2") or key.endswith(".weight_global_scale")
+    }
+    for key in seconds:
+        stem = key.rsplit(".", 1)[0]
+        if f"{stem}.weight_scale" in keys:
+            return True
+    return False
+
+
 def _sidecar_quant_config(model: str) -> dict[str, Any]:
     """A quantization config kept beside config.json rather than inside it.
 
@@ -596,10 +653,19 @@ def _nvfp4_declared_scheme(quant: dict[str, Any]) -> dict[str, Any] | None:
     group: Any = None
     algorithm: str | None = None
 
-    if method == "modelopt":
-        inner = quant.get("quantization")
-        section = inner if isinstance(inner, dict) else quant
-        if str(section.get("quant_algo") or "").upper() != "NVFP4":
+    inner = quant.get("quantization")
+    section = inner if isinstance(inner, dict) else quant
+    algo = str(section.get("quant_algo") or quant.get("quant_algo") or "").upper()
+    fmt = str(quant.get("format") or "").lower()
+
+    # `quant_algo` names the algorithm unambiguously, so honour it whatever the
+    # method says - some exporters omit `quant_method` entirely, and gating on it
+    # left a plainly self-describing NVFP4 pack to be read from its shapes.
+    if "NVFP4" in algo:
+        group = section.get("group_size") or quant.get("group_size")
+        algorithm = "modelopt" if method != "compressed-tensors" else "round_to_nearest"
+    elif method == "modelopt" or (not method and "nvfp4" in fmt):
+        if "nvfp4" not in fmt:
             return None
         group = section.get("group_size")
         algorithm = "modelopt"
@@ -1030,12 +1096,31 @@ def inspect(model: str) -> dict[str, Any]:
         raise SystemExit(f"no config.json at {model}")
     with open(config_path, encoding="utf-8") as handle:
         config = json.load(handle)
-    quant = config.get("quantization_config") or _sidecar_quant_config(model)
+    sections = quant_sections(model, config)
+    quant = sections[0] if sections else {}
     reason = unloadable_reason_from_config(config)
-    quark_scheme = _quark_declared_scheme(quant)
+    quark_scheme = next(
+        (s for s in map(_quark_declared_scheme, sections) if s is not None), None
+    )
     _refuse_mixed_bit_widths(quant)
-    nvfp4 = _nvfp4_declared_scheme(quant)
-    int4 = _int4_declared_scheme(quant)
+    nvfp4 = next(
+        (s for s in map(_nvfp4_declared_scheme, sections) if s is not None), None
+    )
+    int4 = next(
+        (s for s in map(_int4_declared_scheme, sections) if s is not None), None
+    )
+    if nvfp4 is None and int4 is None and quark_scheme is None:
+        # No config anywhere named a format. Two levels of weight scale is NVFP4's
+        # structural signature, and believing it here is what stops the packed
+        # operand's half-width last dim from reading as an 8-wide FP8 block.
+        if _two_level_scaled(model):
+            nvfp4 = {
+                "scheme": "nvfp4",
+                "group_size": 16,
+                "algorithm": "round_to_nearest",
+            }
+            print(f"{os.path.basename(model)} declares no format; "
+                  f"two-level weight scales identify it as nvfp4")
 
     scales = _scale_shapes(model)
     packed_scales = any(
@@ -1523,6 +1608,13 @@ def selftest() -> int:
         {"quant_method": "modelopt", "quantization": {"quant_algo": "FP8"}}
     ) is None
     assert _nvfp4_declared_scheme({"quant_method": "fp8"}) is None
+    # An exporter that names the algorithm but omits the method still resolves;
+    # gating on the method is what let a self-describing pack be read from shapes.
+    no_method = _nvfp4_declared_scheme({"quant_algo": "NVFP4", "group_size": 16})
+    assert no_method is not None and no_method["group_size"] == 16, no_method
+    assert _nvfp4_declared_scheme(
+        {"quantization": {"quant_algo": "nvfp4"}}
+    ) is not None
     assert scheme_block_size("nvfp4", 16) == 16
     # NVIDIA declares the format beside config.json, not inside it. Undetected,
     # the packed weight's half-width last dim makes its 16-wide scale look like
@@ -1542,8 +1634,20 @@ def selftest() -> int:
         found = _nvfp4_declared_scheme(_sidecar_quant_config(sidecar))
         assert found is not None and found["scheme"] == "nvfp4", found
         assert found["group_size"] == 16, found
+        # The sidecar is reached through the same gathering the inspector uses.
+        gathered = quant_sections(sidecar, {"quantization_config": {}})
+        assert any(
+            _nvfp4_declared_scheme(section) is not None for section in gathered
+        ), gathered
     with tempfile.TemporaryDirectory() as bare:
         assert _sidecar_quant_config(bare) == {}
+        assert quant_sections(bare, {}) == []
+    # A declaration nested under text_config is found without a special case.
+    nested = quant_sections(
+        os.devnull + "-absent",
+        {"text_config": {"quantization_config": {"quant_algo": "NVFP4"}}},
+    )
+    assert any(_nvfp4_declared_scheme(s) is not None for s in nested), nested
     print("  NVFP4 is detected from compressed-tensors and modelopt configs")
     print("  NVFP4 is detected from a hf_quant_config.json sidecar")
 
