@@ -1337,6 +1337,8 @@ def _vllm_version() -> str | None:
 
 def selftest() -> int:
     """Prove the properties the 2x2 depends on, on tensors small enough to check."""
+    import tempfile
+
     amd_quark = {
         "quantization_config": {
             "quant_method": "quark",
@@ -1898,8 +1900,6 @@ def selftest() -> int:
     ):
         assert scheme_block_size(scheme, None) == edge, scheme
 
-
-    import tempfile
     from safetensors.torch import save_file
 
     with tempfile.TemporaryDirectory() as root:
