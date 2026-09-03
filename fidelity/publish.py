@@ -553,6 +553,18 @@ def main() -> int:
         ledger.update({plan["model"]: plan["repo"] for plan in plans})
         write_ledger(args.library, ledger)
     upload(index, index_repo, args.private, "Update distribution-fidelity index")
+    # The record mirrors what the published index claims, so the two can never
+    # disagree about what exists - including after an index-only publish, which
+    # relists artifacts uploaded by an earlier run.
+    ledger = read_ledger(args.library)
+    ledger.update(
+        {
+            entry["model"]: entry["repo"]
+            for entry in index_entries(args.library, plans, ledger)
+            if entry["model"] in staged
+        }
+    )
+    write_ledger(args.library, ledger)
     shutil.rmtree(index, ignore_errors=True)
     if refused:
         print(f"\n{len(refused)} model(s) were refused", file=sys.stderr)
