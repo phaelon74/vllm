@@ -400,6 +400,60 @@ def inspect_record(work: str, name: str) -> str:
     return os.path.join(work, "inspect", f"{name}.json")
 
 
+def hold_work_lock(work: str) -> str:
+    """Claim exclusive use of a work tree, or refuse.
+
+    Two campaigns over one work tree build the same variants and write the same
+    reports at the same time, and they contend for the same GPUs, so the first
+    symptom is usually an out-of-memory error that has nothing to do with the
+    checkpoint being scored. A lock naming the live process makes that a refusal
+    instead of a corrupted result.
+    """
+    os.makedirs(work, exist_ok=True)
+    lock = os.path.join(work, "campaign.lock")
+    if os.path.isfile(lock):
+        try:
+            with open(lock, encoding="utf-8") as handle:
+                held = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            held = {}
+        pid = _as_int_or_none(held.get("pid"))
+        if pid and _process_alive(pid):
+            raise SystemExit(
+                f"another campaign is already using {work}: pid {pid}, started "
+                f"{held.get('started', 'at an unrecorded time')}.\nTwo campaigns "
+                f"over one work tree race on variants and reports and contend "
+                f"for the same GPUs. Wait for it, or stop it and remove {lock}."
+            )
+        print(f"=== taking over a stale lock from pid {held.get('pid')}")
+    with open(lock, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(
+            {"pid": os.getpid(), "started": datetime.now(timezone.utc).isoformat()},
+            handle,
+        )
+        handle.write("\n")
+    return lock
+
+
+def _as_int_or_none(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 def remote_weights(repo: str, revision: str | None) -> dict[str, Any]:
     """Size and per-file content hashes of a repo's shards, without downloading.
 
@@ -2368,6 +2422,21 @@ def selftest() -> int:
     assert "Algorithm" in md and "awq" in md
     assert "format (int4_g32_asym) only" in md
 
+    with tempfile.TemporaryDirectory() as locked:
+        first = hold_work_lock(locked)
+        assert os.path.isfile(first)
+        try:
+            hold_work_lock(locked)
+        except SystemExit as exc:
+            assert "another campaign is already using" in str(exc), exc
+        else:
+            raise AssertionError("a second campaign must not share a work tree")
+        with open(first, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump({"pid": 2**30, "started": "long ago"}, handle)
+        assert hold_work_lock(locked) == first, "a dead holder must not block"
+        os.remove(first)
+    print("  one campaign per work tree; a dead holder does not block")
+
     # A format keeps one shape; two releases by one author keep one colour, so
     # neither dimension encodes both facts.
     shapes = _plot_shapes(["nvfp4", "fp8_block", "int4_g32_sym", "int4_g64_sym"])
@@ -2672,13 +2741,20 @@ def main() -> int:
         return cmd_download(config, python)
 
     assert python is not None
-    score_rc = 0
-    if args.stage in ("score", "all"):
-        score_rc = cmd_score(config, python)
-    if args.stage in ("assemble", "all"):
-        assemble_rc = cmd_assemble(config, python, force=args.force)
-        return assemble_rc or score_rc
-    return score_rc
+    lock = hold_work_lock(config.work)
+    try:
+        score_rc = 0
+        if args.stage in ("score", "all"):
+            score_rc = cmd_score(config, python)
+        if args.stage in ("assemble", "all"):
+            assemble_rc = cmd_assemble(config, python, force=args.force)
+            return assemble_rc or score_rc
+        return score_rc
+    finally:
+        try:
+            os.remove(lock)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
