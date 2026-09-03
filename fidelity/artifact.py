@@ -1632,6 +1632,21 @@ def render_plot(payload: dict[str, Any], out: str) -> str | None:
     return f"{missing} candidate(s) omitted for want of a size" if missing else None
 
 
+def _yaml_scalar(value: Any) -> str:
+    """A scalar safe to emit unquoted, or a double-quoted one.
+
+    Values here are prose - titles carrying colons, names carrying hashes - and
+    an unquoted colon is invalid YAML that the Hub rejects on upload. Quoting
+    every string is cheaper than deciding which ones are safe.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    text = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{text}"'
+
+
 def front_matter(fields: dict[str, Any]) -> list[str]:
     """A minimal YAML header for a Hub repo card.
 
@@ -1646,11 +1661,9 @@ def front_matter(fields: dict[str, Any]) -> list[str]:
             continue
         if isinstance(value, list):
             out.append(f"{key}:")
-            out += [f"- {item}" for item in value]
-        elif isinstance(value, bool):
-            out.append(f"{key}: {'true' if value else 'false'}")
+            out += [f"- {_yaml_scalar(item)}" for item in value]
         else:
-            out.append(f"{key}: {value}")
+            out.append(f"{key}: {_yaml_scalar(value)}")
     out += ["---", ""]
     return out
 

@@ -271,6 +271,34 @@ def ledger_from_index_text(text: str) -> dict[str, str]:
     return found
 
 
+def refuse_bad_front_matter(*cards: str) -> None:
+    """Refuse a card whose YAML header the Hub will reject.
+
+    The Hub validates the header server-side and fails the upload, which after a
+    multi-gigabyte artifact has already gone up leaves a partial publish. Checked
+    here, before anything moves.
+    """
+    try:
+        import yaml
+    except ImportError:
+        return
+    for card in cards:
+        if not os.path.isfile(card):
+            continue
+        with open(card, encoding="utf-8") as handle:
+            text = handle.read()
+        if not text.startswith("---"):
+            continue
+        header = text.split("---")[1]
+        try:
+            yaml.safe_load(header)
+        except yaml.YAMLError as exc:
+            raise SystemExit(
+                f"refusing to upload: {card} has an invalid YAML header, which "
+                f"the Hub rejects. {exc}"
+            ) from exc
+
+
 def staged_index_models(staging: str) -> set[str]:
     with open(os.path.join(staging, "README.md"), encoding="utf-8") as handle:
         return index_models_in(handle.read())
@@ -459,7 +487,19 @@ def selftest() -> None:
             ) as handle:
                 readme = handle.read()
             assert readme.startswith("---\n"), readme[:40]
-            assert "pretty_name:" in readme.split("---")[1]
+            header = readme.split("---")[1]
+            assert "pretty_name:" in header
+            # The Hub validates this server-side and rejects the upload, so the
+            # header must parse. The index title carries a colon, which is
+            # exactly what an unquoted scalar gets wrong.
+            try:
+                import yaml
+            except ImportError:
+                assert ': "' in header, header
+            else:
+                parsed = yaml.safe_load(header)
+                assert parsed["pretty_name"].endswith("distribution-fidelity index")
+                assert "quantization" in parsed["tags"]
             # An index that would unlist a published model is refusable.
             assert not (listed - {"Qwen3.6-27B", "Qwen3.8-27B"})
             assert sorted({"Qwen3.8-27B"} - {"Qwen3.6-27B"}) == ["Qwen3.8-27B"]
@@ -547,6 +587,10 @@ def main() -> int:
 
     index = build_index(args.library, plans, args.namespace)
     index_repo = f"{args.namespace}/{args.index_name}"
+    refuse_bad_front_matter(
+        os.path.join(index, "README.md"),
+        *[os.path.join(plan["root"], "README.md") for plan in plans],
+    )
     staged = staged_index_models(index)
     print(f"INDEX    {index_repo} lists {len(staged)} model(s), "
           f"staged at {index}")
