@@ -2116,6 +2116,7 @@ def selftest() -> int:
             "mean_kld": 0.08,
             "report": "bxq.json",
             "routing_trace_sha256": trace,
+            "routing_trace_manifest": "routing-manifest.json",
             "routing_mode": "teacher_ids_student_weights",
             "protocol_version": 1,
             "routing_trace_protocol_version": 2,

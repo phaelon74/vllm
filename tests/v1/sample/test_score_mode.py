@@ -4,6 +4,7 @@
 the fast-path prompt logprobs processor, shared KLD math, windowing, and
 LM-head detection."""
 
+import gc
 import json
 
 import pytest
@@ -163,13 +164,13 @@ class TestGatherTargetLogprobs:
         assert lps.dtype == torch.float32
 
     def test_rank_correctness(self):
-        """The rank of the highest-logprob token should be 0."""
+        """The highest-logprob token has one-based rank 1."""
         logprobs = _make_logprobs_tensor(1, 50)
         best_token = logprobs[0].argmax().item()
         target_ids = torch.tensor([best_token], dtype=torch.int64)
 
         _, _, ranks, *_ = Sampler.gather_target_logprobs(logprobs, target_ids)
-        assert ranks[0].item() == 0
+        assert ranks[0].item() == 1
 
 
 # ---------------------------------------------------------------------------
@@ -586,7 +587,10 @@ def test_v1_v2_engine_kld_parity(monkeypatch, tmp_path):
     vocab_size = tokenizer_unpadded_vocab_size(
         capture_llm.llm_engine.tokenizer
     )
-    capture_llm.shutdown()
+    capture_llm.llm_engine.engine_core.shutdown()
+    del capture_llm, out
+    gc.collect()
+    torch.accelerator.empty_cache()
 
     results = []
     for use_v2 in (False, True):
@@ -616,7 +620,10 @@ def test_v1_v2_engine_kld_parity(monkeypatch, tmp_path):
         )[0]
         assert scored.kld_result is not None
         results.append(scored.kld_result)
-        llm.shutdown()
+        llm.llm_engine.engine_core.shutdown()
+        del llm
+        gc.collect()
+        torch.accelerator.empty_cache()
 
     assert results[0] == results[1]
     assert results[0].kld_count == len(tokens) - 1

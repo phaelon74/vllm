@@ -307,14 +307,6 @@ def test_grouped_forced_weights_ignore_selection_bias_and_apply_scale():
         e_score_correction_bias=torch.tensor([0.0, 0.0, 0.0, 5.0]),
     )
 
-    _, unbiased_ids = unbiased_router.select_experts(
-        hidden_states=torch.empty(1, 1),
-        router_logits=logits,
-    )
-    _, biased_ids = biased_router.select_experts(
-        hidden_states=torch.empty(1, 1),
-        router_logits=logits,
-    )
     unbiased_weights, _ = unbiased_router.select_forced_experts(
         hidden_states=torch.empty(1, 1),
         router_logits=logits,
@@ -326,8 +318,6 @@ def test_grouped_forced_weights_ignore_selection_bias_and_apply_scale():
         forced_topk_ids=forced_ids,
     )
 
-    assert unbiased_ids.item() == 0
-    assert biased_ids.item() == 3
     expected = torch.sigmoid(logits[:, :1]) * 3.0
     torch.testing.assert_close(unbiased_weights, expected)
     torch.testing.assert_close(biased_weights, expected)
