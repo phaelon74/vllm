@@ -12,7 +12,11 @@ from vllm.config import ModelConfig, VllmConfig
 from vllm.config.compilation import CompilationMode
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import override_forward_context
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+from vllm.model_executor.layers.fused_moe.experts.trtllm_fp8_moe import (
+    TrtLlmFp8ExpertsMonolithic,
+)
 from vllm.model_executor.layers.fused_moe.forced_routing import (
     FORCED_ROUTING_KEY,
     ForcedRouting,
@@ -553,6 +557,63 @@ def test_monolithic_kernel_forwards_exact_routing_tensors():
     assert call["topk_ids"] is topk_ids
     assert call["topk_weights"] is topk_weights
     assert output is routed_output
+
+
+def test_trtllm_fp8_forced_route_uses_public_unpacked_api():
+    import flashinfer
+
+    experts = object.__new__(TrtLlmFp8ExpertsMonolithic)
+    experts.quant_config = SimpleNamespace(
+        block_shape=[1, 32],
+        w1_scale=torch.empty(1),
+        w2_scale=torch.empty(1),
+    )
+    experts.gemm1_alpha = None
+    experts.gemm1_beta = None
+    experts.gemm1_clamp_limit = None
+    experts.intermediate_size_per_partition = 4
+    experts.ep_rank = 0
+    experts.local_num_experts = 4
+    experts.routing_method_type = RoutingMethodType.RenormalizeNaive
+    experts.moe_config = SimpleNamespace()
+
+    topk_ids = torch.tensor([[2, 0]], dtype=torch.int32)
+    topk_weights = torch.tensor([[0.75, 0.25]], dtype=torch.float32)
+    expected = torch.empty(1, 4)
+    target = "trtllm_fp8_block_scale_routed_moe"
+
+    with (
+        patch.object(
+            flashinfer.fused_moe,
+            target,
+            return_value=expected,
+            create=True,
+        ) as routed_moe,
+        patch(
+            "vllm.model_executor.layers.fused_moe.experts."
+            "trtllm_fp8_moe.fi_moe_largest_bucket",
+            return_value=1,
+        ),
+    ):
+        output = experts._apply_block_scale_routed(
+            hidden_states=torch.empty(1, 4),
+            w1=torch.empty(1),
+            w2=torch.empty(1),
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=MoEActivation.SILU,
+            global_num_experts=4,
+            a1q_scale=torch.empty(1),
+            apply_router_weight_on_input=False,
+        )
+
+    routed = routed_moe.call_args.kwargs
+    routed_ids, routed_weights = routed["topk_ids"]
+    assert routed_ids is topk_ids
+    assert routed_weights is topk_weights
+    assert "routing_logits" not in routed
+    assert routed["routing_method_type"] == RoutingMethodType.RenormalizeNaive
+    assert output is expected
 
 
 @pytest.mark.parametrize(

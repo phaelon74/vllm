@@ -268,41 +268,43 @@ class TrtLlmBf16ExpertsMonolithic(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsMonol
         a1q_scale: torch.Tensor | None,
         apply_router_weight_on_input: bool,
     ) -> torch.Tensor:
+        import flashinfer
         from flashinfer.fused_moe import WeightLayout
-        from flashinfer.fused_moe.core import trtllm_bf16_moe_op
 
         if apply_router_weight_on_input:
             raise NotImplementedError(
                 "Exact forced routing is not supported when BF16 TRTLLM MoE "
                 "applies router weights on input."
             )
-        result = trtllm_bf16_moe_op(
-            routing_logits=None,
-            routing_bias=None,
-            topk_ids=topk_ids,
-            expert_weights=topk_weights,
-            hidden_states=hidden_states,
-            gemm1_weights=w1,
-            gemm2_weights=w2,
-            gemm1_lora_delta=None,
-            num_experts=global_num_experts,
-            top_k=topk_ids.size(1),
-            n_group=None,
-            topk_group=None,
-            intermediate_size=self.intermediate_size_per_partition,
-            local_expert_offset=self.ep_rank * self.local_num_experts,
-            local_num_experts=self.local_num_experts,
-            routed_scaling_factor=None,
-            routing_method_type=RoutingMethodType.Renormalize,
-            use_shuffled_weight=True,
-            weight_layout=WeightLayout.BlockMajorK,
-            do_finalize=True,
-            activation_type=activation_to_flashinfer_int(activation),
-            tune_max_num_tokens=fi_moe_largest_bucket(self.moe_config),
-            norm_topk_prob=False,
-            routing_replay_out=None,
-        )
-        return result[0]
+        try:
+            result = flashinfer.fused_moe.trtllm_bf16_routed_moe(
+                topk_ids=(topk_ids, topk_weights),
+                hidden_states=hidden_states,
+                gemm1_weights=w1,
+                gemm2_weights=w2,
+                gemm1_lora_delta=None,
+                num_experts=global_num_experts,
+                top_k=topk_ids.size(1),
+                n_group=None,
+                topk_group=None,
+                intermediate_size=self.intermediate_size_per_partition,
+                local_expert_offset=self.ep_rank * self.local_num_experts,
+                local_num_experts=self.local_num_experts,
+                routed_scaling_factor=None,
+                routing_method_type=self.routing_method_type,
+                use_shuffled_weight=True,
+                weight_layout=WeightLayout.BlockMajorK,
+                do_finalize=True,
+                activation_type=activation_to_flashinfer_int(activation),
+                tune_max_num_tokens=fi_moe_largest_bucket(self.moe_config),
+                routing_replay_out=None,
+            )
+        except (AttributeError, TypeError) as exc:
+            raise NotImplementedError(
+                "Installed FlashInfer does not support unpacked FP32 routing "
+                "weights for BF16 TRTLLM MoE."
+            ) from exc
+        return result[0] if isinstance(result, list) else result
 
     def apply(
         self,

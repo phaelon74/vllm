@@ -11,6 +11,9 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     RoutingMethodType,
 )
+from vllm.model_executor.layers.fused_moe.utils import (
+    trtllm_moe_pack_topk_ids_weights,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kInt4Static32,
@@ -138,14 +141,7 @@ class TrtLlmMxint4ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
         a1q_scale: torch.Tensor | None,
         apply_router_weight_on_input: bool,
     ) -> torch.Tensor:
-        try:
-            from flashinfer.fused_moe.core import (
-                trtllm_mxint4_block_scale_moe_op,
-            )
-        except ImportError as exc:
-            raise NotImplementedError(
-                "Installed FlashInfer does not expose exact unpacked MXINT4 routing."
-            ) from exc
+        import flashinfer
 
         if apply_router_weight_on_input:
             raise NotImplementedError(
@@ -155,34 +151,37 @@ class TrtLlmMxint4ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
         if self.w1_scale is None or self.w2_scale is None:
             raise RuntimeError("MXINT4 forced routing requires weight scales.")
 
-        result = trtllm_mxint4_block_scale_moe_op(
-            routing_logits=None,
-            routing_bias=None,
-            topk_ids=topk_ids,
-            expert_weights=topk_weights,
-            hidden_states=hidden_states,
-            gemm1_weights=w1,
-            gemm1_weights_scale=self.w1_scale,
-            gemm1_alpha=None,
-            gemm1_beta=None,
-            gemm1_clamp_limit=None,
-            gemm1_lora_delta=None,
-            gemm2_weights=w2,
-            gemm2_weights_scale=self.w2_scale,
-            num_experts=global_num_experts,
-            top_k=topk_ids.size(1),
-            n_group=None,
-            topk_group=None,
-            intermediate_size=self.intermediate_size_per_partition,
-            local_expert_offset=self.ep_rank * self.local_num_experts,
-            num_local_experts=self.local_num_experts,
-            routed_scaling_factor=None,
-            routing_method_type=RoutingMethodType.Renormalize,
-            do_finalize=True,
-            tune_max_num_tokens=8192,
-            norm_topk_prob=False,
-            routing_replay_out=None,
+        packed_topk = trtllm_moe_pack_topk_ids_weights(
+            topk_ids, topk_weights
         )
+        try:
+            result = flashinfer.fused_moe.trtllm_mxint4_block_scale_routed_moe(
+                topk_ids=packed_topk,
+                hidden_states=hidden_states,
+                gemm1_weights=w1,
+                gemm1_weights_scale=self.w1_scale,
+                gemm1_alpha=None,
+                gemm1_beta=None,
+                gemm1_clamp_limit=None,
+                gemm1_lora_delta=None,
+                gemm2_weights=w2,
+                gemm2_weights_scale=self.w2_scale,
+                num_experts=global_num_experts,
+                top_k=topk_ids.size(1),
+                n_group=None,
+                topk_group=None,
+                intermediate_size=self.intermediate_size_per_partition,
+                local_expert_offset=self.ep_rank * self.local_num_experts,
+                local_num_experts=self.local_num_experts,
+                routed_scaling_factor=None,
+                routing_method_type=self.moe_config.routing_method,
+                do_finalize=True,
+                tune_max_num_tokens=8192,
+            )
+        except (AttributeError, TypeError) as exc:
+            raise NotImplementedError(
+                "Installed FlashInfer does not support pre-routed MXINT4 MoE."
+            ) from exc
         return result[0] if isinstance(result, list) else result
 
     def apply(

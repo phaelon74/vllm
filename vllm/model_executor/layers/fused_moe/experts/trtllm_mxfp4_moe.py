@@ -255,12 +255,9 @@ class TrtLlmMxfp4ExpertsMonolithic(
             dtype=torch.bfloat16,
             device=hidden_states.device,
         )
-        packed_topk = trtllm_moe_pack_topk_ids_weights(
-            topk_ids, topk_weights
-        )
         try:
             trtllm_fp4_block_scale_routed_moe(
-                topk_ids=packed_topk,
+                topk_ids=(topk_ids, topk_weights),
                 routing_bias=None,
                 hidden_states=hidden_states,
                 hidden_states_scale=x_scale,

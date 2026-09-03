@@ -454,8 +454,8 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         a1q_scale: torch.Tensor | None,
         apply_router_weight_on_input: bool,
     ) -> torch.Tensor:
+        import flashinfer
         from flashinfer.fused_moe import Fp8QuantizationType, WeightLayout
-        from flashinfer.fused_moe.core import trtllm_fp8_block_scale_moe_op
 
         if apply_router_weight_on_input:
             raise NotImplementedError(
@@ -481,9 +481,7 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
             hidden_states_scale = prepare_deepseek_fp8_x_sf(hidden_states, a1q_scale)
 
         kwargs = dict(
-            routing_logits=None,
-            topk_ids=topk_ids,
-            expert_weights=topk_weights,
+            topk_ids=(topk_ids, topk_weights),
             routing_bias=None,
             hidden_states=hidden_states,
             hidden_states_scale=hidden_states_scale,
@@ -504,20 +502,25 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
             local_expert_offset=self.ep_rank * self.local_num_experts,
             local_num_experts=self.local_num_experts,
             routed_scaling_factor=None,
-            routing_method_type=RoutingMethodType.Renormalize,
+            routing_method_type=self.routing_method_type,
             use_shuffled_weight=True,
             weight_layout=weight_layout,
             fp8_quantization_type=fp8_quant_type,
             do_finalize=True,
             tune_max_num_tokens=fi_moe_largest_bucket(self.moe_config),
-            num_fused_shared_experts=0,
-            norm_topk_prob=False,
-            routing_replay_out=None,
         )
         if is_mxfp8 or activation == MoEActivation.RELU2_NO_MUL:
             kwargs["activation_type"] = activation_to_flashinfer_int(activation)
-        result = trtllm_fp8_block_scale_moe_op(**kwargs)
-        return result[0]
+        try:
+            result = flashinfer.fused_moe.trtllm_fp8_block_scale_routed_moe(
+                **kwargs
+            )
+        except (AttributeError, TypeError) as exc:
+            raise NotImplementedError(
+                "Installed FlashInfer does not support unpacked FP32 routing "
+                "weights for block-scale FP8 TRTLLM MoE."
+            ) from exc
+        return result[0] if isinstance(result, list) else result
 
     def _apply_block_scale(
         self,
@@ -630,12 +633,9 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
                 f"Exact forced routing does not support {activation} with "
                 "per-tensor FP8 TRTLLM MoE."
             )
-        packed_topk = trtllm_moe_pack_topk_ids_weights(
-            topk_ids, topk_weights
-        )
         try:
             result = flashinfer.fused_moe.trtllm_fp8_per_tensor_scale_routed_moe(
-                topk_ids=packed_topk,
+                topk_ids=(topk_ids, topk_weights),
                 routing_bias=None,
                 hidden_states=hidden_states,
                 gemm1_weights=w1,
@@ -652,7 +652,7 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
                 local_num_experts=self.local_num_experts,
                 routed_scaling_factor=None,
                 use_routing_scales_on_input=apply_router_weight_on_input,
-                routing_method_type=RoutingMethodType.Renormalize,
+                routing_method_type=self.routing_method_type,
                 do_finalize=True,
                 activation_type=activation_to_flashinfer_int(activation),
                 tune_max_num_tokens=fi_moe_largest_bucket(self.moe_config),

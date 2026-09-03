@@ -544,9 +544,6 @@ class TrtLlmNvFp4ExpertsMonolithic(
                 )
             block_scale, per_token_scale = a1q_scale, None
 
-        packed_topk = trtllm_moe_pack_topk_ids_weights(
-            topk_ids, topk_weights
-        )
         output = torch.empty(
             hidden_states.shape[0],
             self.hidden_dim,
@@ -555,7 +552,7 @@ class TrtLlmNvFp4ExpertsMonolithic(
         )
         try:
             flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe(
-                topk_ids=packed_topk,
+                topk_ids=(topk_ids, topk_weights),
                 routing_bias=None,
                 hidden_states=hidden_states,
                 hidden_states_scale=block_scale.view(torch.float8_e4m3fn).reshape(
