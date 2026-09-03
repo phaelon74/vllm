@@ -786,6 +786,12 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
     out += _table(
         rows, ("Cell", "What it isolates", "Mean KLD", "Selections changed", "Support")
     )
+    same = composite.get("identical_to_expert_cell")
+    if same:
+        out += [
+            f"The composite cell {same}",
+            "",
+        ]
     out += _derived_terms(
         deployed,
         engine,

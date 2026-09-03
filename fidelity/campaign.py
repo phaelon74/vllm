@@ -1327,6 +1327,25 @@ def attribute_model(
             composite.get("mean_kld"), (int, float)
         ):
             attribution["engine_arithmetic"] = deployed_mean - composite["mean_kld"]
+        # A composite that names more than the experts yet scores exactly the
+        # expert cell is disclosing something, not repeating itself: rounding
+        # those extra tensors changed nothing the scored graph reads. Left
+        # unsaid, the cell claims coverage its number does not carry.
+        expert_kld = (attribution.get("expert_cell") or {}).get("mean_kld")
+        if (
+            quantized != ["experts"]
+            and isinstance(expert_kld, (int, float))
+            and composite.get("mean_kld") == expert_kld
+        ):
+            extra = [c for c in quantized if c != "experts"]
+            attribution["composite_cell"]["identical_to_expert_cell"] = (
+                f"scores exactly the expert cell though it also rounds "
+                f"{', '.join(extra)}. The tensors it matched in those "
+                f"components changed nothing the scored forward pass reads, "
+                f"which is what happens when the only ones the checkpoint "
+                f"quantizes there sit in a layer the graph does not execute, "
+                f"such as a multi-token-prediction head."
+            )
     algorithm = inspection.get("quant_algorithm")
     if algorithm:
         attribution["quant_algorithm"] = algorithm
