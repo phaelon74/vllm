@@ -2111,12 +2111,22 @@ def selftest() -> int:
         cache_dir = os.path.join(tmp, "ckpt")
         os.makedirs(cache_dir)
         cache = os.path.join(cache_dir, "inspect.json")
+        import qdq as _qdq
         with open(cache, "w", encoding="utf-8") as handle:
-            handle.write('{"ok": true}\n')
+            json.dump({"inspect_version": _qdq.INSPECT_VERSION}, handle)
         durable = inspect_record(work, "ckpt")
         copied = inspect_checkpoint("/no/such/python", cache_dir, durable)
         assert copied == durable
         assert os.path.isfile(durable)
+
+        # A reading an older inspector wrote must not be trusted, and there is
+        # no interpreter here to re-take it, so the attempt must fail loudly
+        # rather than quietly reuse the stale record.
+        with open(cache, "w", encoding="utf-8") as handle:
+            json.dump({"inspect_version": _qdq.INSPECT_VERSION - 1}, handle)
+        assert not _inspect_is_current(cache)
+        os.remove(durable)
+        assert inspect_checkpoint("/no/such/python", cache_dir, durable) is None
 
     rows = _parse_smi_rows(
         "0, GPU-aaa, 97887, 97000\n1, GPU-bbb, 97887, 1000\n"
