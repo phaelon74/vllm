@@ -2126,7 +2126,10 @@ def selftest() -> int:
             json.dump({"inspect_version": _qdq.INSPECT_VERSION - 1}, handle)
         assert not _inspect_is_current(cache)
         os.remove(durable)
-        assert inspect_checkpoint("/no/such/python", cache_dir, durable) is None
+        # Nothing here is inspectable, so the retake fails; what matters is that
+        # it was attempted instead of the stale cache being copied forward.
+        assert inspect_checkpoint(sys.executable, cache_dir, durable) is None
+        assert not os.path.isfile(durable)
 
     rows = _parse_smi_rows(
         "0, GPU-aaa, 97887, 97000\n1, GPU-bbb, 97887, 1000\n"
