@@ -400,6 +400,43 @@ def inspect_record(work: str, name: str) -> str:
     return os.path.join(work, "inspect", f"{name}.json")
 
 
+def remote_weights(repo: str, revision: str | None) -> dict[str, Any]:
+    """Size and per-file content hashes of a repo's shards, without downloading.
+
+    The Hub serves file metadata, so what a quantization costs on disk is
+    answerable for a checkpoint that is not local and for one whose leased
+    weights were released. The LFS oid is a hash of the file's contents, which
+    tells apart two packs of identical geometry that differ in their numbers -
+    something a header digest cannot do.
+
+    Returns a dict with `bytes`, `files`, and `lfs_sha256`; raises SystemExit if
+    huggingface_hub is absent.
+    """
+    try:
+        from huggingface_hub import HfApi
+    except ImportError as exc:
+        raise SystemExit(
+            "huggingface_hub is not installed in this interpreter. Run "
+            "fidelity/bootstrap.sh, or: uv pip install 'huggingface_hub[cli]'"
+        ) from exc
+    total = 0
+    oids: dict[str, str] = {}
+    for entry in HfApi().list_repo_tree(
+        repo, revision=revision, recursive=True, expand=True
+    ):
+        name = getattr(entry, "path", "")
+        if not name.endswith(".safetensors"):
+            continue
+        size = getattr(entry, "size", None)
+        if size:
+            total += int(size)
+        lfs = getattr(entry, "lfs", None)
+        digest = getattr(lfs, "sha256", None) if lfs is not None else None
+        if digest:
+            oids[os.path.basename(name)] = digest
+    return {"bytes": total, "files": len(oids), "lfs_sha256": oids}
+
+
 def _inspect_is_current(path: str) -> bool:
     """Whether `path` holds an inspection this inspector would still stand by.
 
@@ -1899,6 +1936,7 @@ def cmd_assemble(config: Config, python: str, force: bool = False) -> int:
                 inspect_src = os.path.join(cand.path, "inspect.json")
             if os.path.isfile(inspect_src):
                 shutil.copy2(inspect_src, os.path.join(cand_dir, "inspect.json"))
+                _ensure_weights_size(cand, os.path.join(cand_dir, "inspect.json"))
             prov_src = os.path.join(
                 config.work, "provenance", f"{cand.name}.json"
             )
@@ -2009,6 +2047,8 @@ def cmd_assemble(config: Config, python: str, force: bool = False) -> int:
                 file=sys.stderr,
             )
             failures.extend([left, right])
+
+        _plot_family(config, python, model, model_root)
 
         # Rewrite checksums so they cover the receipts and one-pagers too.
         _run([python, os.path.join(HERE, "artifact.py"), "checksums",
@@ -2205,6 +2245,8 @@ def selftest() -> int:
         _beyond_rounding_what,
         _deployed_quantization,
         _derived_terms,
+        _plot_shapes,
+        render_plot,
     )
     from compliance import (
         Campaign as _Campaign,
@@ -2321,6 +2363,35 @@ def selftest() -> int:
     )
     assert "Algorithm" in md and "awq" in md
     assert "format (int4_g32_asym) only" in md
+
+    # A format keeps one shape; two releases by one author keep one colour, so
+    # neither dimension encodes both facts.
+    shapes = _plot_shapes(["nvfp4", "fp8_block", "int4_g32_sym", "int4_g64_sym"])
+    assert shapes["nvfp4"] == "^" and shapes["fp8_block"] == "P"
+    assert shapes["int4_g32_sym"] != shapes["int4_g64_sym"]
+    assert len(set(shapes.values())) == 4, shapes
+    with tempfile.TemporaryDirectory() as plot_dir:
+        chart = os.path.join(plot_dir, "kld-vs-size.png")
+        note = render_plot(
+            {
+                "title": "selftest",
+                "quants": [
+                    {"id": "who/a", "creator": "who", "type": "nvfp4",
+                     "disk_size_gib": 65.0, "mean_kld": 0.08},
+                    {"id": "who/b", "creator": "who", "type": "fp8_block",
+                     "disk_size_gib": 115.0, "mean_kld": 0.011},
+                    {"id": "who/c", "creator": "who", "type": "mxfp8",
+                     "disk_size_gib": None, "mean_kld": 0.02},
+                ],
+            },
+            chart,
+        )
+        if note and "matplotlib is not installed" in note:
+            print("  family plot skipped: matplotlib absent")
+        else:
+            assert os.path.isfile(chart), note
+            assert note and "1 candidate(s) omitted" in note, note
+            print("  family plot: colour is the author, shape is the format")
     partial_md = "\n".join(
         _deployed_quantization(
             {
@@ -2416,12 +2487,146 @@ def selftest() -> int:
     return 0
 
 
+def _ensure_weights_size(cand: Candidate, inspection: str) -> None:
+    """Fill in what the checkpoint costs on disk, asking the Hub if it must.
+
+    An inspection taken before sizes were recorded, or one of a candidate whose
+    leased weights are gone, has no size. The local files answer it when they
+    exist and the Hub answers it for the pinned revision when they do not.
+    """
+    import qdq as _qdq
+
+    try:
+        with open(inspection, encoding="utf-8") as handle:
+            record = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return
+    if record.get("weights_bytes"):
+        return
+    try:
+        if _has_checkpoint_weights(cand.path):
+            record["weights_bytes"] = _qdq.weights_bytes(cand.path)
+            record["weights_bytes_source"] = "local"
+        elif cand.hf_repo:
+            remote = remote_weights(cand.hf_repo, cand.revision)
+            if not remote["bytes"]:
+                return
+            record["weights_bytes"] = remote["bytes"]
+            record["weights_bytes_source"] = "hub"
+        else:
+            return
+    except (OSError, SystemExit) as exc:
+        print(f"WARNING  no size for {cand.name}: {exc}", file=sys.stderr)
+        return
+    with open(inspection, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(record, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def _plot_family(
+    config: Config, python: str, model: Model, model_root: str
+) -> None:
+    """Chart every published candidate of one family by size against fidelity.
+
+    The payload is written beside the chart because a picture is not evidence:
+    a reader who disagrees with the plot can check the numbers that made it.
+    """
+    repos = {cand.name: cand.hf_repo for cand in model.candidates}
+    quants = []
+    for cand in model.candidates:
+        cand_dir = os.path.join(model_root, cand.name)
+        report_path = os.path.join(cand_dir, "report.json")
+        inspect_path = os.path.join(cand_dir, "inspect.json")
+        if not os.path.isfile(report_path):
+            continue
+        try:
+            with open(report_path, encoding="utf-8") as handle:
+                report = json.load(handle)
+            inspection = {}
+            if os.path.isfile(inspect_path):
+                with open(inspect_path, encoding="utf-8") as handle:
+                    inspection = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        size = inspection.get("weights_bytes")
+        repo = repos.get(cand.name) or ""
+        quants.append({
+            "id": repo or cand.name,
+            "creator": repo.split("/")[0] if "/" in repo else "unknown",
+            "type": inspection.get("detected_scheme") or "unquantized",
+            "disk_size_gib": round(size / 2**30, 3) if size else None,
+            "size_source": inspection.get("weights_bytes_source"),
+            "mean_kld": report.get("mean_kld"),
+        })
+    if not quants:
+        return
+    payload = {
+        "title": f"{model.name} quantization analysis",
+        "subtitle": "Mean KL divergence against on-disk size",
+        "quants": quants,
+    }
+    data = os.path.join(model_root, "kld-vs-size.json")
+    with open(data, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+    _run([
+        python, os.path.join(HERE, "artifact.py"), "plot",
+        "--data", data,
+        "--out", os.path.join(model_root, "kld-vs-size.png"),
+    ])
+
+
+def cmd_sizes(config: Config) -> int:
+    """Report what each candidate costs on disk, from the Hub or from local files.
+
+    A size read from the Hub is the repo's claim about the revision this campaign
+    pins, not a measurement of the bytes that were scored, so it is recorded with
+    its source. Where the weights are still local the local measurement wins.
+    """
+    import qdq as _qdq
+
+    for model in config.models:
+        print(f"\n== {model.name}")
+        for cand in model.candidates:
+            local = _has_checkpoint_weights(cand.path)
+            try:
+                if local:
+                    size, source = _qdq.weights_bytes(cand.path), "local"
+                elif cand.hf_repo:
+                    size = remote_weights(cand.hf_repo, cand.revision)["bytes"]
+                    source = "hub"
+                else:
+                    print(f"  {cand.name}: absent and no hf_repo")
+                    continue
+            except (OSError, SystemExit) as exc:
+                print(f"  {cand.name}: unavailable ({exc})")
+                continue
+            print(f"  {cand.name:<52} {size / 2**30:8.2f} GiB  ({source})")
+            record = inspect_record(config.work, cand.name)
+            if not os.path.isfile(record):
+                continue
+            try:
+                with open(record, encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if data.get("weights_bytes"):
+                continue
+            data["weights_bytes"] = size
+            data["weights_bytes_source"] = source
+            with open(record, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump(data, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+            print(f"    recorded into {record}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "stage",
         nargs="?",
-        choices=("download", "score", "assemble", "all", "release"),
+        choices=("download", "score", "assemble", "all", "release", "sizes"),
     )
     parser.add_argument("--config")
     parser.add_argument(
@@ -2444,6 +2649,8 @@ def main() -> int:
 
     if args.stage == "release":
         return cmd_release(config)
+    if args.stage == "sizes":
+        return cmd_sizes(config)
 
     python = None
     try:

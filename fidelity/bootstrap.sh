@@ -43,7 +43,7 @@ if [[ ${SKIP_INSTALL:-0} != 1 ]]; then
     VIRTUAL_ENV="$VENV" VLLM_USE_PRECOMPILED=1 \
       uv pip install -e "$REPO_ROOT" --torch-backend=auto
   fi
-  VIRTUAL_ENV="$VENV" uv pip install --quiet 'huggingface_hub[cli]' datasets
+  VIRTUAL_ENV="$VENV" uv pip install --quiet 'huggingface_hub[cli]' datasets matplotlib
 fi
 
 # The commit is part of every artifact's identity (Law 6), so make it loud here

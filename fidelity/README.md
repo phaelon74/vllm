@@ -200,6 +200,16 @@ reduction dimension and stores one group more than it carries, vLLM allocates fo
 the unpadded width, and the expert weight loader fails on the length mismatch.
 Gemma 4's 704-wide experts do this to a 128-wide group but not to 32 or 64.
 
+Assembly charts each family as mean KLD against on-disk size, writing
+`kld-vs-size.png` beside the `kld-vs-size.json` that produced it, so a reader who
+distrusts the picture can check the numbers. Colour carries the author and shape
+carries the format, never both, so two releases from one hand read as one hand at
+different settings. A size is measured from the local shards where they exist and
+read from the Hub for the pinned revision where the leased weights are gone; the
+artifact says which, because a Hub figure describes a revision while a local one
+describes the bytes that were scored. A candidate with no size is omitted from
+the chart and the omission is counted rather than guessed at.
+
 Every model in a campaign is ingested, scored, and assembled by the identical
 code path. That is the point: a comparison between two candidates means nothing
 if anything about the procedure differed between them.

@@ -810,6 +810,20 @@ def weights_identity(model: str) -> str:
     return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
+def weights_bytes(model: str) -> int:
+    """Total size of the checkpoint's safetensors shards on disk.
+
+    What the quantization actually costs to store and to load, including the
+    scales and zero points the format needs, which is the number a reader
+    comparing two formats wants and cannot derive from the scheme name.
+    """
+    return sum(
+        os.path.getsize(os.path.join(model, name))
+        for name in os.listdir(model)
+        if name.endswith(".safetensors")
+    )
+
+
 def inspect_for_disk(report: dict[str, Any]) -> dict[str, Any]:
     """Inspect JSON without the name list, which is tens of thousands of strings.
 
@@ -1068,6 +1082,7 @@ def inspect(model: str) -> dict[str, Any]:
         "model": os.path.abspath(model),
         "inspect_version": INSPECT_VERSION,
         "weights_sha256": weights_identity(model),
+        "weights_bytes": weights_bytes(model),
         "quant_method": quant.get("quant_method"),
         "declared": {
             key: quant.get(key)
@@ -1090,6 +1105,10 @@ def render_inspection(report: dict[str, Any]) -> str:
     ]
     for key, value in (report["declared"] or {}).items():
         lines.append(f"  {key}: {value}")
+    if report.get("weights_bytes"):
+        lines.append(
+            f"  weights on disk: {report['weights_bytes'] / 2**30:.2f} GiB"
+        )
     lines.append(f"  detected scheme: {report['detected_scheme'] or 'unquantized'}")
     if report.get("detected_block") is not None:
         lines.append(f"  detected block: {report['detected_block']}")
@@ -1886,6 +1905,9 @@ def selftest() -> int:
         assert disk["quantized_names_sha256"] == names_sha256(
             report["quantized_names"]
         )
+        assert report["weights_bytes"] == weights_bytes(root)
+        assert report["weights_bytes"] > 0
+        assert "weights on disk" in rendered
         identity = report["weights_sha256"]
         assert identity == weights_identity(root), "identity is not stable"
         assert disk["weights_sha256"] == identity, "identity must survive to disk"

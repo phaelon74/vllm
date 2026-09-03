@@ -494,9 +494,16 @@ def _deployed_quantization(deployed: dict[str, Any]) -> list[str]:
     if not isinstance(declared, dict):
         declared = {}
     algorithm = inspection.get("quant_algorithm")
+    on_disk = inspection.get("weights_bytes")
+    size = "n/a"
+    if on_disk:
+        size = f"{on_disk / 2**30:.2f} GiB"
+        if inspection.get("weights_bytes_source") == "hub":
+            size += " (as the Hub reports the pinned revision, not measured here)"
     facts = [
         ("Scheme", str(inspection.get("detected_scheme") or "n/a")),
         ("Block", str(inspection.get("detected_block") or "n/a")),
+        ("Weights on disk", size),
         (
             "Declared method",
             str(
@@ -1502,6 +1509,127 @@ def _cmd_checksums(args: argparse.Namespace) -> int:
     return 0
 
 
+PLOT_FACE = "#F5F5E1"
+PLOT_GRID = "#c8c8b8"
+# One shape per format, fixed so a scheme keeps its marker across families.
+PLOT_MARKERS: dict[str, str] = {
+    "nvfp4": "^",
+    "mxfp8": "v",
+    "fp8_per_tensor": "o",
+    "fp8_per_channel": "X",
+    "fp8_block": "P",
+}
+_PLOT_FALLBACK = ("s", "D", "*", "h", "8", "d", "p", "<", ">")
+_PLOT_COLORS = (
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+)
+
+
+def _plot_shapes(kinds: list[str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    spare = 0
+    for kind in sorted(set(kinds)):
+        if kind in PLOT_MARKERS:
+            out[kind] = PLOT_MARKERS[kind]
+        else:
+            out[kind] = _PLOT_FALLBACK[spare % len(_PLOT_FALLBACK)]
+            spare += 1
+    return out
+
+
+def render_plot(payload: dict[str, Any], out: str) -> str | None:
+    """Scatter mean KLD against on-disk size for one family.
+
+    Colour carries the author and shape carries the format, never both, so two
+    releases from one author read as the same hand at different settings. A
+    point whose size is unknown is omitted rather than guessed, and the count of
+    omissions is returned so the caller can say so.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
+    except ImportError:
+        return "matplotlib is not installed; skipping the family plot"
+
+    points = [
+        q for q in payload.get("quants") or []
+        if q.get("disk_size_gib") and q.get("mean_kld") is not None
+    ]
+    if not points:
+        return "no candidate has both a size and a mean KLD; skipping the plot"
+
+    colours = {
+        author: _PLOT_COLORS[index % len(_PLOT_COLORS)]
+        for index, author in enumerate(
+            sorted({str(q.get("creator") or "unknown") for q in points})
+        )
+    }
+    shapes = _plot_shapes([str(q.get("type") or "unknown") for q in points])
+
+    fig, ax = plt.subplots(figsize=(10, 6), facecolor=PLOT_FACE)
+    ax.set_facecolor(PLOT_FACE)
+    xs = [float(q["disk_size_gib"]) for q in points]
+    ys = [float(q["mean_kld"]) for q in points]
+    for q, x, y in zip(points, xs, ys, strict=True):
+        ax.scatter(
+            [x], [y], s=120,
+            c=colours[str(q.get("creator") or "unknown")],
+            marker=shapes[str(q.get("type") or "unknown")],
+            edgecolors="black", linewidths=0.6, zorder=3,
+        )
+
+    ax.set_xlabel("File size (GiB)", fontweight="bold")
+    ax.set_ylabel("Mean KL divergence (lower is better)", fontweight="bold")
+    heading = [t for t in (payload.get("title"), payload.get("subtitle")) if t]
+    if heading:
+        ax.set_title("\n".join(heading), fontweight="bold", fontsize=11, pad=16)
+    ax.grid(True, linestyle=":", linewidth=0.8, color=PLOT_GRID, zorder=0)
+    for spine in ax.spines.values():
+        spine.set_linewidth(0.8)
+        spine.set_edgecolor("black")
+    x_pad = max(1.0, (max(xs) - min(xs)) * 0.12 + 0.5)
+    y_pad = max(1e-3, (max(ys) - min(ys)) * 0.15 + 1e-3)
+    ax.set_xlim(min(xs) - x_pad, max(xs) + x_pad)
+    ax.set_ylim(max(0.0, min(ys) - y_pad), max(ys) + y_pad)
+
+    ax.legend(
+        handles=[
+            Line2D(
+                [0], [0],
+                color=colours[str(q.get("creator") or "unknown")],
+                marker=shapes[str(q.get("type") or "unknown")],
+                linestyle="None", markersize=9,
+                markeredgecolor="black", markeredgewidth=0.6,
+                label=f"{q.get('id') or q.get('creator')} — KLD "
+                      f"{float(q['mean_kld']):.6f}",
+            )
+            for q in sorted(points, key=lambda q: -float(q["mean_kld"]))
+        ],
+        loc="upper right", frameon=True, fancybox=False,
+        edgecolor="black", fontsize=8,
+    )
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    fig.savefig(out, dpi=150, facecolor=PLOT_FACE, bbox_inches="tight")
+    plt.close(fig)
+    missing = len(payload.get("quants") or []) - len(points)
+    return f"{missing} candidate(s) omitted for want of a size" if missing else None
+
+
+def _cmd_plot(args: argparse.Namespace) -> int:
+    with open(args.data, encoding="utf-8") as handle:
+        payload = json.load(handle)
+    note = render_plot(payload, args.out)
+    if note:
+        print(note, file=sys.stderr)
+    if os.path.isfile(args.out):
+        print(f"wrote {args.out}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1529,6 +1657,11 @@ def main() -> int:
     board.add_argument("--out", required=True)
     board.add_argument("--csv")
     board.set_defaults(func=_cmd_leaderboard)
+
+    chart = sub.add_parser("plot", help="scatter mean KLD against on-disk size")
+    chart.add_argument("--data", required=True, help="family plot payload JSON")
+    chart.add_argument("--out", required=True)
+    chart.set_defaults(func=_cmd_plot)
 
     sums = sub.add_parser("checksums", help="hash every file in an artifact")
     sums.add_argument("--root", required=True)
