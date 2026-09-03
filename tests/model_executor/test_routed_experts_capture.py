@@ -456,10 +456,22 @@ def test_modular_runner_dispatches_forced_ids_with_student_weights():
     logits = torch.tensor([[3.0, 1.0, -1.0, 0.0]])
     forced_ids = torch.tensor([[[2, 0]]], dtype=torch.int32)
     ctx = SimpleNamespace(
-        additional_kwargs={FORCED_ROUTING_KEY: ForcedRouting(expert_ids=forced_ids)}
+        additional_kwargs={FORCED_ROUTING_KEY: ForcedRouting(expert_ids=forced_ids)},
+        is_padding=None,
     )
 
-    with override_forward_context(ctx):
+    with (
+        patch(
+            "vllm.model_executor.layers.fused_moe.router."
+            "fused_topk_router.fused_topk",
+            return_value=(
+                torch.tensor([[0.75, 0.25]]),
+                torch.tensor([[0, 1]], dtype=torch.int32),
+                torch.empty(1, 2, dtype=torch.int32),
+            ),
+        ),
+        override_forward_context(ctx),
+    ):
         runner._apply_quant_method(torch.empty(1, 1), logits, None)
 
     call = runner.routed_experts.forward_modular.call_args.kwargs
@@ -504,10 +516,22 @@ def test_monolithic_runner_dispatches_exact_forced_routing():
     logits = torch.tensor([[3.0, 1.0, -1.0, 0.0]])
     forced_ids = torch.tensor([[[2, 0]]], dtype=torch.int64)
     ctx = SimpleNamespace(
-        additional_kwargs={FORCED_ROUTING_KEY: ForcedRouting(expert_ids=forced_ids)}
+        additional_kwargs={FORCED_ROUTING_KEY: ForcedRouting(expert_ids=forced_ids)},
+        is_padding=None,
     )
 
-    with override_forward_context(ctx):
+    with (
+        patch(
+            "vllm.model_executor.layers.fused_moe.router."
+            "fused_topk_router.fused_topk",
+            return_value=(
+                torch.tensor([[0.75, 0.25]]),
+                torch.tensor([[0, 1]], dtype=torch.int32),
+                torch.empty(1, 2, dtype=torch.int32),
+            ),
+        ),
+        override_forward_context(ctx),
+    ):
         runner._apply_quant_method(
             torch.empty(1, 1),
             logits,
