@@ -955,6 +955,7 @@ def LLM_with_max_seqs(
         tensor_parallel_size=int(os.getenv("VLLM_TP_SIZE", "1")),
         enable_prefix_caching=False,
         enforce_eager=os.getenv("VLLM_TEST_ENFORCE_EAGER", "0") == "1",
+        enable_flashinfer_autotune=False,
         attention_config=attention_config,
         # Enable for MOE models
         # enable_expert_parallel=True,

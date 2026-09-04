@@ -414,6 +414,8 @@ invariance and is not expert-parallel: batch-invariant Triton, CUTLASS NVFP4,
 Humming, and patched Marlin after the canonical-order and full-K ports.
 Qwen GDN attention is certified only on its NVIDIA CUDA, non-speculative
 per-sequence path; FlashInfer GDN context parallelism is disabled there.
+Weight-only W4A16 NVFP4 linear layers use deterministic emulation because
+dense Marlin is not batch invariant.
 DeepGEMM, FlashInfer MoE, AITER, XPU, CPU, and EP paths remain uncertified
 until an exact probe passes. Scoring sets `VLLM_BATCH_INVARIANT=1`, disables
 DeepGEMM and FlashInfer autotune, and pins NCCL/cuBLAS determinism flags.

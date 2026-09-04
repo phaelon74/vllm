@@ -140,6 +140,7 @@ from vllm.model_executor.kernels.linear.nvfp4.cutlass import (
     CutlassNvFp4LinearKernel,
 )
 from vllm.model_executor.kernels.linear.nvfp4.emulation import (
+    EmulationA16NvFp4LinearKernel,
     EmulationNvFp4LinearKernel,
 )
 from vllm.model_executor.kernels.linear.nvfp4.fbgemm import (
@@ -327,6 +328,7 @@ _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
     },
     "emulation": {
         EmulationMxfp8LinearKernel,
+        EmulationA16NvFp4LinearKernel,
         EmulationNvFp4LinearKernel,
         EmulationMxfp6LinearKernel,
         EmulationMxfp4LinearKernel,
@@ -1009,14 +1011,27 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
     """Select and instantiate the best NVFP4 linear kernel for the
     current platform."""
     config = NvFp4LinearLayerConfig()
-    a16_kernels = (MarlinNvFp4LinearKernel, HummingNvFp4LinearKernel)
+    a16_kernels = (
+        MarlinNvFp4LinearKernel,
+        HummingNvFp4LinearKernel,
+        EmulationA16NvFp4LinearKernel,
+    )
 
     # VLLM_BATCH_INVARIANT forces deterministic execution. Prefer the
     # batch-invariant CUTLASS implementation when available, otherwise fall
     # back to emulation. It overrides --linear-backend.
     force_kernel: type[NvFp4LinearKernel] | None = None
     linear_backend = _get_linear_backend()
-    if envs.VLLM_BATCH_INVARIANT:
+    if envs.VLLM_BATCH_INVARIANT and use_a16:
+        logger.info_once(
+            "VLLM_BATCH_INVARIANT forces W4A16 NVFP4 linear layers to use "
+            "weight-only emulation for deterministic execution."
+        )
+        # Dense Marlin is not batch invariant. Dequantization followed by
+        # torch.matmul reaches the registered batch-invariant matmul path.
+        # Adapted from vllm-project/vllm#47674.
+        force_kernel = EmulationA16NvFp4LinearKernel
+    elif envs.VLLM_BATCH_INVARIANT:
         bi_supported, reason = CutlassNvFp4LinearKernel.is_supported()
         if bi_supported:
             if linear_backend not in ("auto", "cutlass"):
@@ -1224,6 +1239,7 @@ __all__ = [
     "XPUMxFp8LinearKernel",
     "EmulationMxfp8LinearKernel",
     "CutlassNvFp4LinearKernel",
+    "EmulationA16NvFp4LinearKernel",
     "EmulationNvFp4LinearKernel",
     "FbgemmNvFp4LinearKernel",
     "FlashInferCuteDslNvFp4LinearKernel",

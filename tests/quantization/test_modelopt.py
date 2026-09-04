@@ -16,6 +16,7 @@ from tests.quantization.utils import is_quant_method_supported
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.model import ModelConfig
 from vllm.model_executor.kernels.linear import (
+    EmulationA16NvFp4LinearKernel,
     HummingNvFp4LinearKernel,
     MarlinNvFp4LinearKernel,
 )
@@ -595,6 +596,22 @@ def test_modelopt_w4a16_respects_linear_backend(linear_backend, kernel_cls):
             ModelOptNvFp4Config(quant_method="W4A16_NVFP4")
         )
     assert isinstance(method.kernel, kernel_cls)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
+def test_modelopt_w4a16_batch_invariant_uses_emulation():
+    vllm_config = VllmConfig()
+    with (
+        patch(
+            "vllm.model_executor.kernels.linear.envs.VLLM_BATCH_INVARIANT",
+            True,
+        ),
+        set_current_vllm_config(vllm_config),
+    ):
+        method = ModelOptNvFp4W4A16LinearMethod(
+            ModelOptNvFp4Config(quant_method="W4A16_NVFP4")
+        )
+    assert isinstance(method.kernel, EmulationA16NvFp4LinearKernel)
 
 
 @pytest.mark.parametrize(
