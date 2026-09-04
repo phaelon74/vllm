@@ -7,6 +7,8 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import numpy as np
+
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -68,6 +70,25 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def _select_full_prefill_routed_experts(
+    raw: np.ndarray,
+    reconstructed: np.ndarray,
+) -> np.ndarray:
+    if raw.shape != reconstructed.shape:
+        raise ValueError(
+            "Full-prefill routed-expert shapes differ: "
+            f"raw={raw.shape}, reconstructed={reconstructed.shape}"
+        )
+    mismatch_count = int(np.count_nonzero(raw != reconstructed))
+    if mismatch_count:
+        logger.warning(
+            "Full-prefill routed-expert slot reconstruction differs from "
+            "raw token order at %d entries",
+            mismatch_count,
+        )
+    return raw
 
 
 class Scheduler(SchedulerInterface):
@@ -2008,18 +2029,10 @@ class Scheduler(SchedulerInterface):
                             request.num_prompt_tokens,
                             token_start=prompt_start,
                         )
-                        mismatch_count = int(
-                            np.count_nonzero(
-                                raw_routed_experts != slot_routed_experts
-                            )
+                        routed_experts = _select_full_prefill_routed_experts(
+                            raw_routed_experts,
+                            slot_routed_experts,
                         )
-                        if mismatch_count:
-                            logger.warning(
-                                "Full-prefill routed-expert slot reconstruction "
-                                "differs from raw token order at %d entries",
-                                mismatch_count,
-                            )
-                        routed_experts = raw_routed_experts
                     else:
                         routed_experts = self.routed_experts_mgr.get(
                             block_ids,

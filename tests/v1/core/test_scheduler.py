@@ -4,6 +4,7 @@ import dataclasses
 from concurrent.futures import Future
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 
@@ -29,7 +30,10 @@ from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.sched.scheduler import (
+    Scheduler,
+    _select_full_prefill_routed_experts,
+)
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import FinishReason
 from vllm.v1.kv_cache_interface import (
@@ -51,6 +55,16 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_full_prefill_routing_prefers_raw_token_order(caplog):
+    raw = np.array([[[1, 2]], [[3, 4]]], dtype=np.uint8)
+    reconstructed = raw[::-1].copy()
+
+    selected = _select_full_prefill_routed_experts(raw, reconstructed)
+
+    assert selected is raw
+    assert "differs from raw token order at 4 entries" in caplog.text
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():
