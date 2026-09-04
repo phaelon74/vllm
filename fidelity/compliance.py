@@ -27,8 +27,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-LAWS_VERSION = 11
-BXQ_PROTOCOL_VERSION = 3
+LAWS_VERSION = 12
+BXQ_PROTOCOL_VERSION = 4
 ROUTING_TRACE_PROTOCOL_VERSION = 2
 
 # The identity a capture is bound to. Law 5 requires the scored report to carry
@@ -272,6 +272,10 @@ def law_6_provenance(c: Campaign) -> Finding:
         gaps.append("driver version")
     if not runtime.get("vllm_commit"):
         gaps.append("vLLM commit")
+    if not runtime.get("vllm_dirty_digest"):
+        gaps.append("vLLM dirty digest")
+    if not runtime.get("compiled_extensions_sha256"):
+        gaps.append("compiled extension hashes")
     required_files = ("gpu-smi-query.txt", "repo-git-status.txt", "pip-freeze.txt")
     for name in required_files:
         if not os.path.isfile(os.path.join(c.env_dir, name)):
@@ -379,6 +383,10 @@ def comparability_key(c: Campaign) -> dict[str, Any]:
         "torch": runtime.get("torch"),
         "driver": runtime.get("driver"),
         "gpu_names": runtime.get("gpu_names"),
+        "vllm_commit": runtime.get("vllm_commit"),
+        "compiled_extensions_sha256": runtime.get(
+            "compiled_extensions_sha256"
+        ),
     }
 
 
@@ -685,22 +693,23 @@ def law_14_component_attribution(c: Campaign) -> Finding:
             FAIL,
             "bxq_cell natural-routing backend control did not establish parity",
         )
-    if control.get("protocol") != "natural_repeatability_envelope_v1":
+    if control.get("protocol") != "exact_repeat_certification_v1":
         return Finding(
             14,
             title,
             FAIL,
-            "bxq_cell lacks the natural-repeatability control protocol",
+            "bxq_cell lacks the exact-repeat control protocol",
         )
     if (
         control.get("natural_samples") != 2
         or control.get("control_samples") != 2
+        or control.get("bxq_samples") != 2
     ):
         return Finding(
             14,
             title,
             FAIL,
-            "bxq_cell natural-repeatability evidence has the wrong sample count",
+            "bxq_cell exact-repeat evidence has the wrong sample count",
         )
     route_mismatches = control.get("natural_repeat_route_mismatches")
     route_values = control.get("natural_repeat_route_values")
@@ -733,11 +742,12 @@ def law_14_component_attribution(c: Campaign) -> Finding:
         "natural_repeat_mean_absolute_position_delta",
         "control_repeat_max_absolute_position_delta",
         "control_repeat_mean_absolute_position_delta",
+        "bxq_repeat_max_absolute_position_delta",
+        "bxq_repeat_mean_absolute_position_delta",
         "max_absolute_position_delta",
         "absolute_mean_delta",
         "position_absolute_tolerance",
         "mean_absolute_tolerance",
-        "repeatability_multiplier",
     )
     if any(
         not isinstance(control.get(field), (int, float))
@@ -749,54 +759,57 @@ def law_14_component_attribution(c: Campaign) -> Finding:
             14,
             title,
             FAIL,
-            "bxq_cell natural-repeatability evidence is incomplete",
+            "bxq_cell exact-repeat evidence is incomplete",
         )
-    multiplier = float(control["repeatability_multiplier"])
-    expected_position_tolerance = max(
-        1e-5,
-        multiplier
-        * max(
-            float(control["natural_repeat_max_absolute_position_delta"]),
-            float(control["control_repeat_max_absolute_position_delta"]),
-        ),
+    digest_fields = (
+        "natural_kld_sha256",
+        "natural_repeat_kld_sha256",
+        "control_kld_sha256",
+        "control_repeat_kld_sha256",
+        "bxq_kld_sha256",
+        "bxq_repeat_kld_sha256",
     )
-    expected_mean_tolerance = max(
-        1e-7,
-        multiplier
-        * max(
-            float(control["natural_repeat_mean_absolute_position_delta"]),
-            float(control["control_repeat_mean_absolute_position_delta"]),
-        ),
+    if any(
+        not isinstance(control.get(field), str) or len(control[field]) != 64
+        for field in digest_fields
+    ):
+        return Finding(
+            14,
+            title,
+            FAIL,
+            "bxq_cell exact-repeat evidence lacks recomputable KLD digests",
+        )
+    backend_certified = (
+        backend.get("certified_for_exact_repeat") is True
+        and backend.get("batch_invariant") is True
+        and backend.get("per_layer_consistent") is True
     )
-    expected_deterministic = (
-        float(control["natural_repeat_max_absolute_position_delta"]) <= 1e-5
+    exact = (
+        route_mismatches == 0
+        and float(control["natural_repeat_max_absolute_position_delta"])
+        <= 1e-5
         and float(control["natural_repeat_mean_absolute_position_delta"])
         <= 1e-7
         and float(control["control_repeat_max_absolute_position_delta"])
         <= 1e-5
         and float(control["control_repeat_mean_absolute_position_delta"])
         <= 1e-7
+        and float(control["bxq_repeat_max_absolute_position_delta"]) <= 1e-5
+        and float(control["bxq_repeat_mean_absolute_position_delta"]) <= 1e-7
+        and float(control["max_absolute_position_delta"]) <= 1e-5
+        and float(control["absolute_mean_delta"]) <= 1e-7
+        and _same_number(control["position_absolute_tolerance"], 1e-5)
+        and _same_number(control["mean_absolute_tolerance"], 1e-7)
+        and control.get("deterministic") is True
+        and backend_certified
     )
-    if (
-        multiplier != 2.0
-        or control.get("deterministic") is not expected_deterministic
-        or not _same_number(
-            control["position_absolute_tolerance"],
-            expected_position_tolerance,
-        )
-        or not _same_number(
-            control["mean_absolute_tolerance"],
-            expected_mean_tolerance,
-        )
-        or float(control["max_absolute_position_delta"])
-        > expected_position_tolerance
-        or float(control["absolute_mean_delta"]) > expected_mean_tolerance
-    ):
+    if not exact:
         return Finding(
             14,
             title,
             FAIL,
-            "bxq_cell natural control exceeds or misstates repeatability bounds",
+            "bxq_cell exact-repeat certification failed; diagnostic spans "
+            "are not a publishable substitute",
         )
     if bxq.get("candidate_weights_unchanged") is not True:
         return Finding(

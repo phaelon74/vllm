@@ -23,7 +23,7 @@ from typing import Any
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from redaction import redact_env  # noqa: E402 - sibling module
 
-LAWS_VERSION = 11
+LAWS_VERSION = 12
 PROGRAM = "Local Inference Lab"
 # Vendor calibration on packed int4. QDQ still matches format only.
 _CALIBRATED_ALGORITHMS = frozenset({"awq", "gptq", "autoround"})
@@ -138,6 +138,12 @@ def _identity(
         ("max_num_seqs", str(manifest.get("max_num_seqs"))),
         ("vLLM", str((runtime_env.get("vllm") or {}).get("version"))),
         ("vLLM commit", _short(runtime_env.get("vllm_commit"), 12)),
+        ("vLLM dirty digest", _short(runtime_env.get("vllm_dirty_digest"), 16)),
+        (
+            "Compiled extensions",
+            _short(runtime_env.get("compiled_extensions_sha256"), 16),
+        ),
+        ("FlashInfer", str(runtime_env.get("flashinfer") or "n/a")),
         ("torch", str(runtime.get("torch"))),
         ("Driver", str(runtime.get("driver"))),
         ("GPUs", ", ".join(runtime.get("gpu_names") or []) or "n/a"),
@@ -763,6 +769,16 @@ def _paired_routing_intervention(receipt: dict[str, Any]) -> list[str]:
                 "n/a" if delta is None else f"{float(delta):+.8f}",
                 "",
             ),
+            (
+                "Exact repeat",
+                "two QxQ, two forced-natural, two BxQ samples",
+                (
+                    "certified"
+                    if control.get("deterministic") is True
+                    else "diagnostic only"
+                ),
+                "",
+            ),
         ],
         ("Run", "Routing", "Mean KLD", "Support"),
     )
@@ -775,9 +791,9 @@ def _paired_routing_intervention(receipt: dict[str, Any]) -> list[str]:
         "",
         "Natural control used "
         + (
-            "the deterministic exactness floor"
+            "exact-repeat certification"
             if control.get("deterministic") is True
-            else "a measured backend-repeatability envelope"
+            else "diagnostic spans only (not publishable)"
         )
         + ": max position delta "
         + f"{float(control.get('max_absolute_position_delta', 0.0)):.3e} / "
@@ -1204,10 +1220,12 @@ def _domains(receipt: dict[str, Any]) -> list[str]:
         "## Fidelity by domain",
         "",
         "The suite is stratified, so the mean above is an average over kinds of "
-        "text that do not degrade equally. `x run` is a domain's mean divided by "
-        "the run's, so 1.00 degrades exactly as much as the model overall. The "
-        "reference's own top-1 probability is shown because a domain the "
-        "reference finds harder will diverge more for that reason alone.",
+        "text that do not degrade equally. `deployed` is QxQ (natural student "
+        "routing). `bxq` is the teacher-ID counterfactual on the same weights. "
+        "`x run` is a domain's mean divided by the run's, so 1.00 degrades "
+        "exactly as much as the model overall. The reference's own top-1 "
+        "probability is shown because a domain the reference finds harder will "
+        "diverge more for that reason alone.",
         "",
     ]
     table = []
@@ -1492,6 +1510,15 @@ def render_leaderboard(results: list[dict[str, Any]]) -> tuple[str, list[list[An
             flip_rate = (item["receipt"].get("routing") or {}).get(
                 "selection_flip_rate"
             )
+            exact_repeat = (
+                (
+                    (attribution.get("bxq_cell") or {}).get(
+                        "natural_control_parity"
+                    )
+                    or {}
+                ).get("deterministic")
+                is True
+            )
             weakest, weakest_kld = _weakest_domain(item["receipt"])
             family, author, quant = candidate_identity(
                 item["label"], item["report"].get("student_model")
@@ -1517,6 +1544,7 @@ def render_leaderboard(results: list[dict[str, Any]]) -> tuple[str, list[list[An
                     _kld(bxq),
                     "n/a" if delta is None else f"{float(delta):+.8f}",
                     _pct(flip_rate),
+                    "certified" if exact_repeat else "no",
                     f"{weakest} {_kld(weakest_kld)}" if weakest else "n/a",
                     _kld(report.get("median_kld")),
                     _kld(report.get("p99_kld")),
@@ -1537,6 +1565,7 @@ def render_leaderboard(results: list[dict[str, Any]]) -> tuple[str, list[list[An
                     bxq,
                     delta,
                     flip_rate,
+                    exact_repeat,
                     weakest,
                     weakest_kld,
                     report.get("median_kld"),
@@ -1557,6 +1586,7 @@ def render_leaderboard(results: list[dict[str, Any]]) -> tuple[str, list[list[An
                 "BxQ KLD",
                 "QxQ - BxQ",
                 "Natural route flips",
+                "Exact repeat",
                 "Weakest domain",
                 "Median",
                 "p99",
@@ -1688,6 +1718,7 @@ def _cmd_leaderboard(args: argparse.Namespace) -> int:
                     "bxq_mean_kld",
                     "routing_intervention_delta",
                     "natural_routing_flip_rate",
+                    "exact_repeat",
                     "weakest_domain",
                     "weakest_domain_kld",
                     "median_kld",
@@ -2000,6 +2031,7 @@ def render_card(payload: dict[str, Any], laws_version: int = LAWS_VERSION) -> st
                     _kld(bxq),
                     "n/a" if delta is None else f"{float(delta):+.8f}",
                     _pct(q.get("routing_flip_rate")),
+                    "certified" if q.get("exact_repeat") else "no",
                 )
             )
         lines += _table(
@@ -2012,6 +2044,7 @@ def render_card(payload: dict[str, Any], laws_version: int = LAWS_VERSION) -> st
                 "BxQ KLD",
                 "QxQ - BxQ",
                 "Natural route flips",
+                "Exact repeat",
             ),
         )
         lines.append("")
@@ -2122,10 +2155,11 @@ def selftest() -> int:
         "candidate_weights_sha256": digest,
     }
     control = {
-        "protocol": "natural_repeatability_envelope_v1",
+        "protocol": "exact_repeat_certification_v1",
         "passed": True,
         "natural_samples": 2,
         "control_samples": 2,
+        "bxq_samples": 2,
         "natural_repeat_route_mismatches": 0,
         "natural_repeat_route_values": 100,
         "natural_repeat_route_flip_rate": 0.0,
@@ -2134,12 +2168,19 @@ def selftest() -> int:
         "natural_repeat_mean_absolute_position_delta": 0.0,
         "control_repeat_max_absolute_position_delta": 0.0,
         "control_repeat_mean_absolute_position_delta": 0.0,
+        "bxq_repeat_max_absolute_position_delta": 0.0,
+        "bxq_repeat_mean_absolute_position_delta": 0.0,
         "max_absolute_position_delta": 0.0,
         "absolute_mean_delta": 0.0,
         "position_absolute_tolerance": 1e-5,
         "mean_absolute_tolerance": 1e-7,
-        "repeatability_multiplier": 2.0,
         "deterministic": True,
+        "natural_kld_sha256": "a" * 64,
+        "natural_repeat_kld_sha256": "b" * 64,
+        "control_kld_sha256": "c" * 64,
+        "control_repeat_kld_sha256": "d" * 64,
+        "bxq_kld_sha256": "e" * 64,
+        "bxq_repeat_kld_sha256": "f" * 64,
     }
     attribution = {
         "qxq_cell": {
@@ -2154,12 +2195,15 @@ def selftest() -> int:
             "routing_trace_sha256": trace,
             "routing_trace_manifest": "routing-manifest.json",
             "routing_mode": "teacher_ids_student_weights",
-            "protocol_version": 3,
+            "protocol_version": 4,
             "routing_trace_protocol_version": 2,
             "candidate_weights_unchanged": True,
             "backend_evidence": {
                 "replay_supported": True,
                 "backend": "selftest",
+                "certified_for_exact_repeat": True,
+                "batch_invariant": True,
+                "per_layer_consistent": True,
             },
             "natural_control_parity": control,
         },
@@ -2178,26 +2222,18 @@ def selftest() -> int:
     control["position_absolute_tolerance"] = 2e-5
     assert law_14_component_attribution(campaign).status == "fail"
     control["position_absolute_tolerance"] = 1e-5
-    control.update(
-        {
-            "natural_repeat_max_absolute_position_delta": 0.1,
-            "natural_repeat_mean_absolute_position_delta": 0.01,
-            "control_repeat_max_absolute_position_delta": 0.08,
-            "control_repeat_mean_absolute_position_delta": 0.008,
-            "max_absolute_position_delta": 0.15,
-            "absolute_mean_delta": 0.015,
-            "position_absolute_tolerance": 0.2,
-            "mean_absolute_tolerance": 0.02,
-            "deterministic": False,
-        }
-    )
-    assert law_14_component_attribution(campaign).status == "pass"
-    control["max_absolute_position_delta"] = 0.21
+    control["max_absolute_position_delta"] = 1e-4
     assert law_14_component_attribution(campaign).status == "fail"
-    control["max_absolute_position_delta"] = 0.15
+    control["max_absolute_position_delta"] = 0.0
+    control["bxq_kld_sha256"] = "short"
+    assert law_14_component_attribution(campaign).status == "fail"
+    control["bxq_kld_sha256"] = "e" * 64
     attribution["bxq_cell"]["natural_control_parity"]["passed"] = False
     assert law_14_component_attribution(campaign).status == "fail"
     attribution["bxq_cell"]["natural_control_parity"]["passed"] = True
+    attribution["bxq_cell"]["backend_evidence"]["batch_invariant"] = False
+    assert law_14_component_attribution(campaign).status == "fail"
+    attribution["bxq_cell"]["backend_evidence"]["batch_invariant"] = True
     campaign.manifest["reference_routing"] = {}
     assert law_14_component_attribution(campaign).status == "not_applicable"
 
@@ -2216,6 +2252,7 @@ def selftest() -> int:
                 "bxq_mean_kld": 0.08,
                 "routing_intervention_delta": 0.04,
                 "routing_flip_rate": 0.1,
+                "exact_repeat": True,
             }
         ],
     }
@@ -2223,6 +2260,7 @@ def selftest() -> int:
     assert limits is not None and limits[0] < 0.08 < 0.12 < limits[1]
     card = render_card(payload)
     assert "QxQ KLD" in card and "BxQ KLD" in card
+    assert "Exact repeat" in card
     assert "qxq-vs-size.png" in card and "bxq-vs-size.png" in card
 
     laws_path = os.path.join(os.path.dirname(__file__), "LAWS.md")

@@ -1,6 +1,6 @@
 # Local Inference Lab — Distribution Fidelity Laws
 
-**Laws version:** 11
+**Laws version:** 12
 **Status:** draft, pending coordination with `local-inference-lab` on the
 publication namespace and suite format.
 
@@ -94,6 +94,15 @@ recorded. Both forced-natural controls still replay the first QxQ sample's exact
 IDs.
 The paired routed-score and BxQ protocol versions are now 3. Version-10 paired
 reports must be rescored rather than relabeled.
+
+Version 12 restores Law 14's publication requirement to exact repeated QxQ and
+BxQ. Version 11's repeatability envelope remains diagnostic evidence of kernel
+drift, but it does not authorize a drifting canonical score. Publication
+requires two natural QxQ samples, two forced-natural controls, and two BxQ
+samples to agree exactly in routes and per-position KLD. Uncertified or
+nondeterministic backends fail. Version-11 paired reports must be rescored
+rather than relabeled. The paired routed-score and BxQ protocol versions are
+now 4.
 
 These laws govern every distribution-fidelity measurement this program
 publishes. They are not guidance. The pipeline refuses to produce or upload an
@@ -440,22 +449,18 @@ layer order, and routing geometry used by both scores.
 `backend_evidence` names the active backend or kernel, and `replay_supported` is
 true only when that path injects logical teacher IDs before placement mapping and
 dispatch. If replay uses a different kernel path, the candidate is first run with
-that path and no override. The control protocol runs two deployed-natural and
-two forced-natural samples. A deterministic backend must agree within the fixed
-numerical floor. For a backend whose identical calls are not bitwise
-deterministic, the forced-natural discrepancy must remain within twice the
-larger measured natural or control repeatability span. The report stores every
-span, multiplier, and resulting bound; there is no backend-name allowlist or
-blanket tolerance. `natural_control_parity.passed` is true only when both the
-worst position and mean satisfy that recorded envelope. This prevents either
-backend nondeterminism or a backend change from being reported as a routing
-intervention. The candidate weight digest must remain unchanged and
-`candidate_weights_unchanged` must be true.
-The report also stores the natural-repeat route mismatch count, denominator,
-and flip rate. Route changes are repeatability evidence only: both control
-samples and BxQ remain bound to the first QxQ sample's exact ordered IDs.
-The envelope describes the observed two-sample span, not a confidence bound;
-comparisons inside it still require the repeat study required by Law 1.
+that path and no override. The control protocol runs two deployed-natural, two
+forced-natural, and two BxQ samples. Publication requires exact agreement:
+identical natural expert IDs across the two QxQ samples, identical per-position
+KLD across QxQ repeats, forced-natural controls, and BxQ repeats, all within
+the fixed numerical floor. Observed spans and route-flip rates are stored as a
+diagnostic addendum and never authorize a drifting canonical score. There is no
+backend-name allowlist or blanket tolerance. `natural_control_parity.passed` is
+true only when those exact-repeat conditions hold. An uncertified or
+nondeterministic backend fails. The candidate weight digest must remain unchanged
+and `candidate_weights_unchanged` must be true.
+Forced-natural controls and BxQ remain bound to the first QxQ sample's exact
+ordered IDs. QxQ always uses the model's own router.
 
 **Natural routing divergence.** The QxQ run also measures the student's natural
 expert IDs against the teacher trace. The artifact reports selection flip rate,
@@ -476,17 +481,17 @@ their own route flips, but they are never labeled BxQ or QxQ. In particular,
 teacher IDs.
 
 **Check.** For a manifest declaring experts, compliance requires both paired
-cells and all bindings above; QxQ/deployed equivalence within the measured
-repeatability envelope; a complete trace digest; protocol, backend, and passing
-natural-control evidence; the exact paired delta; and measured natural routing
-divergence. A manifest declaring no experts is
-`not_applicable`. Missing replay support, stale or unbound traces, failed natural
-control, and missing BxQ are failures. They are never converted into an override
-or a synthetic substitute.
+cells and all bindings above; exact QxQ/deployed equivalence; a complete trace
+digest; protocol, certified backend, and passing exact-repeat control evidence;
+the exact paired delta; measured natural routing divergence; and QxQ plus BxQ
+domain records. A manifest declaring no experts is
+`not_applicable`. Missing replay support, stale or unbound traces, failed exact
+repeat, an uncertified backend, and missing BxQ are failures. They are never
+converted into an override or a synthetic substitute.
 
 **Override.** Not permitted. Dense models satisfy this law as
-`not_applicable`; a routed model without supported replay and a passing
-repeatability-calibrated control does not.
+`not_applicable`; a routed model without supported replay and exact repeated
+QxQ/BxQ does not.
 
 ## Law 15 — Domain disclosure
 

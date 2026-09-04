@@ -20,6 +20,7 @@ import argparse
 import contextlib
 import gc
 import glob
+import hashlib
 import json
 import logging
 import os
@@ -76,13 +77,22 @@ def apply_deterministic_env() -> None:
 def apply_compiled_llm_kwargs(llm_kwargs: dict[str, Any]) -> None:
     """Apply best-effort compiled determinism settings (--compiled only)."""
     apply_deterministic_env()
+    os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")
+    os.environ.setdefault("VLLM_MOE_USE_DEEP_GEMM", "0")
+    os.environ.setdefault("NCCL_DETERMINISTIC", "1")
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     llm_kwargs["compilation_config"] = DETERMINISTIC_COMPILATION_CONFIG
     llm_kwargs["enable_flashinfer_autotune"] = False
 
 
 def apply_eager_llm_kwargs(llm_kwargs: dict[str, Any]) -> None:
-    """Avoid graph-level autotuning and compilation choices (default)."""
+    """Avoid graph-level autotuning and pin batch-invariant MoE execution."""
+    os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")
+    os.environ.setdefault("VLLM_MOE_USE_DEEP_GEMM", "0")
+    os.environ.setdefault("NCCL_DETERMINISTIC", "1")
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     llm_kwargs["enforce_eager"] = True
+    llm_kwargs["enable_flashinfer_autotune"] = False
 
 
 def allow_apply_model_rpc() -> None:
@@ -398,10 +408,31 @@ def _dump_positions(chunks: Any, score_from: int, path: str) -> None:
 
 ROUTING_MANIFEST = "routing-manifest.json"
 ROUTING_TRACE_PROTOCOL_VERSION = 2
-PAIRED_ROUTED_SCORE_PROTOCOL_VERSION = 3
+PAIRED_ROUTED_SCORE_PROTOCOL_VERSION = 4
+EXACT_REPEAT_PROTOCOL = "exact_repeat_certification_v1"
 CONTROL_POSITION_BASE_TOLERANCE = 1e-5
 CONTROL_MEAN_BASE_TOLERANCE = 1e-7
-CONTROL_REPEATABILITY_MULTIPLIER = 2.0
+
+
+def _kld_digest(values) -> str:
+    import numpy as np
+
+    if values is None:
+        return hashlib.sha256(b"").hexdigest()
+    packed = np.ascontiguousarray(values, dtype=np.float64)
+    return hashlib.sha256(packed.tobytes()).hexdigest()
+
+
+def _max_abs_span(left, right) -> float:
+    import numpy as np
+
+    return float(np.max(np.abs(left - right), initial=0.0))
+
+
+def _mean_abs_span(left, right) -> float:
+    import numpy as np
+
+    return float(np.mean(np.abs(left - right)))
 
 
 def _routing_filename(idx: int) -> str:
@@ -1106,6 +1137,30 @@ def calculate_kld(
                     if os.path.isfile(path):
                         os.remove(path)
                 existing = []
+        if existing and os.path.isfile(existing_manifest_path):
+            existing_manifest = read_json(existing_manifest_path)
+            current_runtime = capture_runtime_manifest()
+            captured_runtime = existing_manifest.get("runtime") or {}
+            if (
+                captured_runtime.get("vllm_commit")
+                != current_runtime.get("vllm_commit")
+                or captured_runtime.get("vllm_dirty_digest")
+                != current_runtime.get("vllm_dirty_digest")
+                or captured_runtime.get("compiled_extensions_sha256")
+                != current_runtime.get("compiled_extensions_sha256")
+            ):
+                print(
+                    "Reference capture runtime or compiled kernels changed; "
+                    "recapturing it."
+                )
+                for path in [
+                    *existing,
+                    os.path.join(ref_dir, "lm_head.safetensors"),
+                    existing_manifest_path,
+                ]:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                existing = []
         if not existing:
             if run_gate:
                 _run_determinism_gate(
@@ -1479,6 +1534,11 @@ def calculate_kld(
                         "routing_method",
                         "renormalize",
                         "scoring_func",
+                        "use_ep",
+                        "ep_size",
+                        "tp_size",
+                        "batch_invariant_supported",
+                        "certified_for_exact_repeat",
                     )
                 },
                 sort_keys=True,
@@ -1489,6 +1549,25 @@ def calculate_kld(
         print("Student MoE backend profiles:")
         for profile in sorted(backend_profiles):
             print(f"  {profile}")
+        uncertified = sorted(
+            {
+                str(layer.get("experts") or layer.get("quant_method") or "unknown")
+                for worker in moe_backends
+                for layer in worker["layers"]
+                if layer.get("certified_for_exact_repeat") is not True
+            }
+        )
+        if uncertified:
+            raise RuntimeError(
+                "QxQ/BxQ exact-repeat scoring refuses uncertified MoE "
+                f"backends: {', '.join(uncertified)}"
+            )
+        if len(backend_profiles) != 1:
+            raise RuntimeError(
+                "QxQ/BxQ exact-repeat scoring requires every MoE layer to "
+                "use the same certified backend; found "
+                f"{len(backend_profiles)} profiles"
+            )
     student_uses_v2 = bool(
         llm.llm_engine.vllm_config.use_v2_model_runner
     )
@@ -1565,6 +1644,7 @@ def calculate_kld(
     natural_repeat_chunks: list[KLDResult] = []
     control_chunks: list[KLDResult] = []
     control_repeat_chunks: list[KLDResult] = []
+    bxq_repeat_chunks: list[KLDResult] = []
     natural_repeat_route_mismatches = 0
     natural_repeat_route_values = 0
     control_temp = (
@@ -1701,6 +1781,15 @@ def calculate_kld(
                 raise RuntimeError("BxQ kld_result is None; KLD plumbing is broken")
             _assert_forced_window_routing(routing_dir, idx, out)
             bxq_chunks.append(out.kld_result)
+            with _phase(timings, "bxq_repeat_forward"):
+                bxq_repeat_out = llm.generate(
+                    [prompt],
+                    sampling_params=SamplingParams(max_tokens=1, kld_mode=True),
+                )[0]
+            if bxq_repeat_out.kld_result is None:
+                raise RuntimeError("BxQ repeat returned no KLD result")
+            _assert_forced_window_routing(routing_dir, idx, bxq_repeat_out)
+            bxq_repeat_chunks.append(bxq_repeat_out.kld_result)
 
     if dump_positions:
         _dump_positions(chunks, score_from, dump_positions)
@@ -1724,6 +1813,7 @@ def calculate_kld(
             os.path.join(reference_logits_path, "manifest.json")
         )
     report["storage"] = capture_kind
+    report["runtime_binding"] = capture_runtime_manifest()
     report["per_context"] = _per_context_summary(
         chunks, score_from, (suite_identity or {}).get("context_ids")
     )
@@ -1733,36 +1823,33 @@ def calculate_kld(
     if control_chunks:
         import numpy as np
 
-        natural_values = np.concatenate(
-            [
-                np.asarray(chunk.kld_ref_to_model[score_from:], dtype=np.float64)
-                for chunk in chunks
-            ]
+        def _row_values(rows: list[KLDResult]):
+            return np.concatenate(
+                [
+                    np.asarray(chunk.kld_ref_to_model[score_from:], dtype=np.float64)
+                    for chunk in rows
+                ]
+            )
+
+        natural_values = _row_values(chunks)
+        control_values = _row_values(control_chunks)
+        natural_repeat_values = _row_values(natural_repeat_chunks)
+        control_repeat_values = _row_values(control_repeat_chunks)
+        bxq_values = _row_values(bxq_chunks) if bxq_chunks else None
+        bxq_repeat_values = (
+            _row_values(bxq_repeat_chunks) if bxq_repeat_chunks else None
         )
-        control_values = np.concatenate(
-            [
-                np.asarray(chunk.kld_ref_to_model[score_from:], dtype=np.float64)
-                for chunk in control_chunks
-            ]
-        )
-        natural_repeat_values = np.concatenate(
-            [
-                np.asarray(chunk.kld_ref_to_model[score_from:], dtype=np.float64)
-                for chunk in natural_repeat_chunks
-            ]
-        )
-        control_repeat_values = np.concatenate(
-            [
-                np.asarray(chunk.kld_ref_to_model[score_from:], dtype=np.float64)
-                for chunk in control_repeat_chunks
-            ]
-        )
-        for name, values in (
+        named = [
             ("natural", natural_values),
             ("natural repeat", natural_repeat_values),
             ("forced control", control_values),
             ("forced control repeat", control_repeat_values),
-        ):
+        ]
+        if bxq_values is not None:
+            named.append(("bxq", bxq_values))
+        if bxq_repeat_values is not None:
+            named.append(("bxq repeat", bxq_repeat_values))
+        for name, values in named:
             if values.shape != natural_values.shape:
                 raise RuntimeError(
                     f"{name} KLD shape {values.shape} does not match "
@@ -1770,65 +1857,48 @@ def calculate_kld(
                 )
             if not np.all(np.isfinite(values)):
                 raise RuntimeError(
-                    f"non-finite KLD in {name} during repeatability control"
+                    f"non-finite KLD in {name} during exact-repeat control"
                 )
-        repeat_max_abs = float(
-            np.max(
-                np.abs(natural_values - natural_repeat_values),
-                initial=0.0,
-            )
-        )
+        repeat_max_abs = _max_abs_span(natural_values, natural_repeat_values)
         repeat_mean_delta = float(
             natural_repeat_values.mean() - natural_values.mean()
         )
-        repeat_mean_abs = float(
-            np.mean(np.abs(natural_values - natural_repeat_values))
+        repeat_mean_abs = _mean_abs_span(natural_values, natural_repeat_values)
+        control_repeat_max_abs = _max_abs_span(
+            control_values, control_repeat_values
         )
-        control_repeat_max_abs = float(
-            np.max(
-                np.abs(control_values - control_repeat_values),
-                initial=0.0,
-            )
-        )
-        control_repeat_mean_abs = float(
-            np.mean(np.abs(control_values - control_repeat_values))
+        control_repeat_mean_abs = _mean_abs_span(
+            control_values, control_repeat_values
         )
         control_max_abs = max(
-            float(
-                np.max(
-                    np.abs(natural_values - control_values),
-                    initial=0.0,
-                )
-            ),
-            float(
-                np.max(
-                    np.abs(natural_values - control_repeat_values),
-                    initial=0.0,
-                )
-            ),
+            _max_abs_span(natural_values, control_values),
+            _max_abs_span(natural_values, control_repeat_values),
         )
         control_mean_delta = max(
             abs(float(control_values.mean() - natural_values.mean())),
             abs(float(control_repeat_values.mean() - natural_values.mean())),
         )
-        position_tolerance = max(
-            CONTROL_POSITION_BASE_TOLERANCE,
-            CONTROL_REPEATABILITY_MULTIPLIER
-            * max(repeat_max_abs, control_repeat_max_abs),
-        )
-        mean_tolerance = max(
-            CONTROL_MEAN_BASE_TOLERANCE,
-            CONTROL_REPEATABILITY_MULTIPLIER
-            * max(repeat_mean_abs, control_repeat_mean_abs),
+        if bxq_values is None or bxq_repeat_values is None:
+            raise RuntimeError("exact-repeat certification requires two BxQ samples")
+        bxq_repeat_max_abs = _max_abs_span(bxq_values, bxq_repeat_values)
+        bxq_repeat_mean_abs = _mean_abs_span(bxq_values, bxq_repeat_values)
+        exact = (
+            natural_repeat_route_mismatches == 0
+            and repeat_max_abs <= CONTROL_POSITION_BASE_TOLERANCE
+            and repeat_mean_abs <= CONTROL_MEAN_BASE_TOLERANCE
+            and control_repeat_max_abs <= CONTROL_POSITION_BASE_TOLERANCE
+            and control_repeat_mean_abs <= CONTROL_MEAN_BASE_TOLERANCE
+            and control_max_abs <= CONTROL_POSITION_BASE_TOLERANCE
+            and control_mean_delta <= CONTROL_MEAN_BASE_TOLERANCE
+            and bxq_repeat_max_abs <= CONTROL_POSITION_BASE_TOLERANCE
+            and bxq_repeat_mean_abs <= CONTROL_MEAN_BASE_TOLERANCE
         )
         control_evidence = {
-            "protocol": "natural_repeatability_envelope_v1",
-            "passed": (
-                control_max_abs <= position_tolerance
-                and control_mean_delta <= mean_tolerance
-            ),
+            "protocol": EXACT_REPEAT_PROTOCOL,
+            "passed": exact,
             "natural_samples": 2,
             "control_samples": 2,
+            "bxq_samples": 2,
             "natural_repeat_route_mismatches": (
                 natural_repeat_route_mismatches
             ),
@@ -1846,24 +1916,41 @@ def calculate_kld(
             "control_repeat_mean_absolute_position_delta": (
                 control_repeat_mean_abs
             ),
+            "bxq_repeat_max_absolute_position_delta": bxq_repeat_max_abs,
+            "bxq_repeat_mean_absolute_position_delta": bxq_repeat_mean_abs,
             "max_absolute_position_delta": control_max_abs,
             "absolute_mean_delta": control_mean_delta,
-            "position_absolute_tolerance": position_tolerance,
-            "mean_absolute_tolerance": mean_tolerance,
-            "repeatability_multiplier": CONTROL_REPEATABILITY_MULTIPLIER,
-            "deterministic": (
-                repeat_max_abs <= CONTROL_POSITION_BASE_TOLERANCE
-                and repeat_mean_abs <= CONTROL_MEAN_BASE_TOLERANCE
-                and control_repeat_max_abs <= CONTROL_POSITION_BASE_TOLERANCE
-                and control_repeat_mean_abs <= CONTROL_MEAN_BASE_TOLERANCE
-            ),
+            "position_absolute_tolerance": CONTROL_POSITION_BASE_TOLERANCE,
+            "mean_absolute_tolerance": CONTROL_MEAN_BASE_TOLERANCE,
+            "deterministic": exact,
+            "natural_kld_sha256": _kld_digest(natural_values),
+            "natural_repeat_kld_sha256": _kld_digest(natural_repeat_values),
+            "control_kld_sha256": _kld_digest(control_values),
+            "control_repeat_kld_sha256": _kld_digest(control_repeat_values),
+            "bxq_kld_sha256": _kld_digest(bxq_values),
+            "bxq_repeat_kld_sha256": _kld_digest(bxq_repeat_values),
+        }
+        report["kld_evidence"] = {
+            "natural_kld_sha256": control_evidence["natural_kld_sha256"],
+            "natural_repeat_kld_sha256": control_evidence[
+                "natural_repeat_kld_sha256"
+            ],
+            "control_kld_sha256": control_evidence["control_kld_sha256"],
+            "control_repeat_kld_sha256": control_evidence[
+                "control_repeat_kld_sha256"
+            ],
+            "bxq_kld_sha256": control_evidence["bxq_kld_sha256"],
+            "bxq_repeat_kld_sha256": control_evidence["bxq_repeat_kld_sha256"],
         }
         if not control_evidence["passed"]:
             raise RuntimeError(
-                "QxQ forced-route control exceeds deployed natural "
-                f"repeatability: max position delta {control_max_abs:.3e} "
-                f"(limit {position_tolerance:.3e}), mean delta "
-                f"{control_mean_delta:.3e} (limit {mean_tolerance:.3e})"
+                "QxQ/BxQ exact-repeat certification failed: "
+                f"natural route flips="
+                f"{control_evidence['natural_repeat_route_flip_rate']:.3%}, "
+                f"natural max={repeat_max_abs:.3e}, "
+                f"control max={control_max_abs:.3e}, "
+                f"bxq max={bxq_repeat_max_abs:.3e} "
+                f"(limit {CONTROL_POSITION_BASE_TOLERANCE:.3e})"
             )
     if bxq_chunks:
         bxq = summarize_kld_rows(
@@ -1880,6 +1967,14 @@ def calculate_kld(
                 for layer in worker.get("layers", [])
             }
         )
+        kernel_names = sorted(
+            {
+                layer.get("kernel") or "unknown"
+                for worker in moe_backends
+                for layer in worker.get("layers", [])
+            }
+        )
+        per_layer_consistent = len(backend_profiles) == 1
         binding = {
             "protocol_version": PAIRED_ROUTED_SCORE_PROTOCOL_VERSION,
             "routing_trace_protocol_version": ROUTING_TRACE_PROTOCOL_VERSION,
@@ -1892,7 +1987,17 @@ def calculate_kld(
             "backend_identity": moe_backends,
             "backend_evidence": {
                 "backend": ", ".join(backend_names),
+                "kernel": ", ".join(kernel_names),
                 "replay_supported": True,
+                "certified_for_exact_repeat": True,
+                "batch_invariant": os.environ.get("VLLM_BATCH_INVARIANT") == "1",
+                "deep_gemm_disabled": os.environ.get("VLLM_MOE_USE_DEEP_GEMM")
+                == "0",
+                "flashinfer_autotune": False,
+                "nccl_deterministic": os.environ.get("NCCL_DETERMINISTIC") == "1",
+                "cublas_workspace": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+                "per_layer_consistent": per_layer_consistent,
+                "layer_profiles": sorted(backend_profiles),
                 "workers": len(moe_backends),
             },
             "natural_control_parity": control_evidence,
@@ -2256,9 +2361,9 @@ def _print_kld_report(report: dict[str, Any]) -> None:
         print(
             "  Natural control: "
             + (
-                "deterministic"
+                "exact-repeat certified"
                 if control["deterministic"]
-                else "repeatability-calibrated"
+                else "diagnostic only"
             )
             + f", max={control['max_absolute_position_delta']:.3e}/"
             f"{control['position_absolute_tolerance']:.3e}, "
@@ -2667,6 +2772,7 @@ def main():
             "qxq_control_forward",
             "qxq_control_repeat_forward",
             "bxq_score_forward",
+            "bxq_repeat_forward",
             "decompose_head",
         ):
             if name in timings:
@@ -2680,6 +2786,7 @@ def main():
             + timings.get("qxq_control_forward", 0.0)
             + timings.get("qxq_control_repeat_forward", 0.0)
             + timings.get("bxq_score_forward", 0.0)
+            + timings.get("bxq_repeat_forward", 0.0)
         ) / max(report["num_rows"], 1)
         print(f"    weight loading (fixed, independent of rows): {fixed:.2f}")
         print(f"    marginal cost per row: {per_row:.2f}")
@@ -2692,6 +2799,7 @@ def main():
             "qxq_control_forward",
             "qxq_control_repeat_forward",
             "bxq_score_forward",
+            "bxq_repeat_forward",
         )
     )
     if scoring_time:

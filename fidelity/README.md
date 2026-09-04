@@ -402,14 +402,24 @@ attribution.
 The pair is tightly controlled. Both runs use the same tokens, reference capture,
 candidate weight digest, and report protocol. BxQ binds the exact teacher-ID trace.
 If replay needs another backend path, that path first runs without forcing and
-must reproduce deployed QxQ within a measured repeatability envelope. The
-protocol runs two natural and two forced-natural samples: deterministic kernels
-retain the fixed exactness floor, while nondeterministic kernels receive only
-twice their larger observed repeatability span. Every span and derived bound is
-published and compliance-checked. Natural route flips between repeats are
-recorded, while both forced controls remain bound to the first natural sample's
-exact IDs. Unsupported replay or a failed natural control fails compliance; it
-is never replaced by a QDQ estimate.
+must reproduce deployed QxQ exactly. The protocol runs two natural, two
+forced-natural, and two BxQ samples. Publication requires identical natural
+routes and per-position KLD within the fixed exactness floor. Observed spans
+are diagnostic only and never authorize a drifting score. An uncertified or
+nondeterministic backend fails compliance; it is never replaced by a QDQ
+estimate.
+
+Certified backends are those whose expert implementation supports batch
+invariance and is not expert-parallel: batch-invariant Triton, CUTLASS NVFP4,
+Humming, and patched Marlin after the canonical-order and full-K ports.
+DeepGEMM, FlashInfer, AITER, XPU, CPU, and EP paths remain uncertified until an
+exact probe passes. Scoring sets `VLLM_BATCH_INVARIANT=1`, disables DeepGEMM
+and FlashInfer autotune, and pins NCCL/cuBLAS determinism flags.
+
+Publication also binds the vLLM commit, dirty digest, compiled extension
+hashes, FlashInfer version, GPU identity, and per-position QxQ/BxQ KLD
+SHA-256s. Domain tables publish QxQ (`deployed`) and BxQ (`bxq`) strata side
+by side. Cache reuse, assembly, and publication refuse a changed binding.
 
 ### Natural divergence and forced routing are different
 

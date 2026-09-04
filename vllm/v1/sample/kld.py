@@ -12,7 +12,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 from collections.abc import Iterable, Sequence
+from pathlib import Path
 from typing import Any, NamedTuple
 
 import torch
@@ -526,6 +528,18 @@ def capture_runtime_manifest() -> dict[str, Any]:
     info: dict[str, Any] = {
         "python": platform.python_version(),
         "platform": platform.platform(),
+        "vllm_commit": os.environ.get("KLD_REPO_COMMIT") or _git_commit(),
+        "vllm_tree_dirty": os.environ.get("KLD_REPO_DIRTY") == "1"
+        or _git_dirty(),
+        "vllm_dirty_digest": os.environ.get("KLD_REPO_DIRTY_DIGEST")
+        or _git_dirty_digest(),
+        "determinism": {
+            "VLLM_BATCH_INVARIANT": os.environ.get("VLLM_BATCH_INVARIANT"),
+            "VLLM_MOE_USE_DEEP_GEMM": os.environ.get("VLLM_MOE_USE_DEEP_GEMM"),
+            "NCCL_DETERMINISTIC": os.environ.get("NCCL_DETERMINISTIC"),
+            "CUBLAS_WORKSPACE_CONFIG": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+        },
+        "compiled_extensions": _compiled_extension_hashes(),
     }
     info["torch"] = torch.__version__
     if torch.cuda.is_available():
@@ -533,6 +547,10 @@ def capture_runtime_manifest() -> dict[str, Any]:
         info["gpu_names"] = [
             torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())
         ]
+        try:
+            info["nccl"] = ".".join(str(v) for v in torch.cuda.nccl.version())
+        except Exception:
+            info["nccl"] = None
         try:
             import pynvml
         except ImportError:
@@ -547,7 +565,79 @@ def capture_runtime_manifest() -> dict[str, Any]:
                 pynvml.nvmlShutdown()
             except pynvml.NVMLError:
                 info["driver"] = None
+    try:
+        import flashinfer
+
+        info["flashinfer"] = getattr(flashinfer, "__version__", str(flashinfer))
+    except Exception:
+        info["flashinfer"] = None
+    info["compiled_extensions_sha256"] = _digest_mapping(
+        info["compiled_extensions"]
+    )
     return info
+
+
+def _git_commit() -> str | None:
+    probe = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        cwd=os.environ.get("KLD_REPO_ROOT") or None,
+    )
+    return probe.stdout.strip() or None if probe.returncode == 0 else None
+
+
+def _git_dirty() -> bool:
+    probe = subprocess.run(
+        ["git", "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        cwd=os.environ.get("KLD_REPO_ROOT") or None,
+    )
+    return probe.returncode == 0 and bool(probe.stdout.strip())
+
+
+def _git_dirty_digest() -> str | None:
+    probe = subprocess.run(
+        ["git", "diff", "HEAD"],
+        capture_output=True,
+        cwd=os.environ.get("KLD_REPO_ROOT") or None,
+    )
+    if probe.returncode != 0:
+        return None
+    return hashlib.sha256(probe.stdout).hexdigest()
+
+
+def _compiled_extension_hashes() -> dict[str, str]:
+    try:
+        import vllm
+    except Exception:
+        return {}
+    root = Path(vllm.__file__).resolve().parent
+    hashes: dict[str, str] = {}
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        name = path.name
+        if not (
+            name.startswith("_C")
+            or name.startswith("_moe_C")
+            or "marlin" in name.lower()
+        ):
+            continue
+        if path.suffix not in {".so", ".pyd", ".dll"}:
+            continue
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        hashes[str(path.relative_to(root)).replace("\\", "/")] = digest.hexdigest()
+    return hashes
+
+
+def _digest_mapping(values: dict[str, str]) -> str:
+    payload = json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()
 
 
 def load_lm_head_weight(
@@ -964,6 +1054,15 @@ def inspect_model_moe_backends(model: torch.nn.Module) -> dict[str, Any]:
             "routing_method_type",
             getattr(experts, "routing_method", None),
         )
+        supports_batch_invariant = False
+        if experts is not None:
+            checker = getattr(type(experts), "_supports_batch_invariance", None)
+            if callable(checker):
+                supports_batch_invariant = bool(checker())
+        expert_name = type(experts).__name__ if experts is not None else None
+        moe_config = getattr(module, "moe_config", None)
+        use_ep = bool(getattr(moe_config, "use_ep", False))
+        certified = supports_batch_invariant and not use_ep
         layers.append(
             {
                 "name": name,
@@ -971,11 +1070,18 @@ def inspect_model_moe_backends(model: torch.nn.Module) -> dict[str, Any]:
                 "router": type(module.router).__name__,
                 "quant_method": type(quant_method).__name__,
                 "kernel": type(kernel).__name__ if kernel is not None else None,
-                "experts": type(experts).__name__ if experts is not None else None,
+                "experts": expert_name,
                 "monolithic": bool(quant_method.is_monolithic),
-                "routing_method": getattr(routing_method, "name", str(routing_method)),
+                "routing_method": getattr(
+                    routing_method, "name", str(routing_method)
+                ),
                 "renormalize": getattr(module.router, "renormalize", None),
                 "scoring_func": getattr(module.router, "scoring_func", None),
+                "use_ep": use_ep,
+                "ep_size": getattr(moe_config, "ep_size", None),
+                "tp_size": getattr(moe_config, "tp_size", None),
+                "batch_invariant_supported": supports_batch_invariant,
+                "certified_for_exact_repeat": certified,
             }
         )
     return {"layers": layers}

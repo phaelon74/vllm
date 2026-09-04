@@ -320,9 +320,10 @@ def render(report: dict[str, Any], label: str) -> str:
         f"{run['top1_agreement'] * 100:.4f}%.",
         "",
         "`x run` is the domain's mean divided by the run's mean, so 1.00 is a "
-        "domain that degrades exactly as much as the model as a whole. `Median "
-        "ctx` and `p90 ctx` are the spread of per-context means within the "
-        "domain.",
+        "domain that degrades exactly as much as the model as a whole. The "
+        "`deployed` cell is QxQ; `bxq` is the teacher-ID counterfactual on the "
+        "same student weights. `Median ctx` and `p90 ctx` are the spread of "
+        "per-context means within the domain.",
         "",
     ]
     lines += _rank_table(report["groups"]["stratum"], primary, "Ranked by domain")

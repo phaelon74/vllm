@@ -273,6 +273,25 @@ def test_forced_topk_uses_student_weights(scoring_func, renormalize):
     torch.testing.assert_close(weights, expected)
 
 
+def test_forced_routing_weights_are_repeatable():
+    logits = torch.tensor([[3.0, 1.0, -1.0, 0.0], [0.2, 4.0, 1.5, -2.0]])
+    forced_ids = torch.tensor([[2, 0], [1, 3]], dtype=torch.int32)
+    first = compute_forced_routing_weights(
+        logits,
+        forced_ids,
+        scoring_func="softmax",
+        renormalize=True,
+    )
+    second = compute_forced_routing_weights(
+        logits,
+        forced_ids,
+        scoring_func="softmax",
+        renormalize=True,
+    )
+    assert torch.equal(first, second)
+    assert not torch.equal(forced_ids, torch.topk(logits, k=2).indices.to(torch.int32))
+
+
 def test_forced_topk_reuses_native_weights_for_matching_routes():
     router = FusedTopKRouter(top_k=2, global_num_experts=4)
     forced_ids = torch.tensor([[2, 0]], dtype=torch.int32)

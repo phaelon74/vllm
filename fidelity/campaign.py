@@ -67,7 +67,7 @@ FP32_COPIES = 4
 # Peak vs live tensors; expandable_segments keeps this from growing further.
 ALLOCATOR_SLACK = 1.25
 TP_CANDIDATES = (1, 2, 4, 8)
-PAIRED_ROUTED_SCORE_PROTOCOL_VERSION = 3
+PAIRED_ROUTED_SCORE_PROTOCOL_VERSION = 4
 ROUTING_TRACE_PROTOCOL_VERSION = 2
 _REFERENCE_WEIGHT_DIGESTS: dict[str, str] = {}
 
@@ -87,11 +87,12 @@ class CandidateRefused(CampaignError):
 def _repeatability_control_is_current(control: Any) -> bool:
     if (
         not isinstance(control, dict)
-        or control.get("protocol") != "natural_repeatability_envelope_v1"
+        or control.get("protocol") != "exact_repeat_certification_v1"
         or control.get("passed") is not True
+        or control.get("deterministic") is not True
         or control.get("natural_samples") != 2
         or control.get("control_samples") != 2
-        or control.get("repeatability_multiplier") != 2.0
+        or control.get("bxq_samples") != 2
     ):
         return False
     route_mismatches = control.get("natural_repeat_route_mismatches")
@@ -103,17 +104,11 @@ def _repeatability_control_is_current(control: Any) -> bool:
         or not isinstance(route_values, int)
         or isinstance(route_values, bool)
         or route_values <= 0
-        or route_mismatches < 0
-        or route_mismatches > route_values
+        or route_mismatches != 0
         or not isinstance(route_flip_rate, (int, float))
         or isinstance(route_flip_rate, bool)
         or not math.isfinite(float(route_flip_rate))
-        or not math.isclose(
-            float(route_flip_rate),
-            route_mismatches / route_values,
-            rel_tol=1e-12,
-            abs_tol=1e-15,
-        )
+        or float(route_flip_rate) != 0.0
     ):
         return False
     fields = (
@@ -122,6 +117,8 @@ def _repeatability_control_is_current(control: Any) -> bool:
         "natural_repeat_mean_absolute_position_delta",
         "control_repeat_max_absolute_position_delta",
         "control_repeat_mean_absolute_position_delta",
+        "bxq_repeat_max_absolute_position_delta",
+        "bxq_repeat_mean_absolute_position_delta",
         "max_absolute_position_delta",
         "absolute_mean_delta",
         "position_absolute_tolerance",
@@ -134,47 +131,50 @@ def _repeatability_control_is_current(control: Any) -> bool:
         for field in fields
     ):
         return False
-    position_tolerance = max(
-        1e-5,
-        2.0
-        * max(
-            float(control["natural_repeat_max_absolute_position_delta"]),
-            float(control["control_repeat_max_absolute_position_delta"]),
-        ),
+    if (
+        not math.isclose(
+            float(control["position_absolute_tolerance"]),
+            1e-5,
+            rel_tol=0.0,
+            abs_tol=1e-18,
+        )
+        or not math.isclose(
+            float(control["mean_absolute_tolerance"]),
+            1e-7,
+            rel_tol=0.0,
+            abs_tol=1e-18,
+        )
+    ):
+        return False
+    digest_fields = (
+        "natural_kld_sha256",
+        "natural_repeat_kld_sha256",
+        "control_kld_sha256",
+        "control_repeat_kld_sha256",
+        "bxq_kld_sha256",
+        "bxq_repeat_kld_sha256",
     )
-    mean_tolerance = max(
-        1e-7,
-        2.0
-        * max(
-            float(control["natural_repeat_mean_absolute_position_delta"]),
-            float(control["control_repeat_mean_absolute_position_delta"]),
-        ),
+    if any(
+        not isinstance(control.get(field), str)
+        or len(control[field]) != 64
+        for field in digest_fields
+    ):
+        return False
+    exact_fields = (
+        "natural_repeat_max_absolute_position_delta",
+        "control_repeat_max_absolute_position_delta",
+        "bxq_repeat_max_absolute_position_delta",
+        "max_absolute_position_delta",
     )
-    deterministic = (
-        float(control["natural_repeat_max_absolute_position_delta"]) <= 1e-5
-        and float(control["natural_repeat_mean_absolute_position_delta"])
-        <= 1e-7
-        and float(control["control_repeat_max_absolute_position_delta"])
-        <= 1e-5
-        and float(control["control_repeat_mean_absolute_position_delta"])
-        <= 1e-7
+    mean_fields = (
+        "natural_repeat_mean_absolute_position_delta",
+        "control_repeat_mean_absolute_position_delta",
+        "bxq_repeat_mean_absolute_position_delta",
+        "absolute_mean_delta",
     )
     return (
-        control.get("deterministic") is deterministic
-        and math.isclose(
-            float(control["position_absolute_tolerance"]),
-            position_tolerance,
-            rel_tol=1e-12,
-            abs_tol=1e-15,
-        )
-        and math.isclose(
-            float(control["mean_absolute_tolerance"]),
-            mean_tolerance,
-            rel_tol=1e-12,
-            abs_tol=1e-15,
-        )
-        and float(control["max_absolute_position_delta"]) <= position_tolerance
-        and float(control["absolute_mean_delta"]) <= mean_tolerance
+        all(float(control[field]) <= 1e-5 for field in exact_fields)
+        and all(float(control[field]) <= 1e-7 for field in mean_fields)
     )
 
 
@@ -271,6 +271,9 @@ def _paired_report_is_current(report: dict[str, Any]) -> bool:
         and _repeatability_control_is_current(control)
         and isinstance(backend, dict)
         and backend.get("replay_supported") is True
+        and backend.get("certified_for_exact_repeat") is True
+        and backend.get("batch_invariant") is True
+        and backend.get("per_layer_consistent") is True
         and isinstance(digest, str)
         and len(digest) == 64
         and bxq.get("reference_weights_sha256")
@@ -912,6 +915,33 @@ def _repo_head() -> str | None:
     return probe.stdout.strip() or None if probe.returncode == 0 else None
 
 
+def _repo_dirty_digest() -> str | None:
+    probe = subprocess.run(
+        ["git", "-C", REPO_ROOT, "diff", "HEAD"],
+        capture_output=True,
+    )
+    if probe.returncode != 0:
+        return None
+    return hashlib.sha256(probe.stdout).hexdigest()
+
+
+def _repo_env() -> dict[str, str]:
+    """Pin the tree identity the scorer records on runtime_binding."""
+    head = _repo_head() or ""
+    dirty = _repo_dirty_digest() or ""
+    porcelain = subprocess.run(
+        ["git", "-C", REPO_ROOT, "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+    )
+    return {
+        "KLD_REPO_ROOT": REPO_ROOT,
+        "KLD_REPO_COMMIT": head,
+        "KLD_REPO_DIRTY": "1" if porcelain.stdout.strip() else "0",
+        "KLD_REPO_DIRTY_DIGEST": dirty,
+    }
+
+
 def capture_environment(config: Config, python: str) -> str:
     """Capture the environment report, refreshing it when the tree moved (Law 6).
 
@@ -924,13 +954,24 @@ def capture_environment(config: Config, python: str) -> str:
     runtime_path = os.path.join(env_dir, "runtime.json")
     if os.path.isfile(runtime_path):
         head = _repo_head()
+        dirty = _repo_dirty_digest()
         recorded = None
+        recorded_dirty = None
         try:
             with open(runtime_path, encoding="utf-8") as handle:
-                recorded = json.load(handle).get("vllm_commit")
+                runtime = json.load(handle)
+            recorded = runtime.get("vllm_commit")
+            recorded_dirty = runtime.get("vllm_dirty_digest")
         except (OSError, json.JSONDecodeError):
             pass
-        if head and recorded and head == recorded:
+        if (
+            head
+            and recorded
+            and head == recorded
+            and dirty
+            and recorded_dirty
+            and dirty == recorded_dirty
+        ):
             print(f"=== environment already captured at {head[:12]}")
             return env_dir
         print(
@@ -1155,7 +1196,25 @@ def score_one(
             or cached.get("reference_weights_sha256")
             == reference_weights_identity(teacher)
         )
-        if routing_current and reference_current:
+        cached_runtime = cached.get("runtime_binding") or {}
+        current_runtime: dict[str, Any] | None = None
+        try:
+            from vllm.v1.sample.kld import capture_runtime_manifest
+
+            current_runtime = capture_runtime_manifest()
+        except Exception:
+            current_runtime = None
+        runtime_current = (
+            isinstance(cached_runtime, dict)
+            and current_runtime is not None
+            and cached_runtime.get("vllm_commit")
+            == current_runtime.get("vllm_commit")
+            and cached_runtime.get("vllm_dirty_digest")
+            == current_runtime.get("vllm_dirty_digest")
+            and cached_runtime.get("compiled_extensions_sha256")
+            == current_runtime.get("compiled_extensions_sha256")
+        )
+        if routing_current and reference_current and runtime_current:
             print(f"=== {tag} already scored")
             bind_weights(report, student, observed=False)
             return report, capture
@@ -1219,6 +1278,7 @@ def score_one(
         "PYTORCH_CUDA_ALLOC_CONF": os.environ.get(
             "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
         ),
+        **_repo_env(),
     })
     if rc != 0:
         raise CampaignError(f"scoring failed for {tag}; see {log}")
@@ -2092,9 +2152,9 @@ def cmd_smoke(
             print(
                 "  control: "
                 + (
-                    "deterministic exactness floor"
+                    "exact-repeat certified"
                     if control.get("deterministic") is True
-                    else "measured repeatability envelope"
+                    else "diagnostic only"
                 )
                 + f", max={control['max_absolute_position_delta']:.3e}/"
                 f"{control['position_absolute_tolerance']:.3e}, "
@@ -2355,6 +2415,28 @@ def _publish_attribution(src: str, cand_dir: str) -> None:
     if isinstance(deployed, dict) and deployed.get("report"):
         deployed["report"] = "report.json"
 
+    bxq = attribution.get("bxq_cell")
+    if isinstance(bxq, dict) and bxq.get("per_context"):
+        os.makedirs(os.path.join(cand_dir, "attribution"), exist_ok=True)
+        with open(
+            os.path.join(cand_dir, "attribution", "bxq.json"),
+            "w",
+            encoding="utf-8",
+            newline="\n",
+        ) as handle:
+            json.dump(
+                {
+                    "cell": "bxq",
+                    "routing_mode": bxq.get("routing_mode"),
+                    "mean_kld": bxq.get("mean_kld"),
+                    "per_context": bxq["per_context"],
+                },
+                handle,
+                indent=2,
+                sort_keys=True,
+            )
+            handle.write("\n")
+
     with open(
         os.path.join(cand_dir, "attribution.json"), "w",
         encoding="utf-8", newline="\n",
@@ -2385,6 +2467,9 @@ def _strata_cells(cand_dir: str) -> list[str]:
     own absence is reported by Law 15 instead of being hidden here.
     """
     cells = [f"deployed={os.path.join(cand_dir, 'report.json')}"]
+    bxq_path = os.path.join(cand_dir, "attribution", "bxq.json")
+    if _has_per_context(bxq_path):
+        cells.append(f"bxq={bxq_path}")
     path = os.path.join(cand_dir, "attribution.json")
     if not os.path.isfile(path):
         return cells
@@ -3007,10 +3092,11 @@ def selftest() -> int:
                 "routing_trace_manifest": trace.name,
                 "reference_weights_sha256": "f" * 64,
                 "natural_control_parity": {
-                    "protocol": "natural_repeatability_envelope_v1",
+                    "protocol": "exact_repeat_certification_v1",
                     "passed": True,
                     "natural_samples": 2,
                     "control_samples": 2,
+                    "bxq_samples": 2,
                     "natural_repeat_route_mismatches": 0,
                     "natural_repeat_route_values": 100,
                     "natural_repeat_route_flip_rate": 0.0,
@@ -3019,14 +3105,26 @@ def selftest() -> int:
                     "natural_repeat_mean_absolute_position_delta": 0.0,
                     "control_repeat_max_absolute_position_delta": 0.0,
                     "control_repeat_mean_absolute_position_delta": 0.0,
+                    "bxq_repeat_max_absolute_position_delta": 0.0,
+                    "bxq_repeat_mean_absolute_position_delta": 0.0,
                     "max_absolute_position_delta": 0.0,
                     "absolute_mean_delta": 0.0,
                     "position_absolute_tolerance": 1e-5,
                     "mean_absolute_tolerance": 1e-7,
-                    "repeatability_multiplier": 2.0,
                     "deterministic": True,
+                    "natural_kld_sha256": "a" * 64,
+                    "natural_repeat_kld_sha256": "b" * 64,
+                    "control_kld_sha256": "c" * 64,
+                    "control_repeat_kld_sha256": "d" * 64,
+                    "bxq_kld_sha256": "e" * 64,
+                    "bxq_repeat_kld_sha256": "f" * 64,
                 },
-                "backend_evidence": {"replay_supported": True},
+                "backend_evidence": {
+                    "replay_supported": True,
+                    "certified_for_exact_repeat": True,
+                    "batch_invariant": True,
+                    "per_layer_consistent": True,
+                },
                 "candidate_weights_sha256": digest,
                 "candidate_weights_unchanged": True,
             },
@@ -3297,6 +3395,25 @@ def selftest() -> int:
     )
     assert digested.endswith("Ref-qdq-experts-int4_g128_asym-mabc")
 
+    with tempfile.TemporaryDirectory() as tmp:
+        report = os.path.join(tmp, "report.json")
+        bxq = os.path.join(tmp, "attribution", "bxq.json")
+        os.makedirs(os.path.dirname(bxq), exist_ok=True)
+        with open(report, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump({"per_context": [{"context_id": 0}]}, handle)
+        with open(bxq, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump({"per_context": [{"context_id": 0}]}, handle)
+        with open(
+            os.path.join(tmp, "attribution.json"),
+            "w",
+            encoding="utf-8",
+            newline="\n",
+        ) as handle:
+            json.dump({}, handle)
+        cells = _strata_cells(tmp)
+        assert cells[0].endswith("report.json")
+        assert any(cell.startswith("bxq=") for cell in cells)
+
     print("selftest passed")
     return 0
 
@@ -3390,12 +3507,19 @@ def _plot_family(
             "routing_flip_rate": (report.get("routing") or {}).get(
                 "selection_flip_rate"
             ),
+            "exact_repeat": (
+                (
+                    (report.get("bxq_cell") or {}).get("natural_control_parity")
+                    or {}
+                ).get("deterministic")
+                is True
+            ),
             "bxq_omission_reason": (
                 None
                 if report.get("bxq_cell")
                 else "dense reference (QxQ only)"
                 if not qdq_routing(model.reference_path)
-                else "no valid protocol-v1 paired BxQ report"
+                else "no valid protocol-v4 paired BxQ report"
             ),
         })
     if not quants:

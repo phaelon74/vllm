@@ -89,8 +89,9 @@ log_cmd pip-freeze "$PY" -m pip freeze
 KLD_REPO_COMMIT=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null)
 KLD_REPO_DIRTY=0
 [[ -n $(git -C "$REPO_ROOT" status --porcelain 2>/dev/null) ]] && KLD_REPO_DIRTY=1
+KLD_REPO_DIRTY_DIGEST=$(git -C "$REPO_ROOT" diff HEAD 2>/dev/null | sha256sum | awk '{print $1}')
 KLD_REPO_ROOT=$REPO_ROOT
-export KLD_REPO_COMMIT KLD_REPO_DIRTY KLD_REPO_ROOT
+export KLD_REPO_COMMIT KLD_REPO_DIRTY KLD_REPO_DIRTY_DIGEST KLD_REPO_ROOT
 "$PY" - >"$OUT_DIR/runtime.json" 2>"$OUT_DIR/runtime.err" <<'PYEOF'
 import json
 import os
@@ -137,6 +138,7 @@ info = {
     "hostname": platform.node(),
     "vllm_commit": os.environ.get("KLD_REPO_COMMIT") or None,
     "vllm_tree_dirty": os.environ.get("KLD_REPO_DIRTY") == "1",
+    "vllm_dirty_digest": os.environ.get("KLD_REPO_DIRTY_DIGEST") or None,
     "env": captured_env,
     "env_redacted": redacted_names,
     "env_redaction_policy": (
@@ -186,6 +188,16 @@ try:
     info["capture_runtime_manifest"] = capture_runtime_manifest()
 except Exception as exc:
     info["capture_runtime_manifest_error"] = repr(exc)
+
+manifest = info.get("capture_runtime_manifest") or {}
+if isinstance(manifest, dict):
+    info.setdefault("vllm_dirty_digest", manifest.get("vllm_dirty_digest"))
+    info["compiled_extensions"] = manifest.get("compiled_extensions") or {}
+    info["compiled_extensions_sha256"] = manifest.get(
+        "compiled_extensions_sha256"
+    )
+    info["flashinfer"] = manifest.get("flashinfer")
+    info["determinism"] = manifest.get("determinism")
 
 json.dump(info, sys.stdout, indent=2, default=str)
 sys.stdout.write("\n")

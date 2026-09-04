@@ -466,11 +466,19 @@ def build_index(
             mean_text = "n/a" if mean is None else f"{float(mean):.8f}"
             bxq = (report.get("bxq_cell") or {}).get("mean_kld")
             delta = report.get("routing_intervention_delta")
+            control = (report.get("bxq_cell") or {}).get(
+                "natural_control_parity"
+            ) or {}
             paired = ""
             if bxq is not None:
                 paired = f", BxQ {float(bxq):.8f}"
                 if delta is not None:
                     paired += f", QxQ-BxQ {float(delta):+.8f}"
+                paired += (
+                    ", exact-repeat certified"
+                    if control.get("deterministic") is True
+                    else ", exact-repeat missing"
+                )
             who = f"{author} " if author else ""
             lines.append(
                 f"- {who}[{quant}]({rel}) — QxQ KLD {mean_text}{paired}"

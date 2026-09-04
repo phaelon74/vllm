@@ -7,6 +7,8 @@
 #include "libtorch_stable/quantization/marlin/marlin_dtypes.cuh"
 #include "core/scalar_type.hpp"
 
+// use_full_k is the batch-invariant WNA16 reduction pin from
+// vllm-project/vllm#46639. Keep global_scale_ptr as float*.
 #define MARLIN_KERNEL_PARAMS                                          \
   const int4 *__restrict__ A, const int4 *__restrict__ B,             \
       int4 *__restrict__ C, int4 *__restrict__ C_tmp,                 \
@@ -21,7 +23,7 @@
       const float *__restrict__ topk_weights_ptr, int top_k,          \
       bool mul_topk_weights, int num_groups, int prob_m, int prob_n,  \
       int prob_k, int *locks, bool has_bias, bool use_atomic_add,     \
-      bool use_fp32_reduce
+      bool use_fp32_reduce, bool use_full_k
 
 namespace MARLIN_NAMESPACE_NAME {
 template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id

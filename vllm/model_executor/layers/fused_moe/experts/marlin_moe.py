@@ -8,6 +8,7 @@ from collections.abc import Callable
 import torch
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import (
     ApplyMoEActivationConfig,
@@ -54,6 +55,61 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
+
+
+def _canonicalize_marlin_moe_token_order(
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    block_size_m: int,
+    num_valid_tokens: int,
+) -> torch.Tensor:
+    """Canonicalize routed token IDs within contiguous expert regions.
+
+    moe_align_block_size groups by expert but does not order tokens within
+    an expert. Marlin's split-K reduction can depend on physical block
+    position, so equivalent layouts need a common order before the kernel.
+
+    Ported from vllm-project/vllm#52532. Alignment buffers may contain
+    unspecified data after num_tokens_post_padded; keep that tail after
+    the active prefix so it cannot affect the sort.
+    """
+    block_experts = expert_ids.to(dtype=torch.int64)
+    block_positions = torch.arange(
+        expert_ids.numel(),
+        device=expert_ids.device,
+        dtype=torch.int64,
+    )
+    active_blocks = block_positions * block_size_m < num_tokens_post_padded
+    region_starts = torch.cat(
+        (
+            torch.ones_like(block_experts[:1], dtype=torch.bool),
+            (block_experts[1:] != block_experts[:-1])
+            | (active_blocks[1:] != active_blocks[:-1]),
+        ),
+        dim=0,
+    )
+    block_regions = torch.cumsum(region_starts.to(dtype=torch.int64), dim=0) - 1
+    slot_regions = torch.repeat_interleave(
+        block_regions,
+        block_size_m,
+    )[: sorted_token_ids.numel()]
+    slot_positions = torch.arange(
+        sorted_token_ids.numel(),
+        device=sorted_token_ids.device,
+        dtype=torch.int64,
+    )
+    active_slots = slot_positions < num_tokens_post_padded
+    token_ids = sorted_token_ids.to(dtype=torch.int64)
+    key_stride = num_valid_tokens + 1
+    token_key = torch.where(
+        active_slots,
+        token_ids,
+        torch.zeros_like(token_ids),
+    )
+    sort_key = slot_regions * key_stride + token_key
+    order = torch.argsort(sort_key)
+    return sorted_token_ids.index_select(0, order)
 
 
 def _fused_marlin_moe(
@@ -328,11 +384,16 @@ def fused_marlin_moe(
         # Set M to estimated valid tokens per rank
         M = math.ceil(M * E / global_num_experts)
 
-    # M block size selection logic
-    # TODO: tune this further for specific models
-    for block_size_m in [8, 16, 32, 48, 64]:
-        if M * topk / E / block_size_m < 0.9:
-            break
+    if envs.VLLM_BATCH_INVARIANT:
+        # Pin block_size_m so token alignment is independent of M.
+        # Ported from vllm-project/vllm#46639.
+        block_size_m = 64
+    else:
+        # M block size selection logic
+        # TODO: tune this further for specific models
+        for block_size_m in [8, 16, 32, 48, 64]:
+            if M * topk / E / block_size_m < 0.9:
+                break
 
     if input_dtype is not None and input_dtype.itemsize == 1:
         block_size_m = max(block_size_m, 16)
@@ -344,6 +405,18 @@ def fused_marlin_moe(
         expert_map,
         ignore_invalid_experts=True,
     )
+
+    # A single-token decode cannot span multiple routed blocks for one expert,
+    # so keep it on the original fast path.
+    # Ported from vllm-project/vllm#52532.
+    if topk_ids.shape[0] > 1:
+        sorted_token_ids = _canonicalize_marlin_moe_token_order(
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            block_size_m,
+            topk_ids.numel(),
+        )
 
     assert activation is not None
     moe_output = _fused_marlin_moe(
@@ -499,13 +572,18 @@ def batched_fused_marlin_moe(
     # [B * MAX_TOKENS, K] and top_k can be interpreted as just 1.
     topk = 1
 
-    # TODO(varun) : Choose a decent block size like in fused_marlin_moe
-    # Tune block_size_m based on expert capacity to reduce padding overhead.
-    block_size_m = 64
-    for b_m in [8, 16, 32, 48, 64]:
-        if BATCH_TOKENS_MAX / b_m < 0.9:
-            block_size_m = b_m
-            break
+    if envs.VLLM_BATCH_INVARIANT:
+        # Pin block_size_m so token alignment is independent of M.
+        # Ported from vllm-project/vllm#46639.
+        block_size_m = 64
+    else:
+        # TODO(varun) : Choose a decent block size like in fused_marlin_moe
+        # Tune block_size_m based on expert capacity to reduce padding overhead.
+        block_size_m = 64
+        for b_m in [8, 16, 32, 48, 64]:
+            if BATCH_TOKENS_MAX / b_m < 0.9:
+                block_size_m = b_m
+                break
 
     if input_dtype is not None and input_dtype.itemsize == 1:
         block_size_m = max(block_size_m, 16)
@@ -605,6 +683,13 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
     def _supports_current_device() -> bool:
         p = current_platform
         return p.is_cuda() and p.has_device_capability((7, 5))
+
+    @staticmethod
+    def _supports_batch_invariance() -> bool:
+        # Batch-invariant Marlin requires the WNA16 use_full_k kernel path
+        # from vllm-project/vllm#46639 plus canonical token order from
+        # vllm-project/vllm#52532.
+        return True
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
