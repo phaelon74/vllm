@@ -1045,6 +1045,48 @@ def score_report(
     return os.path.join(config.work, "reports", f"{tag}.json")
 
 
+def _score_report_is_current(
+    report_path: str,
+    teacher: str,
+    *,
+    measure_routing: bool,
+    paired_routing: bool,
+    bind_reference_weights: bool,
+) -> bool:
+    try:
+        with open(report_path, encoding="utf-8") as handle:
+            cached = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return False
+    routing_current = (
+        _paired_report_is_current(cached)
+        if paired_routing
+        else not measure_routing or isinstance(cached.get("routing"), dict)
+    )
+    reference_current = (
+        not (bind_reference_weights or measure_routing)
+        or cached.get("reference_weights_sha256")
+        == reference_weights_identity(teacher)
+    )
+    try:
+        from vllm.v1.sample.kld import capture_runtime_manifest
+
+        current_runtime = capture_runtime_manifest()
+    except Exception:
+        return False
+    cached_runtime = cached.get("runtime_binding") or {}
+    runtime_current = (
+        isinstance(cached_runtime, dict)
+        and cached_runtime.get("vllm_commit")
+        == current_runtime.get("vllm_commit")
+        and cached_runtime.get("vllm_dirty_digest")
+        == current_runtime.get("vllm_dirty_digest")
+        and cached_runtime.get("compiled_extensions_sha256")
+        == current_runtime.get("compiled_extensions_sha256")
+    )
+    return routing_current and reference_current and runtime_current
+
+
 def bind_weights(
     report_path: str, student: str, *, observed: bool = True
 ) -> str | None:
@@ -1188,37 +1230,13 @@ def score_one(
     os.makedirs(os.path.dirname(report), exist_ok=True)
 
     if os.path.isfile(report):
-        with open(report, encoding="utf-8") as handle:
-            cached = json.load(handle)
-        routing_current = (
-            _paired_report_is_current(cached)
-            if paired_routing
-            else not measure_routing or isinstance(cached.get("routing"), dict)
-        )
-        reference_current = (
-            not (bind_reference_weights or measure_routing)
-            or cached.get("reference_weights_sha256")
-            == reference_weights_identity(teacher)
-        )
-        cached_runtime = cached.get("runtime_binding") or {}
-        current_runtime: dict[str, Any] | None = None
-        try:
-            from vllm.v1.sample.kld import capture_runtime_manifest
-
-            current_runtime = capture_runtime_manifest()
-        except Exception:
-            current_runtime = None
-        runtime_current = (
-            isinstance(cached_runtime, dict)
-            and current_runtime is not None
-            and cached_runtime.get("vllm_commit")
-            == current_runtime.get("vllm_commit")
-            and cached_runtime.get("vllm_dirty_digest")
-            == current_runtime.get("vllm_dirty_digest")
-            and cached_runtime.get("compiled_extensions_sha256")
-            == current_runtime.get("compiled_extensions_sha256")
-        )
-        if routing_current and reference_current and runtime_current:
+        if _score_report_is_current(
+            report,
+            teacher,
+            measure_routing=measure_routing,
+            paired_routing=paired_routing,
+            bind_reference_weights=bind_reference_weights,
+        ):
             print(f"=== {tag} already scored")
             bind_weights(report, student, observed=False)
             return report, capture
@@ -1551,7 +1569,13 @@ def attribute_model(
             config, label, variant, model.reference_path, config.rows,
             plan_from=model.reference_path,
         )
-        if not os.path.isfile(cached):
+        if not _score_report_is_current(
+            cached,
+            model.reference_path,
+            measure_routing=True,
+            paired_routing=False,
+            bind_reference_weights=False,
+        ):
             variant = build_variant(
                 config, python, model.reference_path, deployed.path,
                 components, scheme,
