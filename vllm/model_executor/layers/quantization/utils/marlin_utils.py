@@ -356,14 +356,16 @@ def check_moe_marlin_supports_config(
     config: FusedMoEConfig,
     group_size: int,
     allow_tile_padding: bool = False,
+    allow_group_padding: bool = False,
 ) -> bool:
     """Whether the fused MoE Marlin kernel supports ``config``.
 
     Callers without act-order may pass ``allow_tile_padding=True``: a
     tile-misaligned intermediate size is then zero-padded to a valid thread
-    tile at weight prep (see marlin_moe_padded_intermediate), so only a group
-    straddling the padded boundary stays unsupported. hidden_size is the MoE
-    I/O extent and is never padded. Act-order keeps the strict shape.
+    tile at weight prep (see marlin_moe_padded_intermediate). Exporters that
+    store the complete partial group may also pass ``allow_group_padding=True``.
+    hidden_size is the MoE I/O extent and is never padded. Act-order keeps the
+    strict shape.
     """
     if current_platform.is_rocm():
         return False
@@ -372,10 +374,21 @@ def check_moe_marlin_supports_config(
     # size. gate-up needs n=2*intermediate % 128, down needs k=intermediate % 64.
     intermediate_size_per_partition = config.intermediate_size_per_partition_unpadded
     assert intermediate_size_per_partition is not None
+    group_padding_required = (
+        group_size > 0 and intermediate_size_per_partition % group_size != 0
+    )
+    if (
+        allow_group_padding
+        and group_padding_required
+        and config.moe_parallel_config.tp_size != 1
+    ):
+        return False
 
     if allow_tile_padding:
         supports_shape = hidden_size % 128 == 0 and (
-            group_size <= 0 or intermediate_size_per_partition % group_size == 0
+            group_size <= 0
+            or allow_group_padding
+            or intermediate_size_per_partition % group_size == 0
         )
     else:
         supports_shape = (
@@ -390,9 +403,13 @@ def check_moe_marlin_supports_layer(
     layer: RoutedExperts,
     group_size: int,
     allow_tile_padding: bool = False,
+    allow_group_padding: bool = False,
 ) -> bool:
     return check_moe_marlin_supports_config(
-        layer.moe_config, group_size, allow_tile_padding
+        layer.moe_config,
+        group_size,
+        allow_tile_padding,
+        allow_group_padding,
     )
 
 

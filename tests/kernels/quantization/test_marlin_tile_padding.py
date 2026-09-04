@@ -678,7 +678,9 @@ def test_check_moe_marlin_supports_layer_padding():
         layer.hidden_size = hidden
         layer.apply_router_weight_on_input = False
         layer.moe_config = SimpleNamespace(
-            hidden_dim=hidden, intermediate_size_per_partition_unpadded=intermediate
+            hidden_dim=hidden,
+            intermediate_size_per_partition_unpadded=intermediate,
+            moe_parallel_config=SimpleNamespace(tp_size=1),
         )
         return layer
 
@@ -692,6 +694,19 @@ def test_check_moe_marlin_supports_layer_padding():
     # A group straddling the boundary cannot be fixed by padding
     layer = make_layer(4096, 176)
     assert not check_moe_marlin_supports_layer(layer, 128, allow_tile_padding=True)
+    assert check_moe_marlin_supports_layer(
+        layer,
+        128,
+        allow_tile_padding=True,
+        allow_group_padding=True,
+    )
+    layer.moe_config.moe_parallel_config.tp_size = 2
+    assert not check_moe_marlin_supports_layer(
+        layer,
+        128,
+        allow_tile_padding=True,
+        allow_group_padding=True,
+    )
 
     # hidden_size is the MoE I/O extent and is never padded
     layer = make_layer(4090, 128)

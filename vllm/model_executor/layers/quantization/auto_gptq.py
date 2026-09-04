@@ -493,6 +493,7 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
             may_have_zp=not self.quant_config.is_sym,
             may_have_bias=True,
             allow_tile_padding=not self.quant_config.desc_act,
+            allow_group_padding=not self.quant_config.desc_act,
         )
 
     def create_weights(
@@ -513,6 +514,13 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
             )
 
         intermediate_size_full = extra_weight_attrs.pop("intermediate_size_full")
+        padded_intermediate_size = intermediate_size_per_partition
+        if self.quant_config.group_size > 0 and not self.quant_config.desc_act:
+            # GPTQ exporters retain the packed rows for a partial final group.
+            group_size = self.quant_config.group_size
+            padded_intermediate_size = (
+                intermediate_size_per_partition + group_size - 1
+            ) // group_size * group_size
 
         self.is_k_full = (not self.quant_config.desc_act) or (
             intermediate_size_per_partition == intermediate_size_full
@@ -523,7 +531,7 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
             w2_scales_size = (
                 intermediate_size_full
                 if self.quant_config.desc_act
-                else intermediate_size_per_partition
+                else padded_intermediate_size
             )
             scales_size2 = w2_scales_size // self.quant_config.group_size
             strategy = FusedMoeWeightScaleSupported.GROUP.value
@@ -552,7 +560,7 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
         w2_qweight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                intermediate_size_per_partition // self.quant_config.pack_factor,
+                padded_intermediate_size // self.quant_config.pack_factor,
                 hidden_size,
                 dtype=torch.int32,
             ),
@@ -622,7 +630,7 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
         w2_g_idx = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                intermediate_size_per_partition,
+                padded_intermediate_size,
                 dtype=torch.int32,
             ),
             requires_grad=False,
@@ -642,7 +650,7 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
         w2_g_idx_sort_indices = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                intermediate_size_per_partition,
+                padded_intermediate_size,
                 dtype=torch.int32,
             ),
             requires_grad=False,

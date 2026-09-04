@@ -131,6 +131,7 @@ def _backend_incompatibility_reason(
     may_have_zp: bool,
     may_have_bias: bool,
     allow_tile_padding: bool,
+    allow_group_padding: bool = False,
 ) -> str | None:
     if backend == WNA16MoEBackend.FLASHINFER_TRTLLM and (may_have_zp or may_have_bias):
         return "zero points and bias are not supported"
@@ -165,7 +166,10 @@ def _backend_incompatibility_reason(
             return "Marlin not supported for this layer"
 
         if not check_moe_marlin_supports_config(
-            moe_config, group_size, allow_tile_padding
+            moe_config,
+            group_size,
+            allow_tile_padding,
+            allow_group_padding,
         ):
             return "Marlin not supported for this layer"
 
@@ -203,6 +207,7 @@ def select_wna16_moe_backend(
     may_have_zp: bool,
     may_have_bias: bool,
     allow_tile_padding: bool = False,
+    allow_group_padding: bool = False,
 ) -> tuple[WNA16MoEBackend, type[mk.FusedMoEExperts]]:
     """Select the WNA16 MoE backend.
 
@@ -213,6 +218,9 @@ def select_wna16_moe_backend(
         quant_config: Quantization structure and checkpoint format description.
         may_have_zp: Whether the integration can provide weight zero points.
         may_have_bias: Whether the integration can provide expert bias.
+        allow_tile_padding: Whether weight preparation may pad Marlin tiles.
+        allow_group_padding: Whether the checkpoint stores a partial final group
+            through the padded reduction extent.
 
     Returns:
         A tuple of (``WNA16MoEBackend``, experts class or ``None``).
@@ -266,6 +274,7 @@ def select_wna16_moe_backend(
             may_have_zp,
             may_have_bias,
             allow_tile_padding,
+            allow_group_padding,
         )
         if reason is not None:
             raise ValueError(_make_log_unsupported(requested_backend, reason))
@@ -284,6 +293,7 @@ def select_wna16_moe_backend(
             may_have_zp,
             may_have_bias,
             allow_tile_padding,
+            allow_group_padding,
         )
         if reason is not None:
             logger.debug_once(_make_log_unsupported(backend, reason), scope="local")

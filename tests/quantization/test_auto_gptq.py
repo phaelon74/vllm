@@ -84,6 +84,31 @@ def test_auto_gptq_moe_creates_zero_initialized_expert_biases():
     assert torch.count_nonzero(layer.w2_bias) == 0
 
 
+def test_auto_gptq_moe_allocates_exporter_padded_reduction():
+    method = object.__new__(AutoGPTQMoEMethod)
+    method.quant_config = AutoGPTQConfig(4, 128, False, True, False, {}, {})
+    method.input_dtype = None
+    method.experts_cls = None
+    method.moe = SimpleNamespace(w13_num_shards=2)
+    layer = torch.nn.Module()
+
+    method.create_weights(
+        layer=layer,
+        num_experts=2,
+        hidden_size=256,
+        intermediate_size_per_partition=704,
+        params_dtype=torch.float16,
+        intermediate_size_full=704,
+        weight_loader=lambda *args, **kwargs: None,
+    )
+
+    assert layer.w2_qweight.shape == (2, 96, 256)
+    assert layer.w2_scales.shape == (2, 6, 256)
+    assert layer.w2_qzeros.shape == (2, 6, 32)
+    assert layer.w2_g_idx.shape == (2, 768)
+    assert layer.w2_g_idx_sort_indices.shape == (2, 768)
+
+
 def test_routed_experts_loads_per_expert_biases():
     class Loader:
         quant_config = None
