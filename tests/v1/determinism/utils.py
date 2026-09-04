@@ -52,6 +52,13 @@ if os.getenv("VLLM_TEST_MODEL"):
             available=DEVICE_BACKENDS["xpu"].available,
             backends=[],
         )
+    elif getattr(config, "model_type", "") == "qwen3_5" or (
+        getattr(config, "dual_chunk_attention_config", None) is not None
+    ):
+        DEVICE_BACKENDS["cuda"] = DeviceConfig(
+            available=DEVICE_BACKENDS["cuda"].available,
+            backends=["GDN_ATTN"],
+        )
 
 # Only include backends for devices that are actually available.
 BACKENDS: list[str] = sorted(
@@ -133,3 +140,10 @@ def _extract_step_logprobs(request_output):
 
 def is_device_capability_below_90() -> bool:
     return not current_platform.has_device_capability(90)
+
+
+def get_attention_config(backend: str) -> dict:
+    """Return standard attention configuration for a backend."""
+    if backend == "GDN_ATTN":
+        return {}
+    return {"backend": backend}

@@ -1087,6 +1087,31 @@ def inspect_model_moe_backends(model: torch.nn.Module) -> dict[str, Any]:
     return {"layers": layers}
 
 
+def inspect_model_recurrent_backends(model: torch.nn.Module) -> dict[str, Any]:
+    """Record loaded recurrent-attention implementations on one worker."""
+    from vllm.model_executor.layers.mamba.abstract import MambaBase
+
+    layers = []
+    for name, module in model.named_modules():
+        if not isinstance(module, MambaBase):
+            continue
+        backend = module.get_attn_backend()
+        supports_batch_invariant = backend.supports_batch_invariance()
+        layers.append(
+            {
+                "name": name,
+                "layer_id": getattr(module, "layer_idx", None),
+                "backend": backend.get_name(),
+                "implementation": type(module).__name__,
+                "prefill_backend": getattr(module, "gdn_prefill_backend", None),
+                "decode_kernel": getattr(module, "gdn_decode_kernel", None),
+                "batch_invariant_supported": supports_batch_invariant,
+                "certified_for_exact_repeat": supports_batch_invariant,
+            }
+        )
+    return {"layers": layers}
+
+
 LOGITS_PROCESSOR_IDENTITY_KEYS = (
     "type",
     "scale",

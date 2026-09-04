@@ -412,9 +412,11 @@ estimate.
 Certified backends are those whose expert implementation supports batch
 invariance and is not expert-parallel: batch-invariant Triton, CUTLASS NVFP4,
 Humming, and patched Marlin after the canonical-order and full-K ports.
-DeepGEMM, FlashInfer, AITER, XPU, CPU, and EP paths remain uncertified until an
-exact probe passes. Scoring sets `VLLM_BATCH_INVARIANT=1`, disables DeepGEMM
-and FlashInfer autotune, and pins NCCL/cuBLAS determinism flags.
+Qwen GDN attention is certified only on its NVIDIA CUDA, non-speculative
+per-sequence path; FlashInfer GDN context parallelism is disabled there.
+DeepGEMM, FlashInfer MoE, AITER, XPU, CPU, and EP paths remain uncertified
+until an exact probe passes. Scoring sets `VLLM_BATCH_INVARIANT=1`, disables
+DeepGEMM and FlashInfer autotune, and pins NCCL/cuBLAS determinism flags.
 
 Publication also binds the vLLM commit, dirty digest, compiled extension
 hashes, FlashInfer version, GPU identity, and per-position QxQ/BxQ KLD

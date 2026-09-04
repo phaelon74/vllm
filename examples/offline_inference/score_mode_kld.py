@@ -1498,10 +1498,15 @@ def calculate_kld(
     with _phase(timings, "student_load"):
         llm = LLM(model=model_path, **student_kwargs)
     moe_backends: list[dict[str, Any]] = []
+    recurrent_backends: list[dict[str, Any]] = []
     if routing_manifest is not None:
-        from vllm.v1.sample.kld import inspect_model_moe_backends
+        from vllm.v1.sample.kld import (
+            inspect_model_moe_backends,
+            inspect_model_recurrent_backends,
+        )
 
         moe_backends = llm.apply_model(inspect_model_moe_backends)
+        recurrent_backends = llm.apply_model(inspect_model_recurrent_backends)
         if not moe_backends or not all(item.get("layers") for item in moe_backends):
             raise ValueError("routed scoring found no replay-capable MoE layers")
         candidate_layer_maps = [
@@ -1567,6 +1572,19 @@ def calculate_kld(
                 "QxQ/BxQ exact-repeat scoring requires every MoE layer to "
                 "use the same certified backend; found "
                 f"{len(backend_profiles)} profiles"
+            )
+        uncertified_recurrent = sorted(
+            {
+                str(layer.get("backend") or "unknown")
+                for worker in recurrent_backends
+                for layer in worker.get("layers", [])
+                if layer.get("certified_for_exact_repeat") is not True
+            }
+        )
+        if uncertified_recurrent:
+            raise RuntimeError(
+                "QxQ/BxQ exact-repeat scoring refuses uncertified recurrent "
+                f"backends: {', '.join(uncertified_recurrent)}"
             )
     student_uses_v2 = bool(
         llm.llm_engine.vllm_config.use_v2_model_runner
@@ -1974,7 +1992,33 @@ def calculate_kld(
                 for layer in worker.get("layers", [])
             }
         )
+        recurrent_names = sorted(
+            {
+                layer.get("backend") or "unknown"
+                for worker in recurrent_backends
+                for layer in worker.get("layers", [])
+            }
+        )
+        recurrent_profiles = {
+            json.dumps(
+                {
+                    key: layer.get(key)
+                    for key in (
+                        "backend",
+                        "implementation",
+                        "prefill_backend",
+                        "decode_kernel",
+                        "batch_invariant_supported",
+                        "certified_for_exact_repeat",
+                    )
+                },
+                sort_keys=True,
+            )
+            for worker in recurrent_backends
+            for layer in worker.get("layers", [])
+        }
         per_layer_consistent = len(backend_profiles) == 1
+        recurrent_per_layer_consistent = len(recurrent_profiles) <= 1
         binding = {
             "protocol_version": PAIRED_ROUTED_SCORE_PROTOCOL_VERSION,
             "routing_trace_protocol_version": ROUTING_TRACE_PROTOCOL_VERSION,
@@ -1985,9 +2029,11 @@ def calculate_kld(
             ),
             "candidate_weights_unchanged": None,
             "backend_identity": moe_backends,
+            "recurrent_backend_identity": recurrent_backends,
             "backend_evidence": {
                 "backend": ", ".join(backend_names),
                 "kernel": ", ".join(kernel_names),
+                "recurrent_backend": ", ".join(recurrent_names),
                 "replay_supported": True,
                 "certified_for_exact_repeat": True,
                 "batch_invariant": os.environ.get("VLLM_BATCH_INVARIANT") == "1",
@@ -1998,6 +2044,10 @@ def calculate_kld(
                 "cublas_workspace": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
                 "per_layer_consistent": per_layer_consistent,
                 "layer_profiles": sorted(backend_profiles),
+                "recurrent_per_layer_consistent": (
+                    recurrent_per_layer_consistent
+                ),
+                "recurrent_layer_profiles": sorted(recurrent_profiles),
                 "workers": len(moe_backends),
             },
             "natural_control_parity": control_evidence,

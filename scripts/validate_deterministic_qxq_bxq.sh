@@ -50,6 +50,18 @@ echo "=== Marlin kernel microprobes (bit-exact repeats)"
 echo "=== CPU/GPU forced-route repeatability"
 "$PY" -m pytest tests/model_executor/test_routed_experts_capture.py::test_forced_routing_weights_are_repeatable -q
 
+echo "=== GDN attention batch invariance"
+VLLM_TEST_MODEL="${KLD_GDN_TEST_MODEL:-Qwen/Qwen3.5-0.8B}" \
+VLLM_NEEDLE_TRIALS="${KLD_GDN_TRIALS:-3}" \
+VLLM_NEEDLE_BATCH_SIZE="${KLD_GDN_BATCH_SIZE:-8}" \
+VLLM_MIN_PROMPT="${KLD_GDN_MIN_PROMPT:-64}" \
+VLLM_MAX_PROMPT="${KLD_GDN_MAX_PROMPT:-256}" \
+VLLM_NEEDLE_MAX_TOKENS="${KLD_GDN_MAX_TOKENS:-8}" \
+VLLM_MAX_MODEL_LEN="${KLD_GDN_MODEL_LEN:-512}" \
+VLLM_TEST_ENFORCE_EAGER=1 \
+"$PY" -m pytest tests/v1/determinism/test_batch_invariance.py \
+  -k "needle and GDN_ATTN and default" -q
+
 echo
 echo "Microprobes passed. Next, without set -e:"
 echo "  1. One-row exact-repeat smokes for each selected backend"

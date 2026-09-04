@@ -37,6 +37,12 @@ class GDNAttentionBackend(AttentionBackend):
     def is_ssm(cls) -> bool:
         return True
 
+    @classmethod
+    def supports_batch_invariance(cls) -> bool:
+        # The invariant execution path is implemented only for NVIDIA CUDA.
+        # Ported from vllm-project/vllm#45819.
+        return torch.cuda.is_available() and torch.version.hip is None
+
 
 @dataclass
 class GDNAttentionMetadata:

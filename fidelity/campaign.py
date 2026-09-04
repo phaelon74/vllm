@@ -274,6 +274,7 @@ def _paired_report_is_current(report: dict[str, Any]) -> bool:
         and backend.get("certified_for_exact_repeat") is True
         and backend.get("batch_invariant") is True
         and backend.get("per_layer_consistent") is True
+        and backend.get("recurrent_per_layer_consistent") is True
         and isinstance(digest, str)
         and len(digest) == 64
         and bxq.get("reference_weights_sha256")
@@ -3124,6 +3125,7 @@ def selftest() -> int:
                     "certified_for_exact_repeat": True,
                     "batch_invariant": True,
                     "per_layer_consistent": True,
+                    "recurrent_per_layer_consistent": True,
                 },
                 "candidate_weights_sha256": digest,
                 "candidate_weights_unchanged": True,

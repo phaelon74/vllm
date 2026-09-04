@@ -286,6 +286,11 @@ class RMSNormGated(CustomOp):
     def forward_cuda(
         self, x: torch.Tensor, z: torch.Tensor | None = None
     ) -> torch.Tensor:
+        if envs.VLLM_BATCH_INVARIANT:
+            # The guarded Triton kernel chooses rows per block from M, which
+            # changes its reduction order across batch geometries.
+            # Ported from vllm-project/vllm#45819.
+            return self.forward_native(x, z)
         from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
             rmsnorm_fn,
         )

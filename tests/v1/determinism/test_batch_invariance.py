@@ -11,6 +11,7 @@ from utils import (
     TEST_MODEL,
     _extract_step_logprobs,
     _random_prompt,
+    get_attention_config,
     skip_if_not_cuda,
     skip_unsupported,
 )
@@ -61,7 +62,7 @@ def test_v1_generation_is_deterministic_across_batch_sizes_with_needle(
     seed = int(os.getenv("VLLM_TEST_SEED", "12345"))
     random.seed(seed)
 
-    attention_config = {"backend": backend}
+    attention_config = get_attention_config(backend)
     # Force the C++ RMSNorm implementation so we actually exercise the
     # num_tokens-dependent block-size branches.
     kernel_config = None
@@ -953,6 +954,7 @@ def LLM_with_max_seqs(
         dtype="auto",
         tensor_parallel_size=int(os.getenv("VLLM_TP_SIZE", "1")),
         enable_prefix_caching=False,
+        enforce_eager=os.getenv("VLLM_TEST_ENFORCE_EAGER", "0") == "1",
         attention_config=attention_config,
         # Enable for MOE models
         # enable_expert_parallel=True,
