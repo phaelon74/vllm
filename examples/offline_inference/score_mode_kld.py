@@ -398,7 +398,7 @@ def _dump_positions(chunks: Any, score_from: int, path: str) -> None:
 
 ROUTING_MANIFEST = "routing-manifest.json"
 ROUTING_TRACE_PROTOCOL_VERSION = 2
-PAIRED_ROUTED_SCORE_PROTOCOL_VERSION = 2
+PAIRED_ROUTED_SCORE_PROTOCOL_VERSION = 3
 CONTROL_POSITION_BASE_TOLERANCE = 1e-5
 CONTROL_MEAN_BASE_TOLERANCE = 1e-7
 CONTROL_REPEATABILITY_MULTIPLIER = 2.0
@@ -1565,6 +1565,8 @@ def calculate_kld(
     natural_repeat_chunks: list[KLDResult] = []
     control_chunks: list[KLDResult] = []
     control_repeat_chunks: list[KLDResult] = []
+    natural_repeat_route_mismatches = 0
+    natural_repeat_route_values = 0
     control_temp = (
         tempfile.TemporaryDirectory(prefix="vllm-kld-qxq-control-")
         if paired_routing
@@ -1624,10 +1626,15 @@ def calculate_kld(
             )
             if repeat_out.kld_result is None or repeat_ids is None:
                 raise RuntimeError("QxQ natural repeat returned incomplete evidence")
-            if not np.array_equal(natural_ids, repeat_ids):
+            if natural_ids.shape != repeat_ids.shape:
                 raise RuntimeError(
-                    "QxQ natural routing is not repeatable for identical input"
+                    "QxQ natural repeat returned different routing geometry: "
+                    f"{natural_ids.shape} != {repeat_ids.shape}"
                 )
+            natural_repeat_route_mismatches += int(
+                np.count_nonzero(natural_ids != repeat_ids)
+            )
+            natural_repeat_route_values += int(natural_ids.size)
             natural_repeat_chunks.append(repeat_out.kld_result)
             control_path = os.path.join(
                 control_temp.name, _routing_filename(idx)
@@ -1822,6 +1829,14 @@ def calculate_kld(
             ),
             "natural_samples": 2,
             "control_samples": 2,
+            "natural_repeat_route_mismatches": (
+                natural_repeat_route_mismatches
+            ),
+            "natural_repeat_route_values": natural_repeat_route_values,
+            "natural_repeat_route_flip_rate": (
+                natural_repeat_route_mismatches
+                / max(natural_repeat_route_values, 1)
+            ),
             "natural_repeat_max_absolute_position_delta": repeat_max_abs,
             "natural_repeat_absolute_mean_delta": abs(repeat_mean_delta),
             "natural_repeat_mean_absolute_position_delta": repeat_mean_abs,
@@ -2248,7 +2263,9 @@ def _print_kld_report(report: dict[str, Any]) -> None:
             + f", max={control['max_absolute_position_delta']:.3e}/"
             f"{control['position_absolute_tolerance']:.3e}, "
             f"mean={control['absolute_mean_delta']:.3e}/"
-            f"{control['mean_absolute_tolerance']:.3e}"
+            f"{control['mean_absolute_tolerance']:.3e}, "
+            "natural route-repeat flips="
+            f"{control['natural_repeat_route_flip_rate']:.3%}"
         )
     head = report.get("student_lm_head") or {}
     print(f"  Student LM head: {head.get('state', 'unknown')}")

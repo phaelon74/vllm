@@ -784,7 +784,9 @@ def _paired_routing_intervention(receipt: dict[str, Any]) -> list[str]:
         + f"{float(control.get('position_absolute_tolerance', 0.0)):.3e}; "
         + "absolute mean delta "
         + f"{float(control.get('absolute_mean_delta', 0.0)):.3e} / "
-        + f"{float(control.get('mean_absolute_tolerance', 0.0)):.3e}.",
+        + f"{float(control.get('mean_absolute_tolerance', 0.0)):.3e}; "
+        + "natural route-repeat flips "
+        + f"{float(control.get('natural_repeat_route_flip_rate', 0.0)):.3%}.",
         "",
     ]
     return out
@@ -2124,6 +2126,9 @@ def selftest() -> int:
         "passed": True,
         "natural_samples": 2,
         "control_samples": 2,
+        "natural_repeat_route_mismatches": 0,
+        "natural_repeat_route_values": 100,
+        "natural_repeat_route_flip_rate": 0.0,
         "natural_repeat_max_absolute_position_delta": 0.0,
         "natural_repeat_absolute_mean_delta": 0.0,
         "natural_repeat_mean_absolute_position_delta": 0.0,
@@ -2149,7 +2154,7 @@ def selftest() -> int:
             "routing_trace_sha256": trace,
             "routing_trace_manifest": "routing-manifest.json",
             "routing_mode": "teacher_ids_student_weights",
-            "protocol_version": 2,
+            "protocol_version": 3,
             "routing_trace_protocol_version": 2,
             "candidate_weights_unchanged": True,
             "backend_evidence": {
@@ -2167,6 +2172,9 @@ def selftest() -> int:
         attribution=attribution,
     )
     assert law_14_component_attribution(campaign).status == "pass"
+    control["natural_repeat_route_flip_rate"] = 0.01
+    assert law_14_component_attribution(campaign).status == "fail"
+    control["natural_repeat_route_flip_rate"] = 0.0
     control["position_absolute_tolerance"] = 2e-5
     assert law_14_component_attribution(campaign).status == "fail"
     control["position_absolute_tolerance"] = 1e-5

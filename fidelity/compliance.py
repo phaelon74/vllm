@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 LAWS_VERSION = 11
-BXQ_PROTOCOL_VERSION = 2
+BXQ_PROTOCOL_VERSION = 3
 ROUTING_TRACE_PROTOCOL_VERSION = 2
 
 # The identity a capture is bound to. Law 5 requires the scored report to carry
@@ -701,6 +701,31 @@ def law_14_component_attribution(c: Campaign) -> Finding:
             title,
             FAIL,
             "bxq_cell natural-repeatability evidence has the wrong sample count",
+        )
+    route_mismatches = control.get("natural_repeat_route_mismatches")
+    route_values = control.get("natural_repeat_route_values")
+    route_flip_rate = control.get("natural_repeat_route_flip_rate")
+    if (
+        not isinstance(route_mismatches, int)
+        or isinstance(route_mismatches, bool)
+        or not isinstance(route_values, int)
+        or isinstance(route_values, bool)
+        or route_values <= 0
+        or route_mismatches < 0
+        or route_mismatches > route_values
+        or not isinstance(route_flip_rate, (int, float))
+        or isinstance(route_flip_rate, bool)
+        or not math.isfinite(float(route_flip_rate))
+        or not _same_number(
+            route_flip_rate,
+            route_mismatches / route_values,
+        )
+    ):
+        return Finding(
+            14,
+            title,
+            FAIL,
+            "bxq_cell natural routing repeatability evidence is invalid",
         )
     numeric_control_fields = (
         "natural_repeat_max_absolute_position_delta",

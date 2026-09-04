@@ -67,7 +67,7 @@ FP32_COPIES = 4
 # Peak vs live tensors; expandable_segments keeps this from growing further.
 ALLOCATOR_SLACK = 1.25
 TP_CANDIDATES = (1, 2, 4, 8)
-PAIRED_ROUTED_SCORE_PROTOCOL_VERSION = 2
+PAIRED_ROUTED_SCORE_PROTOCOL_VERSION = 3
 ROUTING_TRACE_PROTOCOL_VERSION = 2
 _REFERENCE_WEIGHT_DIGESTS: dict[str, str] = {}
 
@@ -92,6 +92,28 @@ def _repeatability_control_is_current(control: Any) -> bool:
         or control.get("natural_samples") != 2
         or control.get("control_samples") != 2
         or control.get("repeatability_multiplier") != 2.0
+    ):
+        return False
+    route_mismatches = control.get("natural_repeat_route_mismatches")
+    route_values = control.get("natural_repeat_route_values")
+    route_flip_rate = control.get("natural_repeat_route_flip_rate")
+    if (
+        not isinstance(route_mismatches, int)
+        or isinstance(route_mismatches, bool)
+        or not isinstance(route_values, int)
+        or isinstance(route_values, bool)
+        or route_values <= 0
+        or route_mismatches < 0
+        or route_mismatches > route_values
+        or not isinstance(route_flip_rate, (int, float))
+        or isinstance(route_flip_rate, bool)
+        or not math.isfinite(float(route_flip_rate))
+        or not math.isclose(
+            float(route_flip_rate),
+            route_mismatches / route_values,
+            rel_tol=1e-12,
+            abs_tol=1e-15,
+        )
     ):
         return False
     fields = (
@@ -2079,7 +2101,9 @@ def cmd_smoke(
                 + f", max={control['max_absolute_position_delta']:.3e}/"
                 f"{control['position_absolute_tolerance']:.3e}, "
                 f"mean={control['absolute_mean_delta']:.3e}/"
-                f"{control['mean_absolute_tolerance']:.3e}"
+                f"{control['mean_absolute_tolerance']:.3e}, "
+                "natural route-repeat flips="
+                f"{control['natural_repeat_route_flip_rate']:.3%}"
             )
             maybe_release(config, candidate)
     if wanted_candidates and attempted == 0:
@@ -2989,6 +3013,9 @@ def selftest() -> int:
                     "passed": True,
                     "natural_samples": 2,
                     "control_samples": 2,
+                    "natural_repeat_route_mismatches": 0,
+                    "natural_repeat_route_values": 100,
+                    "natural_repeat_route_flip_rate": 0.0,
                     "natural_repeat_max_absolute_position_delta": 0.0,
                     "natural_repeat_absolute_mean_delta": 0.0,
                     "natural_repeat_mean_absolute_position_delta": 0.0,

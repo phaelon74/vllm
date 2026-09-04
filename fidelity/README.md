@@ -406,8 +406,10 @@ must reproduce deployed QxQ within a measured repeatability envelope. The
 protocol runs two natural and two forced-natural samples: deterministic kernels
 retain the fixed exactness floor, while nondeterministic kernels receive only
 twice their larger observed repeatability span. Every span and derived bound is
-published and compliance-checked. Unsupported replay or a failed natural control
-fails compliance; it is never replaced by a QDQ estimate.
+published and compliance-checked. Natural route flips between repeats are
+recorded, while both forced controls remain bound to the first natural sample's
+exact IDs. Unsupported replay or a failed natural control fails compliance; it
+is never replaced by a QDQ estimate.
 
 ### Natural divergence and forced routing are different
 

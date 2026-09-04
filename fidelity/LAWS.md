@@ -88,9 +88,11 @@ Version 11 replaces Law 14's fixed bitwise-style natural-control threshold with
 a measured repeatability envelope. The paired protocol runs two natural and two
 forced-natural samples, retains the fixed numerical floor for repeatable
 kernels, and otherwise permits no more than twice the larger observed
-within-path span. It also requires natural expert IDs to be identical across the
-two natural samples; the envelope covers kernel arithmetic, not routing changes.
-The paired routed-score and BxQ protocol versions are now 2. Version-10 paired
+within-path span. Natural expert IDs may differ across the two samples when
+arithmetic drift propagates into later routers, so their selection flip rate is
+recorded. Both forced-natural controls still replay the first QxQ sample's exact
+IDs.
+The paired routed-score and BxQ protocol versions are now 3. Version-10 paired
 reports must be rescored rather than relabeled.
 
 These laws govern every distribution-fidelity measurement this program
@@ -449,6 +451,9 @@ worst position and mean satisfy that recorded envelope. This prevents either
 backend nondeterminism or a backend change from being reported as a routing
 intervention. The candidate weight digest must remain unchanged and
 `candidate_weights_unchanged` must be true.
+The report also stores the natural-repeat route mismatch count, denominator,
+and flip rate. Route changes are repeatability evidence only: both control
+samples and BxQ remain bound to the first QxQ sample's exact ordered IDs.
 The envelope describes the observed two-sample span, not a confidence bound;
 comparisons inside it still require the repeat study required by Law 1.
 
