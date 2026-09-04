@@ -34,9 +34,13 @@ def prepare_flashinfer_forced_topk_weights(
         RoutingMethodType.Renormalize,
         RoutingMethodType.RenormalizeNaive,
     }:
-        return topk_weights
+        return topk_weights.to(torch.bfloat16)
     selected_logits = router_logits.gather(1, topk_ids.to(torch.int64))
-    return torch.softmax(selected_logits, dim=-1, dtype=torch.float32)
+    return torch.softmax(
+        selected_logits,
+        dim=-1,
+        dtype=torch.float32,
+    ).to(torch.bfloat16)
 
 
 @dataclass(frozen=True)

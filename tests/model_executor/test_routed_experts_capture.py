@@ -14,6 +14,9 @@ from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import override_forward_context
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
+    TrtLlmNvFp4ExpertsMonolithic,
+)
 from vllm.model_executor.layers.fused_moe.experts.trtllm_fp8_moe import (
     TrtLlmFp8ExpertsMonolithic,
 )
@@ -697,6 +700,70 @@ def test_trtllm_fp8_forced_route_uses_public_packed_api():
     assert output is expected
 
 
+def test_trtllm_nvfp4_forced_route_uses_native_packed_api():
+    import flashinfer
+
+    experts = object.__new__(TrtLlmNvFp4ExpertsMonolithic)
+    experts.quant_config = SimpleNamespace(
+        g1_alphas=torch.empty(1),
+        g2_alphas=torch.empty(1),
+        w1_scale=torch.empty(1),
+        w2_scale=torch.empty(1),
+    )
+    experts.g1_scale_c = torch.empty(1)
+    experts.gemm1_alpha = None
+    experts.gemm1_beta = None
+    experts.gemm1_clamp_limit = None
+    experts.hidden_dim = 4
+    experts.intermediate_size_per_partition = 4
+    experts.ep_rank = 0
+    experts.local_num_experts = 4
+    experts.per_token_activation = False
+    experts.routing_method_type = RoutingMethodType.RenormalizeNaive
+    experts.topk = 2
+    experts.moe_config = SimpleNamespace(num_experts=4)
+
+    topk_ids = torch.tensor([[2, 0]], dtype=torch.int32)
+    topk_weights = torch.tensor([[0.75, 0.25]], dtype=torch.bfloat16)
+    packed_routes = torch.tensor([[1, 2]], dtype=torch.int32)
+
+    with (
+        patch.object(
+            flashinfer.fused_moe,
+            "trtllm_fp4_block_scale_routed_moe",
+            create=True,
+        ) as routed_moe,
+        patch(
+            "vllm.model_executor.layers.fused_moe.experts."
+            "trtllm_nvfp4_moe.fi_moe_largest_bucket",
+            return_value=1,
+        ),
+        patch(
+            "vllm.model_executor.layers.fused_moe.experts."
+            "trtllm_nvfp4_moe.trtllm_moe_pack_topk_ids_weights",
+            return_value=packed_routes,
+        ) as pack_routes,
+    ):
+        output = experts.apply_routed(
+            hidden_states=torch.empty(1, 4),
+            w1=torch.empty(1),
+            w2=torch.empty(1),
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=MoEActivation.SILU,
+            global_num_experts=4,
+            expert_map=None,
+            a1q_scale=torch.empty(1),
+            apply_router_weight_on_input=False,
+        )
+
+    routed = routed_moe.call_args.kwargs
+    pack_routes.assert_called_once_with(topk_ids, topk_weights)
+    assert routed["topk_ids"] is packed_routes
+    assert routed["routing_method_type"] == RoutingMethodType.RenormalizeNaive
+    assert output is routed["output"]
+
+
 def test_flashinfer_forced_weights_use_selected_logits_softmax():
     router_logits = torch.tensor([[8.0, -3.0, 5.0, 1.0]], dtype=torch.bfloat16)
     topk_ids = torch.tensor([[2, 0]], dtype=torch.int32)
@@ -709,8 +776,25 @@ def test_flashinfer_forced_weights_use_selected_logits_softmax():
         routing_method=RoutingMethodType.RenormalizeNaive,
     )
 
-    expected = torch.softmax(torch.tensor([[5.0, 8.0]]), dim=-1)
+    expected = torch.softmax(torch.tensor([[5.0, 8.0]]), dim=-1).to(
+        torch.bfloat16
+    )
+    assert actual.dtype == torch.bfloat16
     torch.testing.assert_close(actual, expected)
+
+
+def test_flashinfer_forced_weights_use_native_bf16_output_dtype():
+    topk_weights = torch.tensor([[0.75, 0.25]], dtype=torch.float32)
+
+    actual = prepare_flashinfer_forced_topk_weights(
+        router_logits=torch.empty(1, 4),
+        topk_ids=torch.tensor([[2, 0]], dtype=torch.int32),
+        topk_weights=topk_weights,
+        routing_method=RoutingMethodType.Default,
+    )
+
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual, topk_weights.to(torch.bfloat16))
 
 
 @pytest.mark.parametrize(

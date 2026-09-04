@@ -567,9 +567,10 @@ class TrtLlmNvFp4ExpertsMonolithic(
             dtype=torch.bfloat16,
             device=hidden_states.device,
         )
+        packed_topk = trtllm_moe_pack_topk_ids_weights(topk_ids, topk_weights)
         try:
             flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe(
-                topk_ids=(topk_ids, topk_weights),
+                topk_ids=packed_topk,
                 routing_bias=None,
                 hidden_states=hidden_states,
                 hidden_states_scale=block_scale.view(torch.float8_e4m3fn).reshape(
@@ -599,7 +600,7 @@ class TrtLlmNvFp4ExpertsMonolithic(
                 local_expert_offset=self.ep_rank * self.local_num_experts,
                 local_num_experts=self.local_num_experts,
                 routed_scaling_factor=None,
-                routing_method_type=RoutingMethodType.Renormalize,
+                routing_method_type=self.routing_method_type,
                 do_finalize=True,
                 activation_type=activation_to_flashinfer_int(activation),
                 per_token_scale=per_token_scale,
@@ -610,8 +611,8 @@ class TrtLlmNvFp4ExpertsMonolithic(
             )
         except (AssertionError, TypeError) as exc:
             raise NotImplementedError(
-                "Installed FlashInfer does not support unpacked FP32 routing "
-                "weights for NVFP4 TRTLLM MoE."
+                "Installed FlashInfer does not support packed precomputed "
+                "routing for NVFP4 TRTLLM MoE."
             ) from exc
         return output
 
