@@ -52,6 +52,9 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    unpack_quantized_values_into_int32,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -62,6 +65,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.platforms import current_platform
+from vllm.scalar_type import scalar_types
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.gemma4 import gemma4_layer_config
 from vllm.triton_utils import tl, triton
@@ -94,6 +98,43 @@ _GEMMA4_EXPERT_PARENT_MAPPER = WeightsMapper(
 
 def _remap_gemma4_expert_weight_name(name: str) -> str:
     return re.sub(r"(?<!\.moe)\.experts\.(\d+)\.", r".moe.experts.\1.", name)
+
+
+# AutoRound exports quantize the router projection alongside the experts.
+_ROUTER_PROJ_QUANT_SUFFIXES = ("qweight", "qzeros", "scales")
+
+
+def _dequantize_router_proj(
+    shards: dict[str, torch.Tensor], out_dtype: torch.dtype
+) -> torch.Tensor:
+    """Build a dense router projection from GPTQ-packed shards.
+
+    ``GateLinear`` is always unquantized: its specialized GEMMs take a plain
+    weight and routing top-k needs fp32-stable logits. A checkpoint that
+    quantizes the router therefore has no parameter to load into, so the packed
+    shards are dequantized here. The stored zero points are applied directly,
+    which is correct for symmetric and asymmetric exports alike.
+    """
+    q = unpack_quantized_values_into_int32(
+        shards["qweight"], scalar_types.uint4, packed_dim=0
+    )
+    zp = unpack_quantized_values_into_int32(
+        shards["qzeros"], scalar_types.uint4, packed_dim=1
+    )
+    scales = shards["scales"]
+
+    size_k = q.shape[0]
+    num_groups = scales.shape[0]
+    if num_groups == 0 or size_k % num_groups:
+        raise ValueError(
+            f"router projection has {size_k} input rows across {num_groups} "
+            "scale groups, which do not divide evenly"
+        )
+    group_size = size_k // num_groups
+
+    weight = (q - zp.repeat_interleave(group_size, dim=0)).to(scales.dtype)
+    weight = weight * scales.repeat_interleave(group_size, dim=0)
+    return weight.t().contiguous().to(out_dtype)
 
 
 @triton.jit
@@ -1466,7 +1507,15 @@ class Gemma4Model(nn.Module, EagleModelMixin):
         # Include buffers (e.g. layer_scalar) so they can be loaded too
         params_dict.update(dict(self.named_buffers()))
         loaded_params: set[str] = set()
+        router_proj_shards: dict[str, dict[str, torch.Tensor]] = {}
         for name, loaded_weight in weights:
+            prefix, _, suffix = name.rpartition(".")
+            if prefix.endswith(".router.proj") and (
+                suffix in _ROUTER_PROJ_QUANT_SUFFIXES
+            ):
+                router_proj_shards.setdefault(prefix, {})[suffix] = loaded_weight
+                continue
+
             if name.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
                 remapped_name = maybe_remap_kv_scale_name(name, params_dict)
                 if remapped_name is not None and remapped_name in params_dict:
@@ -1555,6 +1604,21 @@ class Gemma4Model(nn.Module, EagleModelMixin):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        for prefix, shards in router_proj_shards.items():
+            target = f"{prefix}.weight"
+            if target not in params_dict or is_pp_missing_parameter(target, self):
+                continue
+            missing = set(_ROUTER_PROJ_QUANT_SUFFIXES) - shards.keys()
+            if missing:
+                raise ValueError(
+                    f"quantized router {prefix} is missing {sorted(missing)}; "
+                    "it cannot be dequantized into a dense projection"
+                )
+            param = params_dict[target]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, _dequantize_router_proj(shards, param.dtype))
+            loaded_params.add(target)
 
         return loaded_params
 

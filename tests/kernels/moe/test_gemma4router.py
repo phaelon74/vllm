@@ -3,7 +3,12 @@
 import pytest
 import torch
 
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    gptq_pack,
+    pack_cols,
+)
 from vllm.model_executor.models.gemma4 import (
+    _dequantize_router_proj,
     gemma4_forced_routing_weights,
     gemma4_fused_routing_kernel_triton,
     gemma4_routing_function_torch,
@@ -13,6 +18,51 @@ from vllm.model_executor.models.gemma4 import (
 def sort_by_id(w, ids):
     order = ids.argsort(dim=-1)
     return w.gather(1, order), ids.gather(1, order)
+
+
+def test_dequantize_router_proj_matches_packed_values_transposed():
+    """A quantized router must reload as GateLinear's dense [E, H] weight.
+
+    AutoRound quantizes the router projection, but GateLinear has no quantized
+    parameter to receive it, so the load path dequantizes instead. Getting the
+    grouping or the orientation wrong yields finite garbage rather than an
+    error, which is why this asserts the exact reconstruction.
+    """
+    torch.manual_seed(0)
+    size_k, size_n, group_size = 64, 16, 32
+    num_groups = size_k // group_size
+
+    q = torch.randint(0, 16, (size_k, size_n), dtype=torch.int32)
+    zp = torch.full((num_groups, size_n), 8, dtype=torch.int32)
+    scales = torch.rand(num_groups, size_n, dtype=torch.bfloat16) + 0.5
+
+    shards = {
+        "qweight": gptq_pack(q, 4, size_k, size_n),
+        "qzeros": pack_cols(zp, 4, num_groups, size_n),
+        "scales": scales,
+    }
+    weight = _dequantize_router_proj(shards, torch.bfloat16)
+
+    expected = (q - zp.repeat_interleave(group_size, dim=0)).to(torch.bfloat16)
+    expected = expected * scales.repeat_interleave(group_size, dim=0)
+
+    assert weight.shape == (size_n, size_k)
+    assert weight.dtype == torch.bfloat16
+    torch.testing.assert_close(weight, expected.t().contiguous())
+
+
+def test_dequantize_router_proj_refuses_indivisible_group_count():
+    size_k, size_n = 64, 16
+    q = torch.randint(0, 16, (size_k, size_n), dtype=torch.int32)
+    shards = {
+        "qweight": gptq_pack(q, 4, size_k, size_n),
+        "qzeros": pack_cols(
+            torch.full((3, size_n), 8, dtype=torch.int32), 4, 3, size_n
+        ),
+        "scales": torch.ones(3, size_n, dtype=torch.bfloat16),
+    }
+    with pytest.raises(ValueError, match="do not divide evenly"):
+        _dequantize_router_proj(shards, torch.bfloat16)
 
 
 def test_gemma4_forced_natural_ids_preserve_triton_weights():
