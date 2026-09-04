@@ -373,6 +373,7 @@ class BaseRouter(FusedMoERouter):
             raise ValueError(
                 "Forced MoE expert IDs and router logits must share a device."
             )
+        forced_topk_ids = forced_topk_ids.contiguous()
 
         topk_weights = self._compute_forced_weights(
             hidden_states,

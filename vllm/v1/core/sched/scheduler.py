@@ -7,8 +7,6 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
-import numpy as np
-
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -70,25 +68,6 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
-
-
-def _select_full_prefill_routed_experts(
-    raw: np.ndarray,
-    reconstructed: np.ndarray,
-) -> np.ndarray:
-    if raw.shape != reconstructed.shape:
-        raise ValueError(
-            "Full-prefill routed-expert shapes differ: "
-            f"raw={raw.shape}, reconstructed={reconstructed.shape}"
-        )
-    mismatch_count = int(np.count_nonzero(raw != reconstructed))
-    if mismatch_count:
-        logger.warning(
-            "Full-prefill routed-expert slot reconstruction differs from "
-            "raw token order at %d entries",
-            mismatch_count,
-        )
-    return raw
 
 
 class Scheduler(SchedulerInterface):
@@ -2007,8 +1986,9 @@ class Scheduler(SchedulerInterface):
                 end = req_offset + num_tokens_scheduled
                 block_ids = self._re_block_ids.pop(req_id, [])
                 if num_output_tokens_before == 0:
-                    # A one-step prefill is already in request/token order.
-                    # Chunked or prefix-cached prefills need slot reconstruction.
+                    # Prefill completed: read full prompt routing from
+                    # slot buffer using the block-ID snapshot taken at
+                    # schedule time (immune to async preemption).
                     if (
                         request.sampling_params is not None
                         and request.sampling_params.routed_experts_prompt_start
@@ -2020,25 +2000,11 @@ class Scheduler(SchedulerInterface):
                         assert prompt_start < request.num_prompt_tokens
                     else:
                         prompt_start = 0
-                    if num_tokens_scheduled == request.num_prompt_tokens:
-                        raw_routed_experts = routing_data[
-                            req_offset + prompt_start : end
-                        ]
-                        slot_routed_experts = self.routed_experts_mgr.get(
-                            block_ids,
-                            request.num_prompt_tokens,
-                            token_start=prompt_start,
-                        )
-                        routed_experts = _select_full_prefill_routed_experts(
-                            raw_routed_experts,
-                            slot_routed_experts,
-                        )
-                    else:
-                        routed_experts = self.routed_experts_mgr.get(
-                            block_ids,
-                            request.num_prompt_tokens,
-                            token_start=prompt_start,
-                        )
+                    routed_experts = self.routed_experts_mgr.get(
+                        block_ids,
+                        request.num_prompt_tokens,
+                        token_start=prompt_start,
+                    )
                 else:
                     if scheduled_spec_token_ids:
                         # Spec decode: accepted tokens at the START of

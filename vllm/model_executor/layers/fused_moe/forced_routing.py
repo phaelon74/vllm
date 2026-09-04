@@ -94,7 +94,7 @@ class ForcedRouting:
                 raise ValueError(
                     "Forced MoE expert IDs must be unique within each token."
                 )
-        return layer_ids
+        return layer_ids.contiguous()
 
 
 def get_forced_expert_ids(

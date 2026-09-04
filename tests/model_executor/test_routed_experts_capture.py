@@ -433,7 +433,7 @@ def _runner_for_forced_routing(router, *, monolithic=False):
     )
     quant_method = SimpleNamespace(
         is_monolithic=monolithic,
-        topk_indices_dtype=torch.int64,
+        topk_indices_dtype=None,
         apply_monolithic_routed=Mock(return_value=torch.empty(1, 1)),
     )
     runner.router = router
@@ -443,6 +443,23 @@ def _runner_for_forced_routing(router, *, monolithic=False):
         forward_monolithic=Mock(return_value=torch.empty(1, 1)),
     )
     return runner
+
+
+def test_forced_routing_materializes_contiguous_per_layer_ids():
+    expert_ids = torch.arange(24, dtype=torch.int32).reshape(3, 4, 2)
+    assert not expert_ids[:, 2, :].is_contiguous()
+
+    layer_ids = ForcedRouting(expert_ids=expert_ids).for_layer(
+        2,
+        num_tokens=3,
+        top_k=2,
+        num_experts=24,
+        device=torch.device("cpu"),
+    )
+
+    assert torch.equal(layer_ids, expert_ids[:, 2, :])
+    assert layer_ids.is_contiguous()
+    assert layer_ids.stride() == (2, 1)
 
 
 def test_modular_runner_dispatches_forced_ids_with_student_weights():
@@ -475,7 +492,7 @@ def test_modular_runner_dispatches_forced_ids_with_student_weights():
         runner._apply_quant_method(torch.empty(1, 1), logits, None)
 
     call = runner.routed_experts.forward_modular.call_args.kwargs
-    assert torch.equal(call["topk_ids"], forced_ids[:, 0].to(torch.int64))
+    assert torch.equal(call["topk_ids"], forced_ids[:, 0])
     selected_scores = torch.softmax(logits, dim=-1).gather(
         1, forced_ids[:, 0].to(torch.int64)
     )

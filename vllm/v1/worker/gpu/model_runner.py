@@ -200,7 +200,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.is_encoder_decoder = self.model_config.is_encoder_decoder
         self._forced_routing_requests: dict[str, tuple[str, str]] = {}
-        self._forced_routing_cache: dict[str, torch.Tensor] = {}
+        self._forced_routing_cache: dict[tuple[str, str], torch.Tensor] = {}
 
         self.output_copy_stream = torch.cuda.Stream(self.device)
 
@@ -1537,7 +1537,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             path, expected_sha = self._forced_routing_requests[req_id]
             if sha256_file(path) != expected_sha:
                 raise ValueError(f"BxQ routing trace hash mismatch: {path}")
-            trace = self._forced_routing_cache.get(path)
+            cache_key = (path, expected_sha)
+            trace = self._forced_routing_cache.get(cache_key)
             if trace is None:
                 tensors = load_file(path, device="cpu")
                 if set(tensors) != {"routed_experts"}:
@@ -1549,7 +1550,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     raise ValueError(
                         f"BxQ routing trace must be [tokens, layers, top_k]: {path}"
                     )
-                self._forced_routing_cache[path] = trace
+                self._forced_routing_cache[cache_key] = trace
             tail = (trace.shape[1], trace.shape[2])
             if expected_tail is not None and tail != expected_tail:
                 raise ValueError("BxQ requests in one batch use incompatible traces")

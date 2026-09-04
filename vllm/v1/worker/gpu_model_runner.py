@@ -731,7 +731,7 @@ class GPUModelRunner(
         self._kld_lm_head_cache: dict[
             str, tuple[torch.nn.Module, torch.nn.Module]
         ] = {}
-        self._forced_routing_cache: dict[str, torch.Tensor] = {}
+        self._forced_routing_cache: dict[tuple[str, str], torch.Tensor] = {}
 
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
@@ -4346,7 +4346,8 @@ class GPUModelRunner(
             assert path is not None and expected_sha is not None
             if sha256_file(path) != expected_sha:
                 raise ValueError(f"BxQ routing trace hash mismatch: {path}")
-            trace = self._forced_routing_cache.get(path)
+            cache_key = (path, expected_sha)
+            trace = self._forced_routing_cache.get(cache_key)
             if trace is None:
                 tensors = load_file(path, device="cpu")
                 if set(tensors) != {"routed_experts"}:
@@ -4358,7 +4359,7 @@ class GPUModelRunner(
                     raise ValueError(
                         f"BxQ routing trace must be [tokens, layers, top_k]: {path}"
                     )
-                self._forced_routing_cache[path] = trace
+                self._forced_routing_cache[cache_key] = trace
             tail = (trace.shape[1], trace.shape[2])
             if expected_tail is not None and tail != expected_tail:
                 raise ValueError("BxQ requests in one batch use incompatible traces")
