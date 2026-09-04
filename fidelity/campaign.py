@@ -1997,6 +1997,7 @@ def cmd_score(config: Config, python: str) -> int:
                 raise SystemExit(
                     f"LAW 1 STOP: could not download reference {model.name}"
                 )
+        routed = bool(qdq_routing(model.reference_path))
         # Law 1: the reference must reproduce itself before anything else runs.
         # One row suffices, because the only acceptable answer is exact zero.
         try:
@@ -2024,7 +2025,6 @@ def cmd_score(config: Config, python: str) -> int:
 
         # Law 14's routing term is measured, not emulated, so a routed
         # reference needs its own expert selections recorded once.
-        routed = bool(qdq_routing(model.reference_path))
 
         for cand in model.candidates:
             if routed:
