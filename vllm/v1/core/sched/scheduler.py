@@ -1986,9 +1986,8 @@ class Scheduler(SchedulerInterface):
                 end = req_offset + num_tokens_scheduled
                 block_ids = self._re_block_ids.pop(req_id, [])
                 if num_output_tokens_before == 0:
-                    # Prefill completed: read full prompt routing from
-                    # slot buffer using the block-ID snapshot taken at
-                    # schedule time (immune to async preemption).
+                    # A one-step prefill is already in request/token order.
+                    # Chunked or prefix-cached prefills need slot reconstruction.
                     if (
                         request.sampling_params is not None
                         and request.sampling_params.routed_experts_prompt_start
@@ -2000,11 +1999,33 @@ class Scheduler(SchedulerInterface):
                         assert prompt_start < request.num_prompt_tokens
                     else:
                         prompt_start = 0
-                    routed_experts = self.routed_experts_mgr.get(
-                        block_ids,
-                        request.num_prompt_tokens,
-                        token_start=prompt_start,
-                    )
+                    if num_tokens_scheduled == request.num_prompt_tokens:
+                        raw_routed_experts = routing_data[
+                            req_offset + prompt_start : end
+                        ]
+                        slot_routed_experts = self.routed_experts_mgr.get(
+                            block_ids,
+                            request.num_prompt_tokens,
+                            token_start=prompt_start,
+                        )
+                        mismatch_count = int(
+                            np.count_nonzero(
+                                raw_routed_experts != slot_routed_experts
+                            )
+                        )
+                        if mismatch_count:
+                            logger.warning(
+                                "Full-prefill routed-expert slot reconstruction "
+                                "differs from raw token order at %d entries",
+                                mismatch_count,
+                            )
+                        routed_experts = raw_routed_experts
+                    else:
+                        routed_experts = self.routed_experts_mgr.get(
+                            block_ids,
+                            request.num_prompt_tokens,
+                            token_start=prompt_start,
+                        )
                 else:
                     if scheduled_spec_token_ids:
                         # Spec decode: accepted tokens at the START of
