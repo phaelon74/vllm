@@ -2172,15 +2172,15 @@ def selftest() -> int:
         "bxq_repeat_mean_absolute_position_delta": 0.0,
         "max_absolute_position_delta": 0.0,
         "absolute_mean_delta": 0.0,
-        "position_absolute_tolerance": 1e-5,
-        "mean_absolute_tolerance": 1e-7,
+        "position_absolute_tolerance": 0.0,
+        "mean_absolute_tolerance": 0.0,
         "deterministic": True,
         "natural_kld_sha256": "a" * 64,
-        "natural_repeat_kld_sha256": "b" * 64,
-        "control_kld_sha256": "c" * 64,
-        "control_repeat_kld_sha256": "d" * 64,
+        "natural_repeat_kld_sha256": "a" * 64,
+        "control_kld_sha256": "a" * 64,
+        "control_repeat_kld_sha256": "a" * 64,
         "bxq_kld_sha256": "e" * 64,
-        "bxq_repeat_kld_sha256": "f" * 64,
+        "bxq_repeat_kld_sha256": "e" * 64,
     }
     attribution = {
         "qxq_cell": {
@@ -2204,6 +2204,7 @@ def selftest() -> int:
                 "certified_for_exact_repeat": True,
                 "batch_invariant": True,
                 "per_layer_consistent": True,
+                "recurrent_per_layer_consistent": True,
             },
             "natural_control_parity": control,
         },
@@ -2219,9 +2220,9 @@ def selftest() -> int:
     control["natural_repeat_route_flip_rate"] = 0.01
     assert law_14_component_attribution(campaign).status == "fail"
     control["natural_repeat_route_flip_rate"] = 0.0
-    control["position_absolute_tolerance"] = 2e-5
-    assert law_14_component_attribution(campaign).status == "fail"
     control["position_absolute_tolerance"] = 1e-5
+    assert law_14_component_attribution(campaign).status == "fail"
+    control["position_absolute_tolerance"] = 0.0
     control["max_absolute_position_delta"] = 1e-4
     assert law_14_component_attribution(campaign).status == "fail"
     control["max_absolute_position_delta"] = 0.0

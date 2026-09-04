@@ -783,23 +783,19 @@ def law_14_component_attribution(c: Campaign) -> Finding:
         backend.get("certified_for_exact_repeat") is True
         and backend.get("batch_invariant") is True
         and backend.get("per_layer_consistent") is True
+        and backend.get("recurrent_per_layer_consistent") is True
     )
     exact = (
         route_mismatches == 0
-        and float(control["natural_repeat_max_absolute_position_delta"])
-        <= 1e-5
-        and float(control["natural_repeat_mean_absolute_position_delta"])
-        <= 1e-7
-        and float(control["control_repeat_max_absolute_position_delta"])
-        <= 1e-5
-        and float(control["control_repeat_mean_absolute_position_delta"])
-        <= 1e-7
-        and float(control["bxq_repeat_max_absolute_position_delta"]) <= 1e-5
-        and float(control["bxq_repeat_mean_absolute_position_delta"]) <= 1e-7
-        and float(control["max_absolute_position_delta"]) <= 1e-5
-        and float(control["absolute_mean_delta"]) <= 1e-7
-        and _same_number(control["position_absolute_tolerance"], 1e-5)
-        and _same_number(control["mean_absolute_tolerance"], 1e-7)
+        and all(
+            float(control[field]) == 0.0
+            for field in numeric_control_fields
+        )
+        and control["natural_kld_sha256"]
+        == control["natural_repeat_kld_sha256"]
+        == control["control_kld_sha256"]
+        == control["control_repeat_kld_sha256"]
+        and control["bxq_kld_sha256"] == control["bxq_repeat_kld_sha256"]
         and control.get("deterministic") is True
         and backend_certified
     )

@@ -410,8 +410,8 @@ ROUTING_MANIFEST = "routing-manifest.json"
 ROUTING_TRACE_PROTOCOL_VERSION = 2
 PAIRED_ROUTED_SCORE_PROTOCOL_VERSION = 4
 EXACT_REPEAT_PROTOCOL = "exact_repeat_certification_v1"
-CONTROL_POSITION_BASE_TOLERANCE = 1e-5
-CONTROL_MEAN_BASE_TOLERANCE = 1e-7
+CONTROL_POSITION_BASE_TOLERANCE = 0.0
+CONTROL_MEAN_BASE_TOLERANCE = 0.0
 
 
 def _kld_digest(values) -> str:
@@ -1900,16 +1900,19 @@ def calculate_kld(
             raise RuntimeError("exact-repeat certification requires two BxQ samples")
         bxq_repeat_max_abs = _max_abs_span(bxq_values, bxq_repeat_values)
         bxq_repeat_mean_abs = _mean_abs_span(bxq_values, bxq_repeat_values)
+        natural_digest = _kld_digest(natural_values)
+        natural_repeat_digest = _kld_digest(natural_repeat_values)
+        control_digest = _kld_digest(control_values)
+        control_repeat_digest = _kld_digest(control_repeat_values)
+        bxq_digest = _kld_digest(bxq_values)
+        bxq_repeat_digest = _kld_digest(bxq_repeat_values)
         exact = (
             natural_repeat_route_mismatches == 0
-            and repeat_max_abs <= CONTROL_POSITION_BASE_TOLERANCE
-            and repeat_mean_abs <= CONTROL_MEAN_BASE_TOLERANCE
-            and control_repeat_max_abs <= CONTROL_POSITION_BASE_TOLERANCE
-            and control_repeat_mean_abs <= CONTROL_MEAN_BASE_TOLERANCE
-            and control_max_abs <= CONTROL_POSITION_BASE_TOLERANCE
-            and control_mean_delta <= CONTROL_MEAN_BASE_TOLERANCE
-            and bxq_repeat_max_abs <= CONTROL_POSITION_BASE_TOLERANCE
-            and bxq_repeat_mean_abs <= CONTROL_MEAN_BASE_TOLERANCE
+            and natural_digest
+            == natural_repeat_digest
+            == control_digest
+            == control_repeat_digest
+            and bxq_digest == bxq_repeat_digest
         )
         control_evidence = {
             "protocol": EXACT_REPEAT_PROTOCOL,
@@ -1941,12 +1944,12 @@ def calculate_kld(
             "position_absolute_tolerance": CONTROL_POSITION_BASE_TOLERANCE,
             "mean_absolute_tolerance": CONTROL_MEAN_BASE_TOLERANCE,
             "deterministic": exact,
-            "natural_kld_sha256": _kld_digest(natural_values),
-            "natural_repeat_kld_sha256": _kld_digest(natural_repeat_values),
-            "control_kld_sha256": _kld_digest(control_values),
-            "control_repeat_kld_sha256": _kld_digest(control_repeat_values),
-            "bxq_kld_sha256": _kld_digest(bxq_values),
-            "bxq_repeat_kld_sha256": _kld_digest(bxq_repeat_values),
+            "natural_kld_sha256": natural_digest,
+            "natural_repeat_kld_sha256": natural_repeat_digest,
+            "control_kld_sha256": control_digest,
+            "control_repeat_kld_sha256": control_repeat_digest,
+            "bxq_kld_sha256": bxq_digest,
+            "bxq_repeat_kld_sha256": bxq_repeat_digest,
         }
         report["kld_evidence"] = {
             "natural_kld_sha256": control_evidence["natural_kld_sha256"],

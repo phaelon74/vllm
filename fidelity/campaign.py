@@ -134,15 +134,15 @@ def _repeatability_control_is_current(control: Any) -> bool:
     if (
         not math.isclose(
             float(control["position_absolute_tolerance"]),
-            1e-5,
+            0.0,
             rel_tol=0.0,
-            abs_tol=1e-18,
+            abs_tol=0.0,
         )
         or not math.isclose(
             float(control["mean_absolute_tolerance"]),
-            1e-7,
+            0.0,
             rel_tol=0.0,
-            abs_tol=1e-18,
+            abs_tol=0.0,
         )
     ):
         return False
@@ -160,21 +160,24 @@ def _repeatability_control_is_current(control: Any) -> bool:
         for field in digest_fields
     ):
         return False
-    exact_fields = (
+    delta_fields = (
         "natural_repeat_max_absolute_position_delta",
-        "control_repeat_max_absolute_position_delta",
-        "bxq_repeat_max_absolute_position_delta",
-        "max_absolute_position_delta",
-    )
-    mean_fields = (
+        "natural_repeat_absolute_mean_delta",
         "natural_repeat_mean_absolute_position_delta",
+        "control_repeat_max_absolute_position_delta",
         "control_repeat_mean_absolute_position_delta",
+        "bxq_repeat_max_absolute_position_delta",
         "bxq_repeat_mean_absolute_position_delta",
+        "max_absolute_position_delta",
         "absolute_mean_delta",
     )
     return (
-        all(float(control[field]) <= 1e-5 for field in exact_fields)
-        and all(float(control[field]) <= 1e-7 for field in mean_fields)
+        all(float(control[field]) == 0.0 for field in delta_fields)
+        and control["natural_kld_sha256"]
+        == control["natural_repeat_kld_sha256"]
+        == control["control_kld_sha256"]
+        == control["control_repeat_kld_sha256"]
+        and control["bxq_kld_sha256"] == control["bxq_repeat_kld_sha256"]
     )
 
 
@@ -3110,15 +3113,15 @@ def selftest() -> int:
                     "bxq_repeat_mean_absolute_position_delta": 0.0,
                     "max_absolute_position_delta": 0.0,
                     "absolute_mean_delta": 0.0,
-                    "position_absolute_tolerance": 1e-5,
-                    "mean_absolute_tolerance": 1e-7,
+                    "position_absolute_tolerance": 0.0,
+                    "mean_absolute_tolerance": 0.0,
                     "deterministic": True,
                     "natural_kld_sha256": "a" * 64,
-                    "natural_repeat_kld_sha256": "b" * 64,
-                    "control_kld_sha256": "c" * 64,
-                    "control_repeat_kld_sha256": "d" * 64,
+                    "natural_repeat_kld_sha256": "a" * 64,
+                    "control_kld_sha256": "a" * 64,
+                    "control_repeat_kld_sha256": "a" * 64,
                     "bxq_kld_sha256": "e" * 64,
-                    "bxq_repeat_kld_sha256": "f" * 64,
+                    "bxq_repeat_kld_sha256": "e" * 64,
                 },
                 "backend_evidence": {
                     "replay_supported": True,
