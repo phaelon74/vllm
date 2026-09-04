@@ -248,6 +248,8 @@ def _paired_report_is_current(report: dict[str, Any]) -> bool:
     control = bxq.get("natural_control_parity") if isinstance(bxq, dict) else None
     backend = bxq.get("backend_evidence") if isinstance(bxq, dict) else None
     digest = report.get("student_weights_sha256")
+    # Candidate-cell before/after bindings are added by score_candidate after
+    # this runtime report is reused. Compliance still requires them at assemble.
     return (
         report.get("paired_routing_protocol_version")
         == PAIRED_ROUTED_SCORE_PROTOCOL_VERSION
@@ -271,12 +273,8 @@ def _paired_report_is_current(report: dict[str, Any]) -> bool:
         and backend.get("replay_supported") is True
         and isinstance(digest, str)
         and len(digest) == 64
-        and qxq.get("candidate_weights_sha256") == digest
-        and bxq.get("candidate_weights_sha256") == digest
         and bxq.get("reference_weights_sha256")
         == report.get("reference_weights_sha256")
-        and qxq.get("candidate_weights_unchanged") is True
-        and bxq.get("candidate_weights_unchanged") is True
     )
 
 
