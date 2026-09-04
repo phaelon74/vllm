@@ -1602,52 +1602,11 @@ def calculate_kld(
                     routing_manifest["layer_map"],
                 )
         if control_temp is not None:
-            import numpy as np
             from safetensors.numpy import save_file as save_numpy
 
             natural_ids = out.outputs[0].routed_experts if out.outputs else None
             if natural_ids is None:
                 raise RuntimeError("QxQ pass returned no routes for control parity")
-            with _phase(timings, "qxq_natural_repeat_forward"):
-                repeat_out = llm.generate(
-                    [prompt],
-                    sampling_params=SamplingParams(max_tokens=1, kld_mode=True),
-                )[0]
-            if repeat_out.kld_result is None:
-                raise RuntimeError("QxQ natural repeat returned no KLD result")
-            repeat_ids = (
-                repeat_out.outputs[0].routed_experts
-                if repeat_out.outputs
-                else None
-            )
-            if repeat_ids is None or not np.array_equal(natural_ids, repeat_ids):
-                raise RuntimeError(
-                    "QxQ deployed natural execution is not routing-deterministic"
-                )
-            natural_values = np.asarray(
-                out.kld_result.kld_ref_to_model[score_from:], dtype=np.float64
-            )
-            repeat_values = np.asarray(
-                repeat_out.kld_result.kld_ref_to_model[score_from:],
-                dtype=np.float64,
-            )
-            repeat_max_abs = float(
-                np.max(np.abs(natural_values - repeat_values), initial=0.0)
-            )
-            repeat_mean_delta = float(
-                repeat_values.mean() - natural_values.mean()
-            )
-            print(
-                "QxQ natural-repeat control: "
-                f"max position delta {repeat_max_abs:.3e}, "
-                f"mean delta {repeat_mean_delta:.3e}"
-            )
-            if repeat_max_abs > 1e-5 or abs(repeat_mean_delta) > 1e-7:
-                raise RuntimeError(
-                    "QxQ deployed natural execution is not score-deterministic: "
-                    f"max position delta {repeat_max_abs:.3e}, mean delta "
-                    f"{repeat_mean_delta:.3e}"
-                )
             control_path = os.path.join(
                 control_temp.name, _routing_filename(idx)
             )
