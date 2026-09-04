@@ -23,7 +23,7 @@ from typing import Any
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from redaction import redact_env  # noqa: E402 - sibling module
 
-LAWS_VERSION = 10
+LAWS_VERSION = 11
 PROGRAM = "Local Inference Lab"
 # Vendor calibration on packed int4. QDQ still matches format only.
 _CALIBRATED_ALGORITHMS = frozenset({"awq", "gptq", "autoround"})
@@ -733,6 +733,7 @@ def _paired_routing_intervention(receipt: dict[str, Any]) -> list[str]:
         return []
     delta = attribution.get("routing_intervention_delta")
     routing = receipt.get("routing") or {}
+    control = bxq.get("natural_control_parity") or {}
     out = [
         "## Routed-model intervention: QxQ and BxQ",
         "",
@@ -771,6 +772,19 @@ def _paired_routing_intervention(receipt: dict[str, Any]) -> list[str]:
         f"**{_pct(routing.get('selection_flip_rate'))}** of (token, layer) "
         f"choices. BxQ protocol {bxq.get('protocol_version')}; routing trace "
         f"`{_short(bxq.get('routing_trace_sha256'), 16)}`.",
+        "",
+        "Natural control used "
+        + (
+            "the deterministic exactness floor"
+            if control.get("deterministic") is True
+            else "a measured backend-repeatability envelope"
+        )
+        + ": max position delta "
+        + f"{float(control.get('max_absolute_position_delta', 0.0)):.3e} / "
+        + f"{float(control.get('position_absolute_tolerance', 0.0)):.3e}; "
+        + "absolute mean delta "
+        + f"{float(control.get('absolute_mean_delta', 0.0)):.3e} / "
+        + f"{float(control.get('mean_absolute_tolerance', 0.0)):.3e}.",
         "",
     ]
     return out
@@ -2105,6 +2119,23 @@ def selftest() -> int:
         "reference_config_sha256": "reference",
         "candidate_weights_sha256": digest,
     }
+    control = {
+        "protocol": "natural_repeatability_envelope_v1",
+        "passed": True,
+        "natural_samples": 2,
+        "control_samples": 2,
+        "natural_repeat_max_absolute_position_delta": 0.0,
+        "natural_repeat_absolute_mean_delta": 0.0,
+        "natural_repeat_mean_absolute_position_delta": 0.0,
+        "control_repeat_max_absolute_position_delta": 0.0,
+        "control_repeat_mean_absolute_position_delta": 0.0,
+        "max_absolute_position_delta": 0.0,
+        "absolute_mean_delta": 0.0,
+        "position_absolute_tolerance": 1e-5,
+        "mean_absolute_tolerance": 1e-7,
+        "repeatability_multiplier": 2.0,
+        "deterministic": True,
+    }
     attribution = {
         "qxq_cell": {
             **binding,
@@ -2118,14 +2149,14 @@ def selftest() -> int:
             "routing_trace_sha256": trace,
             "routing_trace_manifest": "routing-manifest.json",
             "routing_mode": "teacher_ids_student_weights",
-            "protocol_version": 1,
+            "protocol_version": 2,
             "routing_trace_protocol_version": 2,
             "candidate_weights_unchanged": True,
             "backend_evidence": {
                 "replay_supported": True,
                 "backend": "selftest",
             },
-            "natural_control_parity": {"passed": True},
+            "natural_control_parity": control,
         },
         "routing_intervention_delta": 0.04,
     }
@@ -2136,9 +2167,29 @@ def selftest() -> int:
         attribution=attribution,
     )
     assert law_14_component_attribution(campaign).status == "pass"
-    attribution["bxq_cell"]["natural_control_parity"] = {"passed": False}
+    control["position_absolute_tolerance"] = 2e-5
     assert law_14_component_attribution(campaign).status == "fail"
-    attribution["bxq_cell"]["natural_control_parity"] = {"passed": True}
+    control["position_absolute_tolerance"] = 1e-5
+    control.update(
+        {
+            "natural_repeat_max_absolute_position_delta": 0.1,
+            "natural_repeat_mean_absolute_position_delta": 0.01,
+            "control_repeat_max_absolute_position_delta": 0.08,
+            "control_repeat_mean_absolute_position_delta": 0.008,
+            "max_absolute_position_delta": 0.15,
+            "absolute_mean_delta": 0.015,
+            "position_absolute_tolerance": 0.2,
+            "mean_absolute_tolerance": 0.02,
+            "deterministic": False,
+        }
+    )
+    assert law_14_component_attribution(campaign).status == "pass"
+    control["max_absolute_position_delta"] = 0.21
+    assert law_14_component_attribution(campaign).status == "fail"
+    control["max_absolute_position_delta"] = 0.15
+    attribution["bxq_cell"]["natural_control_parity"]["passed"] = False
+    assert law_14_component_attribution(campaign).status == "fail"
+    attribution["bxq_cell"]["natural_control_parity"]["passed"] = True
     campaign.manifest["reference_routing"] = {}
     assert law_14_component_attribution(campaign).status == "not_applicable"
 

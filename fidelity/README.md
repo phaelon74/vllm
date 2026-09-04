@@ -402,8 +402,12 @@ attribution.
 The pair is tightly controlled. Both runs use the same tokens, reference capture,
 candidate weight digest, and report protocol. BxQ binds the exact teacher-ID trace.
 If replay needs another backend path, that path first runs without forcing and
-must reproduce deployed QxQ within the declared bound. Unsupported replay or a
-failed natural control fails compliance; it is never replaced by a QDQ estimate.
+must reproduce deployed QxQ within a measured repeatability envelope. The
+protocol runs two natural and two forced-natural samples: deterministic kernels
+retain the fixed exactness floor, while nondeterministic kernels receive only
+twice their larger observed repeatability span. Every span and derived bound is
+published and compliance-checked. Unsupported replay or a failed natural control
+fails compliance; it is never replaced by a QDQ estimate.
 
 ### Natural divergence and forced routing are different
 

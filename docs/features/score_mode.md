@@ -236,9 +236,11 @@ Manual verification commands live in
 Scoring is only meaningful if the same command produces the same score every
 time. Investigation on this fork found:
 
-- **Eager execution** (`enforce_eager=True`) is bit-reproducible on the first
-  run: identical Mean KLD across repeated runs, and byte-identical reference
-  logits across independent generations (verified via `sha256sum`).
+- **Eager execution** (`enforce_eager=True`) removes graph-level timing choices,
+  but does not make every custom GPU kernel bit-reproducible. Marlin MoE, for
+  example, has produced 1–2 ULP BF16 differences from identical inputs and
+  routing. Paired routed scoring measures and publishes this repeatability
+  floor instead of assuming it away.
 - The **compiled stack** wobbles run-to-run even with every known timing-based
   selector disabled (`combo_kernels`, Inductor pointwise autotune,
   `TORCHINDUCTOR_DETERMINISTIC=1`, FlashInfer autotune). It converges to an
@@ -255,8 +257,9 @@ time. Investigation on this fork found:
 ### Rules
 
 1. **Scoring runs eager.** The example scripts use eager mode by default. API
-   users must pass `enforce_eager=True`. One pass is sufficient; the first run
-   is already exact.
+   users must pass `enforce_eager=True`. Paired routed scoring repeats both its
+   natural and forced-natural controls because eager custom kernels may still
+   be numerically nondeterministic.
 2. **Never mix stacks.** References and every scored model must use the same
    execution mode on the same GPU, driver, and PyTorch build. Regenerate
    references after any of those change.
@@ -266,7 +269,7 @@ time. Investigation on this fork found:
 4. **Use the runner the model requires.** Both V1 and V2 implement score mode
    through `compute_kld_chunk`. GLM-5.3-Flash needs V2. Do not pin V1 globally.
 
-### Exact commands (always deterministic)
+### Eager scoring commands
 
 Generate reference logits and score a quant (one pass each; no extra flags):
 

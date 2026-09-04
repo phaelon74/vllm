@@ -67,7 +67,7 @@ FP32_COPIES = 4
 # Peak vs live tensors; expandable_segments keeps this from growing further.
 ALLOCATOR_SLACK = 1.25
 TP_CANDIDATES = (1, 2, 4, 8)
-PAIRED_ROUTED_SCORE_PROTOCOL_VERSION = 1
+PAIRED_ROUTED_SCORE_PROTOCOL_VERSION = 2
 ROUTING_TRACE_PROTOCOL_VERSION = 2
 _REFERENCE_WEIGHT_DIGESTS: dict[str, str] = {}
 
@@ -82,6 +82,78 @@ class CandidateRefused(CampaignError):
     Distinct from a failure: nothing went wrong here, so it must not be counted
     as though something had. A refused candidate is a disclosed absence.
     """
+
+
+def _repeatability_control_is_current(control: Any) -> bool:
+    if (
+        not isinstance(control, dict)
+        or control.get("protocol") != "natural_repeatability_envelope_v1"
+        or control.get("passed") is not True
+        or control.get("natural_samples") != 2
+        or control.get("control_samples") != 2
+        or control.get("repeatability_multiplier") != 2.0
+    ):
+        return False
+    fields = (
+        "natural_repeat_max_absolute_position_delta",
+        "natural_repeat_absolute_mean_delta",
+        "natural_repeat_mean_absolute_position_delta",
+        "control_repeat_max_absolute_position_delta",
+        "control_repeat_mean_absolute_position_delta",
+        "max_absolute_position_delta",
+        "absolute_mean_delta",
+        "position_absolute_tolerance",
+        "mean_absolute_tolerance",
+    )
+    if any(
+        not isinstance(control.get(field), (int, float))
+        or not math.isfinite(float(control[field]))
+        or float(control[field]) < 0
+        for field in fields
+    ):
+        return False
+    position_tolerance = max(
+        1e-5,
+        2.0
+        * max(
+            float(control["natural_repeat_max_absolute_position_delta"]),
+            float(control["control_repeat_max_absolute_position_delta"]),
+        ),
+    )
+    mean_tolerance = max(
+        1e-7,
+        2.0
+        * max(
+            float(control["natural_repeat_mean_absolute_position_delta"]),
+            float(control["control_repeat_mean_absolute_position_delta"]),
+        ),
+    )
+    deterministic = (
+        float(control["natural_repeat_max_absolute_position_delta"]) <= 1e-5
+        and float(control["natural_repeat_mean_absolute_position_delta"])
+        <= 1e-7
+        and float(control["control_repeat_max_absolute_position_delta"])
+        <= 1e-5
+        and float(control["control_repeat_mean_absolute_position_delta"])
+        <= 1e-7
+    )
+    return (
+        control.get("deterministic") is deterministic
+        and math.isclose(
+            float(control["position_absolute_tolerance"]),
+            position_tolerance,
+            rel_tol=1e-12,
+            abs_tol=1e-15,
+        )
+        and math.isclose(
+            float(control["mean_absolute_tolerance"]),
+            mean_tolerance,
+            rel_tol=1e-12,
+            abs_tol=1e-15,
+        )
+        and float(control["max_absolute_position_delta"]) <= position_tolerance
+        and float(control["absolute_mean_delta"]) <= mean_tolerance
+    )
 
 
 @dataclass
@@ -172,8 +244,7 @@ def _paired_report_is_current(report: dict[str, Any]) -> bool:
         and len(trace) == 64
         and isinstance(trace_manifest, str)
         and os.path.isfile(trace_manifest)
-        and isinstance(control, dict)
-        and control.get("passed") is True
+        and _repeatability_control_is_current(control)
         and isinstance(backend, dict)
         and backend.get("replay_supported") is True
         and isinstance(digest, str)
@@ -1989,11 +2060,7 @@ def cmd_smoke(
             qxq = payload.get("qxq_cell") or {}
             bxq = payload.get("bxq_cell") or {}
             control = bxq.get("natural_control_parity") or {}
-            if not (
-                isinstance(qxq.get("mean_kld"), (int, float))
-                and isinstance(bxq.get("mean_kld"), (int, float))
-                and control.get("passed") is True
-            ):
+            if not _paired_report_is_current(payload):
                 raise SystemExit(
                     f"SMOKE FAIL {candidate.name}: incomplete paired report {report}"
                 )
@@ -2001,6 +2068,18 @@ def cmd_smoke(
                 f"SMOKE PASS {candidate.name}: "
                 f"QxQ={qxq['mean_kld']:.8f} BxQ={bxq['mean_kld']:.8f} "
                 f"delta={payload['routing_intervention_delta']:+.8f}"
+            )
+            print(
+                "  control: "
+                + (
+                    "deterministic exactness floor"
+                    if control.get("deterministic") is True
+                    else "measured repeatability envelope"
+                )
+                + f", max={control['max_absolute_position_delta']:.3e}/"
+                f"{control['position_absolute_tolerance']:.3e}, "
+                f"mean={control['absolute_mean_delta']:.3e}/"
+                f"{control['mean_absolute_tolerance']:.3e}"
             )
             maybe_release(config, candidate)
     if wanted_candidates and attempted == 0:
@@ -2905,7 +2984,23 @@ def selftest() -> int:
                 "routing_trace_sha256": "e" * 64,
                 "routing_trace_manifest": trace.name,
                 "reference_weights_sha256": "f" * 64,
-                "natural_control_parity": {"passed": True},
+                "natural_control_parity": {
+                    "protocol": "natural_repeatability_envelope_v1",
+                    "passed": True,
+                    "natural_samples": 2,
+                    "control_samples": 2,
+                    "natural_repeat_max_absolute_position_delta": 0.0,
+                    "natural_repeat_absolute_mean_delta": 0.0,
+                    "natural_repeat_mean_absolute_position_delta": 0.0,
+                    "control_repeat_max_absolute_position_delta": 0.0,
+                    "control_repeat_mean_absolute_position_delta": 0.0,
+                    "max_absolute_position_delta": 0.0,
+                    "absolute_mean_delta": 0.0,
+                    "position_absolute_tolerance": 1e-5,
+                    "mean_absolute_tolerance": 1e-7,
+                    "repeatability_multiplier": 2.0,
+                    "deterministic": True,
+                },
                 "backend_evidence": {"replay_supported": True},
                 "candidate_weights_sha256": digest,
                 "candidate_weights_unchanged": True,

@@ -39,9 +39,8 @@ from vllm.inputs import TokensPrompt
 logger = logging.getLogger(__name__)
 
 # Best-effort compiled determinism config (--compiled only). Eager execution
-# (the default) is the only mode proven bit-reproducible run-to-run on the
-# current stack. This config disables known timing-based selectors but does
-# not guarantee reproducibility; see docs/features/score_mode.md.
+# (the default) avoids graph-level timing choices, but custom GPU kernels may
+# still be numerically nondeterministic. Paired routing measures that floor.
 DETERMINISTIC_COMPILATION_CONFIG: dict[str, Any] = {
     "inductor_compile_config": {
         "combo_kernels": False,
@@ -82,7 +81,7 @@ def apply_compiled_llm_kwargs(llm_kwargs: dict[str, Any]) -> None:
 
 
 def apply_eager_llm_kwargs(llm_kwargs: dict[str, Any]) -> None:
-    """Apply guaranteed bit-reproducible eager execution (default)."""
+    """Avoid graph-level autotuning and compilation choices (default)."""
     llm_kwargs["enforce_eager"] = True
 
 
@@ -399,7 +398,10 @@ def _dump_positions(chunks: Any, score_from: int, path: str) -> None:
 
 ROUTING_MANIFEST = "routing-manifest.json"
 ROUTING_TRACE_PROTOCOL_VERSION = 2
-PAIRED_ROUTED_SCORE_PROTOCOL_VERSION = 1
+PAIRED_ROUTED_SCORE_PROTOCOL_VERSION = 2
+CONTROL_POSITION_BASE_TOLERANCE = 1e-5
+CONTROL_MEAN_BASE_TOLERANCE = 1e-7
+CONTROL_REPEATABILITY_MULTIPLIER = 2.0
 
 
 def _routing_filename(idx: int) -> str:
@@ -1560,7 +1562,9 @@ def calculate_kld(
         )
 
     chunks: list[KLDResult] = []
+    natural_repeat_chunks: list[KLDResult] = []
     control_chunks: list[KLDResult] = []
+    control_repeat_chunks: list[KLDResult] = []
     control_temp = (
         tempfile.TemporaryDirectory(prefix="vllm-kld-qxq-control-")
         if paired_routing
@@ -1602,11 +1606,29 @@ def calculate_kld(
                     routing_manifest["layer_map"],
                 )
         if control_temp is not None:
+            import numpy as np
             from safetensors.numpy import save_file as save_numpy
 
             natural_ids = out.outputs[0].routed_experts if out.outputs else None
             if natural_ids is None:
                 raise RuntimeError("QxQ pass returned no routes for control parity")
+            with _phase(timings, "qxq_natural_repeat_forward"):
+                repeat_out = llm.generate(
+                    [prompt],
+                    sampling_params=SamplingParams(max_tokens=1, kld_mode=True),
+                )[0]
+            repeat_ids = (
+                repeat_out.outputs[0].routed_experts
+                if repeat_out.outputs
+                else None
+            )
+            if repeat_out.kld_result is None or repeat_ids is None:
+                raise RuntimeError("QxQ natural repeat returned incomplete evidence")
+            if not np.array_equal(natural_ids, repeat_ids):
+                raise RuntimeError(
+                    "QxQ natural routing is not repeatable for identical input"
+                )
+            natural_repeat_chunks.append(repeat_out.kld_result)
             control_path = os.path.join(
                 control_temp.name, _routing_filename(idx)
             )
@@ -1625,6 +1647,19 @@ def calculate_kld(
                 raise RuntimeError("QxQ control returned no KLD result")
             _assert_forced_window_routing(control_temp.name, idx, control_out)
             control_chunks.append(control_out.kld_result)
+            with _phase(timings, "qxq_control_repeat_forward"):
+                control_repeat_out = llm.generate(
+                    [control_prompt],
+                    sampling_params=SamplingParams(max_tokens=1, kld_mode=True),
+                )[0]
+            if control_repeat_out.kld_result is None:
+                raise RuntimeError("QxQ control repeat returned no KLD result")
+            _assert_forced_window_routing(
+                control_temp.name,
+                idx,
+                control_repeat_out,
+            )
+            control_repeat_chunks.append(control_repeat_out.kld_result)
 
     bxq_chunks: list[KLDResult] = []
     if paired_routing:
@@ -1703,20 +1738,117 @@ def calculate_kld(
                 for chunk in control_chunks
             ]
         )
-        max_abs = float(np.max(np.abs(natural_values - control_values), initial=0.0))
-        mean_delta = float(control_values.mean() - natural_values.mean())
+        natural_repeat_values = np.concatenate(
+            [
+                np.asarray(chunk.kld_ref_to_model[score_from:], dtype=np.float64)
+                for chunk in natural_repeat_chunks
+            ]
+        )
+        control_repeat_values = np.concatenate(
+            [
+                np.asarray(chunk.kld_ref_to_model[score_from:], dtype=np.float64)
+                for chunk in control_repeat_chunks
+            ]
+        )
+        for name, values in (
+            ("natural", natural_values),
+            ("natural repeat", natural_repeat_values),
+            ("forced control", control_values),
+            ("forced control repeat", control_repeat_values),
+        ):
+            if values.shape != natural_values.shape:
+                raise RuntimeError(
+                    f"{name} KLD shape {values.shape} does not match "
+                    f"natural KLD shape {natural_values.shape}"
+                )
+            if not np.all(np.isfinite(values)):
+                raise RuntimeError(
+                    f"non-finite KLD in {name} during repeatability control"
+                )
+        repeat_max_abs = float(
+            np.max(
+                np.abs(natural_values - natural_repeat_values),
+                initial=0.0,
+            )
+        )
+        repeat_mean_delta = float(
+            natural_repeat_values.mean() - natural_values.mean()
+        )
+        repeat_mean_abs = float(
+            np.mean(np.abs(natural_values - natural_repeat_values))
+        )
+        control_repeat_max_abs = float(
+            np.max(
+                np.abs(control_values - control_repeat_values),
+                initial=0.0,
+            )
+        )
+        control_repeat_mean_abs = float(
+            np.mean(np.abs(control_values - control_repeat_values))
+        )
+        control_max_abs = max(
+            float(
+                np.max(
+                    np.abs(natural_values - control_values),
+                    initial=0.0,
+                )
+            ),
+            float(
+                np.max(
+                    np.abs(natural_values - control_repeat_values),
+                    initial=0.0,
+                )
+            ),
+        )
+        control_mean_delta = max(
+            abs(float(control_values.mean() - natural_values.mean())),
+            abs(float(control_repeat_values.mean() - natural_values.mean())),
+        )
+        position_tolerance = max(
+            CONTROL_POSITION_BASE_TOLERANCE,
+            CONTROL_REPEATABILITY_MULTIPLIER
+            * max(repeat_max_abs, control_repeat_max_abs),
+        )
+        mean_tolerance = max(
+            CONTROL_MEAN_BASE_TOLERANCE,
+            CONTROL_REPEATABILITY_MULTIPLIER
+            * max(repeat_mean_abs, control_repeat_mean_abs),
+        )
         control_evidence = {
-            "passed": max_abs <= 1e-5 and abs(mean_delta) <= 1e-7,
-            "max_absolute_position_delta": max_abs,
-            "absolute_mean_delta": abs(mean_delta),
-            "position_absolute_tolerance": 1e-5,
-            "mean_absolute_tolerance": 1e-7,
+            "protocol": "natural_repeatability_envelope_v1",
+            "passed": (
+                control_max_abs <= position_tolerance
+                and control_mean_delta <= mean_tolerance
+            ),
+            "natural_samples": 2,
+            "control_samples": 2,
+            "natural_repeat_max_absolute_position_delta": repeat_max_abs,
+            "natural_repeat_absolute_mean_delta": abs(repeat_mean_delta),
+            "natural_repeat_mean_absolute_position_delta": repeat_mean_abs,
+            "control_repeat_max_absolute_position_delta": (
+                control_repeat_max_abs
+            ),
+            "control_repeat_mean_absolute_position_delta": (
+                control_repeat_mean_abs
+            ),
+            "max_absolute_position_delta": control_max_abs,
+            "absolute_mean_delta": control_mean_delta,
+            "position_absolute_tolerance": position_tolerance,
+            "mean_absolute_tolerance": mean_tolerance,
+            "repeatability_multiplier": CONTROL_REPEATABILITY_MULTIPLIER,
+            "deterministic": (
+                repeat_max_abs <= CONTROL_POSITION_BASE_TOLERANCE
+                and repeat_mean_abs <= CONTROL_MEAN_BASE_TOLERANCE
+                and control_repeat_max_abs <= CONTROL_POSITION_BASE_TOLERANCE
+                and control_repeat_mean_abs <= CONTROL_MEAN_BASE_TOLERANCE
+            ),
         }
         if not control_evidence["passed"]:
             raise RuntimeError(
-                "QxQ forced-route control does not match deployed natural "
-                f"execution: max position delta {max_abs:.3e}, mean delta "
-                f"{mean_delta:.3e}"
+                "QxQ forced-route control exceeds deployed natural "
+                f"repeatability: max position delta {control_max_abs:.3e} "
+                f"(limit {position_tolerance:.3e}), mean delta "
+                f"{control_mean_delta:.3e} (limit {mean_tolerance:.3e})"
             )
     if bxq_chunks:
         bxq = summarize_kld_rows(
@@ -2104,6 +2236,19 @@ def _print_kld_report(report: dict[str, Any]) -> None:
             f"QxQ={report['qxq_cell']['mean_kld']:.8f}, "
             f"BxQ={bxq['mean_kld']:.8f}, "
             f"QxQ-BxQ={report['routing_intervention_delta']:+.8f}"
+        )
+        control = bxq["natural_control_parity"]
+        print(
+            "  Natural control: "
+            + (
+                "deterministic"
+                if control["deterministic"]
+                else "repeatability-calibrated"
+            )
+            + f", max={control['max_absolute_position_delta']:.3e}/"
+            f"{control['position_absolute_tolerance']:.3e}, "
+            f"mean={control['absolute_mean_delta']:.3e}/"
+            f"{control['mean_absolute_tolerance']:.3e}"
         )
     head = report.get("student_lm_head") or {}
     print(f"  Student LM head: {head.get('state', 'unknown')}")
@@ -2501,7 +2646,9 @@ def main():
             "replay_probe",
             "student_load",
             "score_forward",
+            "qxq_natural_repeat_forward",
             "qxq_control_forward",
+            "qxq_control_repeat_forward",
             "bxq_score_forward",
             "decompose_head",
         ):
@@ -2512,13 +2659,26 @@ def main():
             timings.get("capture_forward", 0.0)
             + timings.get("capture_write", 0.0)
             + timings.get("score_forward", 0.0)
+            + timings.get("qxq_natural_repeat_forward", 0.0)
+            + timings.get("qxq_control_forward", 0.0)
+            + timings.get("qxq_control_repeat_forward", 0.0)
+            + timings.get("bxq_score_forward", 0.0)
         ) / max(report["num_rows"], 1)
         print(f"    weight loading (fixed, independent of rows): {fixed:.2f}")
         print(f"    marginal cost per row: {per_row:.2f}")
     npos = report["num_positions"]
-    score_forward = timings.get("score_forward")
-    if score_forward:
-        print(f"  Scoring throughput: {npos / score_forward:.0f} positions/second")
+    scoring_time = sum(
+        timings.get(name, 0.0)
+        for name in (
+            "score_forward",
+            "qxq_natural_repeat_forward",
+            "qxq_control_forward",
+            "qxq_control_repeat_forward",
+            "bxq_score_forward",
+        )
+    )
+    if scoring_time:
+        print(f"  Scoring throughput: {npos / scoring_time:.0f} positions/second")
 
 
 if __name__ == "__main__":

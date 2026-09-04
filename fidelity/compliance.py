@@ -27,8 +27,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-LAWS_VERSION = 10
-BXQ_PROTOCOL_VERSION = 1
+LAWS_VERSION = 11
+BXQ_PROTOCOL_VERSION = 2
 ROUTING_TRACE_PROTOCOL_VERSION = 2
 
 # The identity a capture is bound to. Law 5 requires the scored report to carry
@@ -684,6 +684,94 @@ def law_14_component_attribution(c: Campaign) -> Finding:
             title,
             FAIL,
             "bxq_cell natural-routing backend control did not establish parity",
+        )
+    if control.get("protocol") != "natural_repeatability_envelope_v1":
+        return Finding(
+            14,
+            title,
+            FAIL,
+            "bxq_cell lacks the natural-repeatability control protocol",
+        )
+    if (
+        control.get("natural_samples") != 2
+        or control.get("control_samples") != 2
+    ):
+        return Finding(
+            14,
+            title,
+            FAIL,
+            "bxq_cell natural-repeatability evidence has the wrong sample count",
+        )
+    numeric_control_fields = (
+        "natural_repeat_max_absolute_position_delta",
+        "natural_repeat_absolute_mean_delta",
+        "natural_repeat_mean_absolute_position_delta",
+        "control_repeat_max_absolute_position_delta",
+        "control_repeat_mean_absolute_position_delta",
+        "max_absolute_position_delta",
+        "absolute_mean_delta",
+        "position_absolute_tolerance",
+        "mean_absolute_tolerance",
+        "repeatability_multiplier",
+    )
+    if any(
+        not isinstance(control.get(field), (int, float))
+        or not math.isfinite(float(control[field]))
+        or float(control[field]) < 0
+        for field in numeric_control_fields
+    ):
+        return Finding(
+            14,
+            title,
+            FAIL,
+            "bxq_cell natural-repeatability evidence is incomplete",
+        )
+    multiplier = float(control["repeatability_multiplier"])
+    expected_position_tolerance = max(
+        1e-5,
+        multiplier
+        * max(
+            float(control["natural_repeat_max_absolute_position_delta"]),
+            float(control["control_repeat_max_absolute_position_delta"]),
+        ),
+    )
+    expected_mean_tolerance = max(
+        1e-7,
+        multiplier
+        * max(
+            float(control["natural_repeat_mean_absolute_position_delta"]),
+            float(control["control_repeat_mean_absolute_position_delta"]),
+        ),
+    )
+    expected_deterministic = (
+        float(control["natural_repeat_max_absolute_position_delta"]) <= 1e-5
+        and float(control["natural_repeat_mean_absolute_position_delta"])
+        <= 1e-7
+        and float(control["control_repeat_max_absolute_position_delta"])
+        <= 1e-5
+        and float(control["control_repeat_mean_absolute_position_delta"])
+        <= 1e-7
+    )
+    if (
+        multiplier != 2.0
+        or control.get("deterministic") is not expected_deterministic
+        or not _same_number(
+            control["position_absolute_tolerance"],
+            expected_position_tolerance,
+        )
+        or not _same_number(
+            control["mean_absolute_tolerance"],
+            expected_mean_tolerance,
+        )
+        or float(control["max_absolute_position_delta"])
+        > expected_position_tolerance
+        or float(control["absolute_mean_delta"]) > expected_mean_tolerance
+    ):
+        return Finding(
+            14,
+            title,
+            FAIL,
+            "bxq_cell natural control exceeds or misstates repeatability bounds",
         )
     if bxq.get("candidate_weights_unchanged") is not True:
         return Finding(
