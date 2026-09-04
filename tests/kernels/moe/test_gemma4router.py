@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from vllm.model_executor.models.gemma4 import (
+    gemma4_forced_routing_weights,
     gemma4_fused_routing_kernel_triton,
     gemma4_routing_function_torch,
 )
@@ -12,6 +13,24 @@ from vllm.model_executor.models.gemma4 import (
 def sort_by_id(w, ids):
     order = ids.argsort(dim=-1)
     return w.gather(1, order), ids.gather(1, order)
+
+
+def test_gemma4_forced_natural_ids_preserve_triton_weights():
+    torch.manual_seed(0)
+    gating = torch.randn(32, 128, dtype=torch.bfloat16, device="cuda")
+    scales = torch.rand(128, dtype=torch.float32, device="cuda")
+    natural_weights, natural_ids = gemma4_fused_routing_kernel_triton(gating, 8, scales)
+
+    forced_weights = gemma4_forced_routing_weights(
+        gating,
+        natural_ids,
+        scales,
+        natural_weights,
+        natural_ids,
+        renormalize=True,
+    )
+
+    assert torch.equal(forced_weights, natural_weights)
 
 
 # Gemma4 MoE Model has context length of 250K

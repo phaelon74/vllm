@@ -210,6 +210,28 @@ def gemma4_routing_function_torch(
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
+def gemma4_forced_routing_weights(
+    gating_output: torch.Tensor,
+    forced_topk_ids: torch.Tensor,
+    per_expert_scale: torch.Tensor,
+    natural_weights: torch.Tensor,
+    natural_ids: torch.Tensor,
+    renormalize: bool,
+) -> torch.Tensor:
+    probabilities = torch.softmax(gating_output, dim=-1, dtype=torch.float32)
+    ids = forced_topk_ids.to(torch.int64)
+    forced_weights = probabilities.gather(1, ids)
+    if renormalize:
+        forced_weights = forced_weights / forced_weights.sum(dim=-1, keepdim=True)
+    forced_weights = forced_weights * per_expert_scale[ids].to(forced_weights.dtype)
+    matching_rows = torch.all(
+        natural_ids == forced_topk_ids,
+        dim=-1,
+        keepdim=True,
+    )
+    return torch.where(matching_rows, natural_weights, forced_weights)
+
+
 def _get_text_config(config):
     """Dereference text_config if config is a nested Gemma4Config.
 
@@ -357,13 +379,20 @@ class Gemma4MoE(nn.Module):
             forced_topk_ids: torch.Tensor,
             renormalize: bool,
         ) -> torch.Tensor:
-            del hidden_states
-            probabilities = torch.softmax(gating_output, dim=-1, dtype=torch.float32)
-            ids = forced_topk_ids.to(torch.int64)
-            weights = probabilities.gather(1, ids)
-            if renormalize:
-                weights = weights / weights.sum(dim=-1, keepdim=True)
-            return weights * self.per_expert_scale[ids].to(weights.dtype)
+            natural_weights, natural_ids = routing_function(
+                hidden_states,
+                gating_output,
+                forced_topk_ids.shape[-1],
+                renormalize,
+            )
+            return gemma4_forced_routing_weights(
+                gating_output,
+                forced_topk_ids,
+                self.per_expert_scale,
+                natural_weights,
+                natural_ids,
+                renormalize,
+            )
 
         # MoERunner experts with custom Gemma4 routing
         intermediate_size = getattr(
