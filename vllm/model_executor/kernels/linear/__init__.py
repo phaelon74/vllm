@@ -42,9 +42,6 @@ from vllm.model_executor.kernels.linear.mixed_precision.cutlass import (
 from vllm.model_executor.kernels.linear.mixed_precision.dynamic_4bit import (
     Dynamic4bitLinearKernel,
 )
-from vllm.model_executor.kernels.linear.mixed_precision.emulation import (
-    EmulationWNA16LinearKernel,
-)
 from vllm.model_executor.kernels.linear.mixed_precision.exllama import (
     ExllamaLinearKernel,
 )
@@ -330,7 +327,6 @@ _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
         ExllamaLinearKernel,
     },
     "emulation": {
-        EmulationWNA16LinearKernel,
         EmulationMxfp8LinearKernel,
         EmulationA16NvFp4LinearKernel,
         EmulationNvFp4LinearKernel,
@@ -808,17 +804,8 @@ def choose_mp_linear_kernel(
 
     platform_kernels = _POSSIBLE_KERNELS.get(current_platform._enum, [])
 
-    if envs.VLLM_BATCH_INVARIANT:
-        logger.info_once(
-            "VLLM_BATCH_INVARIANT forces symmetric GPTQ linear layers to use "
-            "weight-only emulation for deterministic execution."
-        )
-        platform_kernels = [EmulationWNA16LinearKernel]
-    else:
-        # Apply --linear-backend filtering when set.
-        platform_kernels = _resolve_backend_kernels(
-            platform_kernels, "mixed-precision"
-        )
+    # Apply --linear-backend filtering when set.
+    platform_kernels = _resolve_backend_kernels(platform_kernels, "mixed-precision")
 
     failure_reasons = []
     for kernel in platform_kernels:
@@ -1221,7 +1208,6 @@ __all__ = [
     "CPUWNA16LinearKernel",
     "CutlassW4A8LinearKernel",
     "Dynamic4bitLinearKernel",
-    "EmulationWNA16LinearKernel",
     "ExllamaLinearKernel",
     "RDNAHybridW4A16LinearKernel",
     "MacheteLinearKernel",

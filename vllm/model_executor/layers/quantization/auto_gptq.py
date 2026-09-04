@@ -577,15 +577,15 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_qweight", w2_qweight)
         set_weight_attrs(w2_qweight, extra_weight_attrs)
+        self.w2_logical_packed_rows = (
+            intermediate_size_per_partition + self.quant_config.pack_factor - 1
+        ) // self.quant_config.pack_factor
         if padded_intermediate_size != intermediate_size_per_partition:
-            logical_packed_rows = (
-                intermediate_size_per_partition + self.quant_config.pack_factor - 1
-            ) // self.quant_config.pack_factor
             set_weight_attrs(
                 w2_qweight,
                 {
                     "expected_shard_sizes": (
-                        logical_packed_rows,
+                        self.w2_logical_packed_rows,
                         padded_intermediate_size // self.quant_config.pack_factor,
                     )
                 },
@@ -712,13 +712,15 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
             layer.workspace = marlin_make_workspace_new(device, 4)
 
     def _fill_w2_qweight_padding(self, layer: RoutedExperts) -> None:
-        logical_intermediate = self.moe.intermediate_size_per_partition_unpadded
-        assert logical_intermediate is not None
-        logical_packed_rows = (
-            logical_intermediate + self.quant_config.pack_factor - 1
-        ) // self.quant_config.pack_factor
-        if layer.w2_qweight.shape[1] > logical_packed_rows:
-            layer.w2_qweight.data[:, logical_packed_rows:].fill_(
+        """Canonicalize the reduction-dim tail so padded lanes decode to zero.
+
+        Exporters may store either the logical or the padded row count, and any
+        value they wrote past the logical extent is unconstrained. Rewriting the
+        tail keeps the loaded state identical in both cases.
+        """
+        logical_rows = self.w2_logical_packed_rows
+        if layer.w2_qweight.shape[1] > logical_rows:
+            layer.w2_qweight.data[:, logical_rows:].fill_(
                 marlin_packed_zero(self.quant_config.quant_type)
             )
 
