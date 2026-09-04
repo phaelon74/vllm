@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, cast
@@ -56,6 +57,29 @@ from vllm.utils.torch_utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _assert_routing_debug_equal(
+    name: str,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    layer_id: int,
+) -> None:
+    if torch.equal(actual, expected):
+        return
+    if torch.is_floating_point(actual):
+        delta = (actual.float() - expected.float()).abs()
+        detail = (
+            f"max_delta={delta.max().item():.6e}, "
+            f"mean_delta={delta.mean().item():.6e}"
+        )
+    else:
+        detail = f"mismatches={torch.count_nonzero(actual != expected).item()}"
+    raise RuntimeError(
+        f"Routing debug first divergence at layer {layer_id} {name}: {detail}; "
+        f"actual shape={tuple(actual.shape)} dtype={actual.dtype} "
+        f"stride={actual.stride()}, expected stride={expected.stride()}"
+    )
 
 
 def register_layer_for_moe_forward_op(
@@ -628,6 +652,26 @@ class MoERunner(MoERunnerInterface):
                 )
         else:
             # Modular kernels: select experts first, then call routed_experts
+            debug_enabled = os.getenv("VLLM_KLD_ROUTING_DEBUG") == "1"
+            debug_snapshot = getattr(self, "_routing_debug_snapshot", None)
+            debug_compare = (
+                debug_enabled
+                and forced_topk_ids is not None
+                and debug_snapshot is not None
+            )
+            if debug_compare:
+                _assert_routing_debug_equal(
+                    "hidden_states",
+                    hidden_states,
+                    debug_snapshot["hidden_states"],
+                    self.layer_id,
+                )
+                _assert_routing_debug_equal(
+                    "router_logits",
+                    router_logits,
+                    debug_snapshot["router_logits"],
+                    self.layer_id,
+                )
             if forced_topk_ids is None:
                 topk_weights, topk_ids = self.router.select_experts(
                     hidden_states=hidden_states,
@@ -644,6 +688,19 @@ class MoERunner(MoERunnerInterface):
                     input_ids=input_ids,
                 )
 
+            if debug_compare:
+                _assert_routing_debug_equal(
+                    "topk_ids",
+                    topk_ids,
+                    debug_snapshot["topk_ids"],
+                    self.layer_id,
+                )
+                _assert_routing_debug_equal(
+                    "topk_weights",
+                    topk_weights,
+                    debug_snapshot["topk_weights"],
+                    self.layer_id,
+                )
             fused_out = self.routed_experts.forward_modular(
                 x=hidden_states,
                 topk_weights=topk_weights,
@@ -651,6 +708,27 @@ class MoERunner(MoERunnerInterface):
                 shared_experts=self._shared_experts,
                 shared_experts_input=shared_experts_input,
             )
+            if debug_enabled:
+                if not isinstance(fused_out, torch.Tensor):
+                    raise RuntimeError(
+                        "Routing debug requires finalized modular MoE output"
+                    )
+                if forced_topk_ids is None:
+                    self._routing_debug_snapshot = {
+                        "hidden_states": hidden_states.clone(),
+                        "router_logits": router_logits.clone(),
+                        "topk_ids": topk_ids.clone(),
+                        "topk_weights": topk_weights.clone(),
+                        "fused_out": fused_out.clone(),
+                    }
+                elif debug_compare:
+                    _assert_routing_debug_equal(
+                        "fused_out",
+                        fused_out,
+                        debug_snapshot["fused_out"],
+                        self.layer_id,
+                    )
+                    del self._routing_debug_snapshot
 
         self._maybe_apply_shared_experts(
             shared_experts_input,
