@@ -184,27 +184,25 @@ def scheme_arg(value: str) -> str:
 def _int4_quant_dequant(tensor: Any, group_size: int, symmetric: bool) -> Any:
     """Round a 2-D HF weight [out, in] through grouped int4, return as-stored."""
     import torch
+    import torch.nn.functional as F
     from vllm.model_executor.layers.quantization.utils.quant_utils import (
         quantize_weights,
     )
     from vllm.scalar_type import scalar_types
 
     size_k = tensor.shape[-1]
-    if group_size != -1 and size_k % group_size:
-        raise ValueError(
-            f"last dimension {size_k} is not a multiple of the "
-            f"{group_size}-element group; a real int4 quantizer pads "
-            "here, and padding changes the scales, so refusing to guess"
-        )
+    padded = tensor
+    if group_size != -1 and (remainder := size_k % group_size):
+        padded = F.pad(tensor, (0, group_size - remainder))
     # quantize_weights groups along dim 0 and expects [size_k, size_n].
-    transposed = tensor.t().to(torch.float32).contiguous()
+    transposed = padded.t().to(torch.float32).contiguous()
     w_ref, _, _, _ = quantize_weights(
         transposed,
         scalar_types.uint4b8 if symmetric else scalar_types.uint4,
         group_size,
         zero_points=not symmetric,
     )
-    return w_ref.t().contiguous().to(tensor.dtype)
+    return w_ref.t()[..., :size_k].contiguous().to(tensor.dtype)
 
 
 def quantize_dequantize(tensor: Any, scheme: str, block_size: int) -> Any:
@@ -833,14 +831,14 @@ def unexpressible_reason(
 ) -> str | None:
     """Why `scheme` cannot round `model`'s selected weights, or None if it can.
 
-    A blocked or grouped scheme lays its scales on a fixed grid, and a weight
-    whose shape is not a multiple of that grid cannot carry them. A real
-    quantizer pads, which changes the scales and so changes what is being
-    measured, so the ladder reports such a rung as absent with this reason
-    rather than guessing at a padding the deployed checkpoint never used.
-    `fp8_block` is square, so it constrains both dimensions; every other grid
-    applies along the reduction dimension only.
+    Grouped int4 explicitly right-pads the reduction dimension with zeros before
+    rounding and slices it back afterward. Other blocked schemes remain absent
+    when a weight cannot carry their fixed grid. `fp8_block` is square, so it
+    constrains both dimensions; every other grid applies along the reduction
+    dimension only.
     """
+    if parse_int4_scheme(scheme) is not None:
+        return None
     edge = scheme_block_size(scheme, block_size)
     if edge is None:
         return None
@@ -1368,7 +1366,9 @@ def convert(
     if scheme.startswith("int4_"):
         note += (
             " This cell matched the int4 format (bit width, group size, "
-            "symmetry), not a vendor calibration algorithm such as AWQ or GPTQ."
+            "symmetry), not a vendor calibration algorithm such as AWQ or GPTQ. "
+            "Reduction dimensions that do not fill the final group were "
+            "right-zero-padded for rounding and sliced back to source shape."
         )
     tensors_rounded = sum(entry["tensors"] for entry in rollup.values())
     manifest = {
@@ -1384,6 +1384,11 @@ def convert(
         "tensors_untouched": untouched,
         "tensors_rounded": tensors_rounded,
         "match_mode": "per_tensor" if only is not None else "per_component",
+        "padding_policy": (
+            "right_zero_pad_reduction_then_slice"
+            if scheme.startswith("int4_")
+            else None
+        ),
         "quantized_names_sha256": (
             names_sha256(only) if only is not None else None
         ),
@@ -1721,14 +1726,14 @@ def selftest() -> int:
     import torch
 
     torch.manual_seed(0)
-    try:
-        quantize_dequantize(
-            torch.zeros(8, 30, dtype=torch.bfloat16), "int4_g32_asym", 32
-        )
-    except ValueError as exc:
-        assert "multiple" in str(exc)
-    else:
-        raise AssertionError("non-multiple K must be refused")
+    partial_group = torch.randn(8, 30, dtype=torch.bfloat16)
+    partial_rounded = quantize_dequantize(
+        partial_group, "int4_g32_asym", 32
+    )
+    assert partial_rounded.shape == partial_group.shape
+    assert partial_rounded.dtype == partial_group.dtype
+    assert torch.isfinite(partial_rounded).all()
+    print("  grouped int4 zero-pads and slices a partial final group")
 
     weight = torch.randn(64, 256, dtype=torch.bfloat16)
 
