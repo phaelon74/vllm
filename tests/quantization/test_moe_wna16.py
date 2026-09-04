@@ -33,6 +33,46 @@ def test_map_wna16_backend_supports_triton():
     assert map_wna16_backend("triton") == WNA16MoEBackend.TRITON
 
 
+def test_gptq_scale_group_reduction_trims_only_padded_tail(monkeypatch):
+    config = MoeWNA16Config(
+        linear_quant_method="gptq",
+        weight_bits=4,
+        group_size=128,
+        has_zp=False,
+        lm_head_quantized=False,
+        modules_to_not_convert=None,
+        full_config={},
+    )
+    layer = SimpleNamespace(
+        quant_config=config,
+        group_size_div_factor=2,
+        intermediate_size_per_partition=704,
+        moe_config=SimpleNamespace(tp_size=1),
+    )
+    param = torch.nn.Parameter(torch.empty(1, 8, 11), requires_grad=False)
+    loaded = torch.arange(6).unsqueeze(1).expand(6, 8)
+    captured = {}
+
+    def base_loader(param, loaded_weight, *args, **kwargs):
+        captured["weight"] = loaded_weight
+
+    monkeypatch.setattr(
+        moe_wna16,
+        "get_tp_group",
+        lambda: SimpleNamespace(device=torch.device("cpu")),
+    )
+    monkeypatch.setattr(moe_wna16, "get_tensor_model_parallel_rank", lambda: 0)
+
+    loader = MoeWNA16Method.get_weight_loader(layer, base_loader)
+    loader(param, loaded, "w2_scales", "w2", 0)
+
+    assert captured["weight"].shape == (8, 11)
+    assert torch.equal(
+        captured["weight"][0],
+        torch.tensor([0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5]),
+    )
+
+
 @pytest.mark.parametrize(
     ("backend", "quant_config", "may_have_zp", "may_have_bias", "expected"),
     [

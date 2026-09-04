@@ -606,14 +606,13 @@ class MoeWNA16Method(FusedMoEMethodBase):
                     loaded_weight = loaded_weight.T
 
             # repeat the qzeros/scales to fit new group size
-            if (
-                layer.group_size_div_factor > 1
-                and "qzeros" in weight_name
-                or "scales" in weight_name
+            if layer.group_size_div_factor > 1 and (
+                "qzeros" in weight_name or "scales" in weight_name
             ):
                 loaded_weight = loaded_weight.repeat_interleave(
                     layer.group_size_div_factor, 1
                 )
+                loaded_weight = loaded_weight[:, : param.shape[-1]]
 
             if "w13_qzeros" in weight_name:
                 tensor = loaded_weight.view(

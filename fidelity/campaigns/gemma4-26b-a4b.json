@@ -11,13 +11,6 @@
   "max_num_seqs": 1,
   "fetch": "lease",
   "approvals": "fidelity/approvals/unbound-legacy-weights.json",
-  "excluded_candidates": [
-    {
-      "hf_repo": "Intel/gemma-4-26B-A4B-it-int4-AutoRound",
-      "revision": "edff62728a3c79ec541983b86a21674500e0f05b",
-      "reason": "The checkpoint cannot be loaded: moe_intermediate_size is 704, but group size 128 pads the exported expert scales to width 768 while vLLM allocates width 704. The expert loader therefore receives a scale tensor with one extra group. This is pinned checkpoint geometry, not a missing package or a fidelity-pipeline failure."
-    }
-  ],
   "models": [
     {
       "name": "gemma-4-26B-A4B-it",
@@ -74,6 +67,12 @@
           "path": "/media/fmodels2/dhruvil237/gemma-4-26B-A4B-it-W4A16",
           "hf_repo": "dhruvil237/gemma-4-26B-A4B-it-W4A16",
           "revision": "4fff0de2a4faae2882f28ca148a11181572ef995"
+        },
+        {
+          "name": "gemma-4-26B-A4B-it-int4-AutoRound",
+          "path": "/media/fmodels2/Intel/gemma-4-26B-A4B-it-int4-AutoRound",
+          "hf_repo": "Intel/gemma-4-26B-A4B-it-int4-AutoRound",
+          "revision": "edff62728a3c79ec541983b86a21674500e0f05b"
         },
         {
           "name": "lcu0312-gemma-4-26B-A4B-it-AWQ-4bit",

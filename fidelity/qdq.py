@@ -406,13 +406,13 @@ def unloadable_reason(model: str) -> str | None:
 
 
 def _padded_group_reason(config: dict[str, Any], quant: dict[str, Any]) -> str | None:
-    """Why a grouped int4 pack of this model will not load, or None.
+    """Why an AWQ grouped-int4 pack of this model will not load, or None.
 
     A grouped quantizer needs the reduction dimension to be a multiple of its
     group size. When it is not, the exporter pads and stores one group more than
-    the dimension really carries, while vLLM allocates for the unpadded width and
-    the expert weight loader fails copying a scale of the wrong length. The
-    dimensions are declared, so this is answerable before a download.
+    the dimension really carries. AutoRound's GPTQ-compatible path splits those
+    groups and trims only the padded tail; AWQ does not yet do so. The dimensions
+    are declared, so this is answerable before a download.
     """
     group = _as_int(_first_present(quant, ("group_size", "q_group_size")))
     if not group or group <= 0:
@@ -425,9 +425,9 @@ def _padded_group_reason(config: dict[str, Any], quant: dict[str, Any]) -> str |
             return (
                 f"{key} {width} is not a multiple of the declared group size "
                 f"{group}, so the exporter padded it to "
-                f"{(width // group + 1) * group} while vLLM allocates {width}; "
-                f"the expert weight loader fails copying a scale one group too "
-                f"long. This is the checkpoint's geometry, not a missing package"
+                f"{(width // group + 1) * group}, which the AWQ loader does not "
+                f"yet support. This is the checkpoint's geometry, not a missing "
+                "package"
             )
     return None
 
@@ -437,15 +437,7 @@ def unloadable_reason_from_config(config: dict[str, Any]) -> str | None:
     if not isinstance(quant, dict):
         return None
     method = str(quant.get("quant_method") or "").lower()
-    grouped = (
-        "auto-round",
-        "auto_round",
-        "gptq",
-        "gptq_marlin",
-        "awq",
-        "awq_marlin",
-    )
-    if method in grouped:
+    if method in ("awq", "awq_marlin"):
         return _padded_group_reason(config, quant)
     if method != "quark":
         return None
@@ -1447,14 +1439,13 @@ def selftest() -> int:
     }
     assert unloadable_reason_from_config(fp8_quark) is None
 
-    # Gemma 4's 704-wide experts do not divide by AutoRound's 128 group.
+    # AutoGPTQ retains the exporter's partial final group for Gemma 4's
+    # 704-wide experts.
     gemma_autoround = {
         "text_config": {"moe_intermediate_size": 704, "intermediate_size": 2112},
         "quantization_config": {"quant_method": "auto-round", "group_size": 128},
     }
-    reason = unloadable_reason_from_config(gemma_autoround)
-    assert reason is not None and "moe_intermediate_size 704" in reason, reason
-    assert "768" in reason, reason
+    assert unloadable_reason_from_config(gemma_autoround) is None
     for group in (32, 64):
         loadable = {
             "text_config": {"moe_intermediate_size": 704, "intermediate_size": 2112},
