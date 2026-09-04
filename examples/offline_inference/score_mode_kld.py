@@ -1526,31 +1526,44 @@ def calculate_kld(
             raise ValueError(
                 "candidate MoE layer IDs do not match the BF16 routing trace"
             )
-        backend_profiles = {
-            json.dumps(
-                {
-                    key: layer.get(key)
-                    for key in (
-                        "router",
-                        "quant_method",
-                        "kernel",
-                        "experts",
-                        "monolithic",
-                        "routing_method",
-                        "renormalize",
-                        "scoring_func",
-                        "use_ep",
-                        "ep_size",
-                        "tp_size",
-                        "batch_invariant_supported",
-                        "certified_for_exact_repeat",
-                    )
-                },
+        backend_profile_keys = (
+            "router",
+            "quant_method",
+            "kernel",
+            "experts",
+            "monolithic",
+            "routing_method",
+            "renormalize",
+            "scoring_func",
+            "use_ep",
+            "ep_size",
+            "tp_size",
+            "batch_invariant_supported",
+            "certified_for_exact_repeat",
+        )
+
+        def backend_profile(layer: dict[str, Any]) -> str:
+            return json.dumps(
+                {key: layer.get(key) for key in backend_profile_keys},
                 sort_keys=True,
             )
+
+        worker_backend_maps = [
+            {
+                int(layer["layer_id"]): backend_profile(layer)
+                for layer in worker["layers"]
+            }
             for worker in moe_backends
-            for layer in worker["layers"]
+        ]
+        backend_profiles = {
+            profile
+            for worker_map in worker_backend_maps
+            for profile in worker_map.values()
         }
+        per_layer_consistent = bool(worker_backend_maps) and all(
+            worker_map == worker_backend_maps[0]
+            for worker_map in worker_backend_maps[1:]
+        )
         print("Student MoE backend profiles:")
         for profile in sorted(backend_profiles):
             print(f"  {profile}")
@@ -1567,11 +1580,10 @@ def calculate_kld(
                 "QxQ/BxQ exact-repeat scoring refuses uncertified MoE "
                 f"backends: {', '.join(uncertified)}"
             )
-        if len(backend_profiles) != 1:
+        if not per_layer_consistent:
             raise RuntimeError(
-                "QxQ/BxQ exact-repeat scoring requires every MoE layer to "
-                "use the same certified backend; found "
-                f"{len(backend_profiles)} profiles"
+                "QxQ/BxQ exact-repeat scoring requires each MoE layer to use "
+                "the same certified backend profile on every worker"
             )
         uncertified_recurrent = sorted(
             {
@@ -1585,6 +1597,43 @@ def calculate_kld(
             raise RuntimeError(
                 "QxQ/BxQ exact-repeat scoring refuses uncertified recurrent "
                 f"backends: {', '.join(uncertified_recurrent)}"
+            )
+        recurrent_profile_keys = (
+            "backend",
+            "implementation",
+            "prefill_backend",
+            "decode_kernel",
+            "batch_invariant_supported",
+            "certified_for_exact_repeat",
+        )
+
+        def recurrent_profile(layer: dict[str, Any]) -> str:
+            return json.dumps(
+                {key: layer.get(key) for key in recurrent_profile_keys},
+                sort_keys=True,
+            )
+
+        worker_recurrent_maps = [
+            {
+                int(layer["layer_id"]): recurrent_profile(layer)
+                for layer in worker.get("layers", [])
+                if isinstance(layer.get("layer_id"), int)
+            }
+            for worker in recurrent_backends
+        ]
+        recurrent_profiles = {
+            profile
+            for worker_map in worker_recurrent_maps
+            for profile in worker_map.values()
+        }
+        recurrent_per_layer_consistent = bool(worker_recurrent_maps) and all(
+            worker_map == worker_recurrent_maps[0]
+            for worker_map in worker_recurrent_maps[1:]
+        )
+        if not recurrent_per_layer_consistent:
+            raise RuntimeError(
+                "QxQ/BxQ exact-repeat scoring requires each recurrent layer "
+                "to use the same certified backend profile on every worker"
             )
     student_uses_v2 = bool(
         llm.llm_engine.vllm_config.use_v2_model_runner
@@ -2002,26 +2051,6 @@ def calculate_kld(
                 for layer in worker.get("layers", [])
             }
         )
-        recurrent_profiles = {
-            json.dumps(
-                {
-                    key: layer.get(key)
-                    for key in (
-                        "backend",
-                        "implementation",
-                        "prefill_backend",
-                        "decode_kernel",
-                        "batch_invariant_supported",
-                        "certified_for_exact_repeat",
-                    )
-                },
-                sort_keys=True,
-            )
-            for worker in recurrent_backends
-            for layer in worker.get("layers", [])
-        }
-        per_layer_consistent = len(backend_profiles) == 1
-        recurrent_per_layer_consistent = len(recurrent_profiles) <= 1
         binding = {
             "protocol_version": PAIRED_ROUTED_SCORE_PROTOCOL_VERSION,
             "routing_trace_protocol_version": ROUTING_TRACE_PROTOCOL_VERSION,
