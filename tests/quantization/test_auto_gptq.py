@@ -109,6 +109,38 @@ def test_auto_gptq_moe_allocates_exporter_padded_reduction():
     assert layer.w2_g_idx_sort_indices.shape == (2, 768)
 
 
+def test_auto_gptq_linear_keeps_packed_rows_and_partial_scale_group(monkeypatch):
+    class DummyKernel:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.auto_gptq."
+        "choose_mp_linear_kernel",
+        lambda config: DummyKernel,
+    )
+    method = object.__new__(AutoGPTQLinearMethod)
+    method.quant_config = AutoGPTQConfig(4, 128, False, True, False, {}, {})
+    method.input_dtype = None
+    method.quant_type = method.quant_config.quant_type
+    layer = torch.nn.Module()
+
+    method.create_weights(
+        layer=layer,
+        input_size_per_partition=2112,
+        output_partition_sizes=[256],
+        input_size=2112,
+        output_size=256,
+        params_dtype=torch.float16,
+        weight_loader=lambda *args, **kwargs: None,
+    )
+
+    assert layer.qweight.shape == (264, 256)
+    assert layer.scales.shape == (17, 256)
+    assert layer.qzeros.shape == (17, 32)
+    assert layer.g_idx.shape == (2112,)
+
+
 def test_routed_experts_loads_per_expert_biases():
     class Loader:
         quant_config = None

@@ -252,16 +252,31 @@ def marlin_repacked_nk(qweight: torch.Tensor, num_bits: int) -> tuple[int, int]:
     return size_n, size_k
 
 
+def marlin_packed_zero(quant_type: ScalarType) -> int:
+    """Return one int32 word filled with the type's encoded zero value."""
+    bits = quant_type.size_bits
+    assert 32 % bits == 0
+    encoded_zero = quant_type.bias & ((1 << bits) - 1)
+    packed = sum(encoded_zero << shift for shift in range(0, 32, bits))
+    return packed - (1 << 32) if packed >= (1 << 31) else packed
+
+
 def marlin_pad_qweight(
-    qweight: torch.Tensor, size_n: int, size_k: int, padded_n: int, padded_k: int
+    qweight: torch.Tensor,
+    size_n: int,
+    size_k: int,
+    padded_n: int,
+    padded_k: int,
+    padding_value: int = 0,
 ) -> torch.Tensor:
-    """Zero-pad a GPTQ-layout packed weight (size_k / pack, size_n) for
-    gptq_marlin_repack."""
+    """Pad a GPTQ-layout packed weight for ``gptq_marlin_repack``."""
     if (padded_n, padded_k) == (size_n, size_k):
         return qweight
     pack_factor = size_k // qweight.size(0)
     return torch.nn.functional.pad(
-        qweight, (0, padded_n - size_n, 0, (padded_k - size_k) // pack_factor)
+        qweight,
+        (0, padded_n - size_n, 0, (padded_k - size_k) // pack_factor),
+        value=padding_value,
     )
 
 

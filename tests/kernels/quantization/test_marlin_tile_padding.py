@@ -11,12 +11,19 @@ import pytest
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.model_executor.kernels.linear.mixed_precision.marlin import (
+    MarlinLinearKernel,
+)
+from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (
+    MPLinearLayerConfig,
+)
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     GPTQ_MARLIN_TILE,
     apply_gptq_marlin_linear,
     marlin_make_empty_g_idx,
     marlin_make_workspace_new,
     marlin_moe_padded_intermediate,
+    marlin_packed_zero,
     marlin_pad_qweight,
     marlin_pad_scales,
     marlin_padded_nk,
@@ -116,6 +123,50 @@ def test_marlin_pad_helpers_shapes():
     channelwise = torch.ones(1, size_n)
     padded = marlin_pad_scales(channelwise, size_n, size_k, padded_n, padded_k, -1)
     assert padded.shape == (1, padded_n)
+
+
+def test_marlin_qweight_padding_uses_encoded_symmetric_zero():
+    packed_zero = marlin_packed_zero(scalar_types.uint4b8)
+    qweight = torch.ones((264, 256), dtype=torch.int32)
+
+    padded = marlin_pad_qweight(
+        qweight,
+        size_n=256,
+        size_k=2112,
+        padded_n=256,
+        padded_k=2176,
+        padding_value=packed_zero,
+    )
+
+    assert padded.shape == (272, 256)
+    for shift in range(0, 32, 4):
+        assert ((packed_zero & 0xFFFFFFFF) >> shift) & 0xF == 8
+    assert torch.all(padded[264:] == packed_zero)
+
+
+def test_marlin_allows_single_rank_partial_symmetric_group(monkeypatch):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mixed_precision.marlin."
+        "query_marlin_supported_quant_types",
+        lambda has_zp: [scalar_types.uint4b8],
+    )
+    config = MPLinearLayerConfig(
+        full_weight_shape=(2112, 256),
+        partition_weight_shape=(2112, 256),
+        weight_type=scalar_types.uint4b8,
+        act_type=torch.bfloat16,
+        group_size=128,
+        zero_points=False,
+        has_g_idx=False,
+    )
+
+    supported, reason = MarlinLinearKernel.can_implement(config)
+    assert supported, reason
+
+    config.partition_weight_shape = (1056, 256)
+    supported, _ = MarlinLinearKernel.can_implement(config)
+    assert not supported
 
 
 # Rank-local MoE intermediate sizes. group<=0 / 32 with a non-multiple-of-64

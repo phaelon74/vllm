@@ -14,6 +14,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_make_empty_g_idx,
     marlin_make_workspace_new,
     marlin_pad_dim,
+    marlin_packed_zero,
     marlin_pad_qweight,
     marlin_pad_scales,
     marlin_padded_nk,
@@ -69,11 +70,14 @@ class MarlinLinearKernel(MPLinearKernel):
                 c.group_size,
             )
 
-        # A group straddling TP ranks cannot be fixed by padding.
+        row_parallel = c.partition_weight_shape[0] != c.full_weight_shape[0]
+        # A group straddling TP ranks or using runtime zero points cannot be
+        # completed with a single neutral packed value.
         if (
             c.group_size != -1
             and c.group_size < c.full_weight_shape[0]
             and c.partition_weight_shape[0] % c.group_size != 0
+            and (row_parallel or c.zero_points)
         ):
             return False, (
                 f"in_features per partition {c.partition_weight_shape[0]} is "
@@ -129,7 +133,12 @@ class MarlinLinearKernel(MPLinearKernel):
             permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=0)
             x.data = ops.gptq_marlin_repack(
                 marlin_pad_qweight(
-                    x.data.contiguous(), size_n, size_k, padded_n, padded_k
+                    x.data.contiguous(),
+                    size_n,
+                    size_k,
+                    padded_n,
+                    padded_k,
+                    marlin_packed_zero(c.weight_type),
                 ),
                 perm=layer.g_idx_sort_indices,
                 size_k=padded_k,

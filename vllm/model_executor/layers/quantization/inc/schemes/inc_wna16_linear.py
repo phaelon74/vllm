@@ -27,7 +27,6 @@ if TYPE_CHECKING:
 class INCWNA16LinearScheme(INCLinearScheme):
     def __init__(self, layer_config: "INCLayerConfig") -> None:
         self.layer_config = layer_config
-        self.input_padding = 0
         self.inner_method = self._build_inner_method()
 
     @classmethod
@@ -136,29 +135,11 @@ class INCWNA16LinearScheme(INCLinearScheme):
         params_dtype: "torch.dtype",
         **extra_weight_attrs,
     ) -> None:
-        padded_partition = input_size_per_partition
-        padded_input_size = input_size
-        group_size = self.layer_config.group_size
-        if (
-            self.layer_config.is_gptq
-            and group_size > 0
-            and input_size_per_partition % group_size
-        ):
-            if input_size != input_size_per_partition:
-                raise NotImplementedError(
-                    "AutoRound GPTQ input padding is not supported with "
-                    "row-parallel tensor sharding."
-                )
-            padded_partition = (
-                input_size_per_partition + group_size - 1
-            ) // group_size * group_size
-            self.input_padding = padded_partition - input_size_per_partition
-            padded_input_size = padded_partition
         return self.inner_method.create_weights(
             layer=layer,
-            input_size_per_partition=padded_partition,
+            input_size_per_partition=input_size_per_partition,
             output_partition_sizes=output_partition_sizes,
-            input_size=padded_input_size,
+            input_size=input_size,
             output_size=output_size,
             params_dtype=params_dtype,
             **extra_weight_attrs,
@@ -173,8 +154,6 @@ class INCWNA16LinearScheme(INCLinearScheme):
         x: "torch.Tensor",
         bias: "torch.Tensor | None" = None,
     ) -> "torch.Tensor":
-        if self.input_padding:
-            x = torch.nn.functional.pad(x, (0, self.input_padding))
         return self.inner_method.apply(layer, x, bias)
 
 

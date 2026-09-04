@@ -1158,39 +1158,6 @@ def test_wna16_linear_gptq_uses_auto_gptq_when_supported(monkeypatch) -> None:
     assert captured["cfg"].is_sym is True
 
 
-def test_wna16_linear_gptq_preserves_exporter_padding() -> None:
-    captured = {}
-
-    class DummyMethod:
-        def create_weights(self, **kwargs):
-            captured.update(kwargs)
-
-        def apply(self, layer, x, bias):
-            captured["x"] = x
-            return x
-
-    scheme = object.__new__(INCWNA16LinearScheme)
-    scheme.layer_config = make_layer_config(group_size=128)
-    scheme.input_padding = 0
-    scheme.inner_method = DummyMethod()
-    layer = torch.nn.Module()
-
-    scheme.create_weights(
-        layer,
-        input_size_per_partition=2112,
-        output_partition_sizes=[2816],
-        input_size=2112,
-        output_size=2816,
-        params_dtype=torch.float16,
-    )
-    output = scheme.apply_weights(layer, torch.ones(2, 2112))
-
-    assert captured["input_size_per_partition"] == 2176
-    assert captured["input_size"] == 2176
-    assert output.shape == (2, 2176)
-    assert torch.count_nonzero(output[:, 2112:]) == 0
-
-
 def test_wna16_linear_gptq_unsupported_config_raises() -> None:
     with pytest.raises(NotImplementedError, match="Only 4-bit and 8-bit symmetric"):
         INCWNA16LinearScheme(make_layer_config(sym=False))
