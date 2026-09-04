@@ -42,7 +42,8 @@ TEST_MODEL = os.getenv("VLLM_TEST_MODEL", DEFAULT_MODEL)
 # Override backends for MLA models (MLA only supported on CUDA).
 if os.getenv("VLLM_TEST_MODEL"):
     config = get_config(TEST_MODEL, trust_remote_code=False)
-    if ModelArchConfigConvertorBase(config, config.get_text_config()).is_deepseek_mla():
+    text_config = config.get_text_config()
+    if ModelArchConfigConvertorBase(config, text_config).is_deepseek_mla():
         DEVICE_BACKENDS["cuda"] = DeviceConfig(
             available=DEVICE_BACKENDS["cuda"].available,
             backends=["TRITON_MLA"]
@@ -52,8 +53,15 @@ if os.getenv("VLLM_TEST_MODEL"):
             available=DEVICE_BACKENDS["xpu"].available,
             backends=[],
         )
-    elif getattr(config, "model_type", "") == "qwen3_5" or (
-        getattr(config, "dual_chunk_attention_config", None) is not None
+    elif any(
+        str(model_type).startswith(("qwen3_5", "qwen3_next"))
+        for model_type in (
+            getattr(config, "model_type", ""),
+            getattr(text_config, "model_type", ""),
+        )
+    ) or any(
+        getattr(candidate, "dual_chunk_attention_config", None) is not None
+        for candidate in (config, text_config)
     ):
         DEVICE_BACKENDS["cuda"] = DeviceConfig(
             available=DEVICE_BACKENDS["cuda"].available,
