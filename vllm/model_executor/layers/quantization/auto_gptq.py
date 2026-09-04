@@ -46,6 +46,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     check_moe_marlin_supports_layer,
     get_marlin_input_dtype,
     marlin_make_workspace_new,
+    marlin_packed_zero,
     marlin_repeat_scales_on_all_ranks,
     verify_marlin_supported,
 )
@@ -244,7 +245,10 @@ class AutoGPTQConfig(QuantizationConfig):
             from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
 
             if not check_moe_marlin_supports_layer(
-                layer, self.group_size, allow_tile_padding=not self.desc_act
+                layer,
+                self.group_size,
+                allow_tile_padding=not self.desc_act,
+                allow_group_padding=not self.desc_act,
             ):
                 logger.warning_once(
                     f"Layer '{prefix}' is not supported by GPTQMoeMarlin. "
@@ -560,16 +564,32 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w13_qweight, extra_weight_attrs)
         # down_proj (row parallel)
         w2_qweight = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                padded_intermediate_size // self.quant_config.pack_factor,
-                hidden_size,
+            torch.full(
+                (
+                    num_experts,
+                    padded_intermediate_size // self.quant_config.pack_factor,
+                    hidden_size,
+                ),
+                fill_value=marlin_packed_zero(self.quant_config.quant_type),
                 dtype=torch.int32,
             ),
             requires_grad=False,
         )
         layer.register_parameter("w2_qweight", w2_qweight)
         set_weight_attrs(w2_qweight, extra_weight_attrs)
+        if padded_intermediate_size != intermediate_size_per_partition:
+            logical_packed_rows = (
+                intermediate_size_per_partition + self.quant_config.pack_factor - 1
+            ) // self.quant_config.pack_factor
+            set_weight_attrs(
+                w2_qweight,
+                {
+                    "expected_shard_sizes": (
+                        logical_packed_rows,
+                        padded_intermediate_size // self.quant_config.pack_factor,
+                    )
+                },
+            )
         # up_proj scales
         w13_scales = torch.nn.Parameter(
             torch.empty(
@@ -589,6 +609,11 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_scales", w2_scales)
         set_weight_attrs(w2_scales, extra_weight_attrs)
+        if padded_intermediate_size != intermediate_size_per_partition:
+            set_weight_attrs(
+                w2_scales,
+                {"expected_shard_sizes": (scales_size2,)},
+            )
         # don't shard the w2 scales when running act order
         set_weight_attrs(w2_scales, {"load_full_w2": self.quant_config.desc_act})
         # up_proj zero points
@@ -686,6 +711,17 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
             device = layer.w13_qweight.device
             layer.workspace = marlin_make_workspace_new(device, 4)
 
+    def _fill_w2_qweight_padding(self, layer: RoutedExperts) -> None:
+        logical_intermediate = self.moe.intermediate_size_per_partition_unpadded
+        assert logical_intermediate is not None
+        logical_packed_rows = (
+            logical_intermediate + self.quant_config.pack_factor - 1
+        ) // self.quant_config.pack_factor
+        if layer.w2_qweight.shape[1] > logical_packed_rows:
+            layer.w2_qweight.data[:, logical_packed_rows:].fill_(
+                marlin_packed_zero(self.quant_config.quant_type)
+            )
+
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         def replace_or_register(name: str, val: torch.Tensor | None):
             if val is None:
@@ -713,6 +749,7 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w2_bias", None)
             w2_bias = None
 
+        self._fill_w2_qweight_padding(layer)
         converted = convert_to_wna16_moe_kernel_format(
             backend=self.wna16_moe_backend,
             layer=layer,

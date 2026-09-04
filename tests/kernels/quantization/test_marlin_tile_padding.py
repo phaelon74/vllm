@@ -50,6 +50,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
+from vllm.utils.math_utils import round_up
 
 # (size_n, size_k) rank-local shapes that violate Marlin tile alignment,
 # e.g. produced by TP-sharding dims that are valid at TP=1.
@@ -353,30 +354,47 @@ def test_nvfp4_marlin_padded_round_trip(shape):
     _gpu_marlin_unsupported(),
     reason="Marlin is not supported on this GPU type.",
 )
-@pytest.mark.parametrize("shape", ODD_SHAPES)
+@pytest.mark.parametrize("shape", ODD_SHAPES + [(256, 2112)])
 @pytest.mark.parametrize("group_size", [-1, 128])
 def test_gptq_marlin_padded_round_trip(shape, group_size):
     """Pad-then-repack a GPTQ int4 weight the way MarlinLinearKernel does and
     check the GEMM against the dequantized reference.
 
-    Symmetric int4's quantized zero decodes to -8, so this exercises the
-    zero-padded-scales cancellation, not just zero weights.
+    Partial final groups retain their scale while added packed rows use the
+    scalar type's encoded zero.
     """
     size_n, size_k = shape
-    if group_size > 0 and size_k % group_size != 0:
-        pytest.skip("group must divide the rank-local K (not fixable by padding)")
     dtype = torch.float16
     quant_type = scalar_types.uint4b8
     device = torch.device("cuda")
 
     weight = torch.randn(size_k, size_n, dtype=dtype, device=device) / size_k**0.5
-    w_ref, q_w, s, _, _ = gptq_quantize_weights(
-        weight, quant_type, group_size, act_order=False
+    quantized_k = (
+        round_up(size_k, group_size) if group_size > 0 else size_k
     )
+    quantized_weight = torch.zeros(
+        quantized_k,
+        size_n,
+        dtype=dtype,
+        device=device,
+    )
+    quantized_weight[:size_k] = weight
+    w_ref, q_w, s, _, _ = gptq_quantize_weights(
+        quantized_weight, quant_type, group_size, act_order=False
+    )
+    w_ref = w_ref[:size_k]
+    q_w = q_w[:size_k]
     qweight = gptq_pack(q_w, quant_type.size_bits, size_k, size_n)
 
     padded_n, padded_k = marlin_padded_nk(size_n, size_k, group_size)
-    qweight = marlin_pad_qweight(qweight, size_n, size_k, padded_n, padded_k)
+    qweight = marlin_pad_qweight(
+        qweight,
+        size_n,
+        size_k,
+        padded_n,
+        padded_k,
+        padding_value=marlin_packed_zero(quant_type),
+    )
     marlin_qweight = ops.gptq_marlin_repack(
         b_q_weight=qweight,
         perm=torch.empty(0, dtype=torch.int, device=device),
@@ -407,6 +425,21 @@ def test_gptq_marlin_padded_round_trip(shape, group_size):
 
     assert output.shape == (8, size_n)
     torch.testing.assert_close(output, ref, rtol=2e-2, atol=2e-2)
+    if (size_n, size_k, group_size) == (256, 2112, 128):
+        single = apply_gptq_marlin_linear(
+            input=x[:1],
+            weight=marlin_qweight,
+            weight_scale=marlin_s,
+            weight_zp=marlin_make_empty_g_idx(device),
+            g_idx=marlin_make_empty_g_idx(device),
+            g_idx_sort_indices=marlin_make_empty_g_idx(device),
+            workspace=marlin_make_workspace_new(device),
+            wtype=quant_type,
+            output_size_per_partition=size_n,
+            input_size_per_partition=size_k,
+            is_k_full=True,
+        )
+        assert torch.equal(single, output[:1])
 
 
 @pytest.mark.skipif(
@@ -596,8 +629,16 @@ def test_check_marlin_supports_layer_allow_tile_padding():
     _gpu_marlin_unsupported(),
     reason="Marlin is not supported on this GPU type.",
 )
-@pytest.mark.parametrize("group_size", [-1, 32])
-@pytest.mark.parametrize("shape", [(96, 256, 8), (160, 512, 4)])
+@pytest.mark.parametrize(
+    "shape,group_size",
+    [
+        ((96, 256, 8), -1),
+        ((96, 256, 8), 32),
+        ((160, 512, 4), -1),
+        ((160, 512, 4), 32),
+        ((704, 2816, 2), 128),
+    ],
+)
 def test_gptq_marlin_moe_padded_round_trip(shape, group_size):
     """Pad a tile-misaligned MoE intermediate the way the WNA16 Marlin MoE prep
     does, run the real repack + fused_marlin_moe, and check against the
@@ -636,10 +677,27 @@ def test_gptq_marlin_moe_padded_round_trip(shape, group_size):
 
     def quant(w, size_k, size_n):
         # w is (size_n, size_k); gptq expects (size_k, size_n).
-        ref, q_w, s, _, _ = gptq_quantize_weights(
-            w.T, quant_type, group_size, act_order=False
+        quantized_k = (
+            round_up(size_k, group_size) if group_size > 0 else size_k
         )
-        return ref, gptq_pack(q_w, bits, size_k, size_n), s
+        quantized_weight = torch.zeros(
+            quantized_k,
+            size_n,
+            dtype=w.dtype,
+            device=w.device,
+        )
+        quantized_weight[:size_k] = w.T
+        ref, q_w, s, _, _ = gptq_quantize_weights(
+            quantized_weight,
+            quant_type,
+            group_size,
+            act_order=False,
+        )
+        return (
+            ref[:size_k],
+            gptq_pack(q_w[:size_k], bits, size_k, size_n),
+            s,
+        )
 
     w13_qw, w13_s, w13_ref = [], [], []
     w2_qw, w2_s, w2_ref = [], [], []
@@ -663,6 +721,8 @@ def test_gptq_marlin_moe_padded_round_trip(shape, group_size):
     # Pad the intermediate via the production helpers.
     w13_qweight = _pad_w13_shard_cols(w13_qweight, n, padded_n)
     w2_qweight = _pad_rows(w2_qweight, padded_n // pack)
+    if group_size > 0 and n % group_size:
+        w2_qweight[:, n // pack :].fill_(marlin_packed_zero(quant_type))
     w13_scales = _pad_w13_shard_cols(w13_scales, n, padded_n)
     if group_size > 0:
         w2_scales = _pad_rows(w2_scales, padded_n // group_size)
@@ -676,7 +736,10 @@ def test_gptq_marlin_moe_padded_round_trip(shape, group_size):
     )
     group_or_pack = group_size if group_size != -1 else pack
     marlin_w13_s = marlin_moe_permute_scales(
-        s=w13_scales, size_k=n, size_n=w13_scales.shape[2], group_size=group_size
+        s=w13_scales,
+        size_k=w13_qweight.shape[1] * pack,
+        size_n=w13_scales.shape[2],
+        group_size=group_size,
     )
     marlin_w2_s = marlin_moe_permute_scales(
         s=w2_scales,

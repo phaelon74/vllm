@@ -16,6 +16,9 @@ from vllm.model_executor.kernels.linear.mixed_precision.cutlass import (
 from vllm.model_executor.kernels.linear.mixed_precision.dynamic_4bit import (
     Dynamic4bitLinearKernel,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.emulation import (
+    EmulationWNA16LinearKernel,
+)
 from vllm.model_executor.kernels.linear.mixed_precision.exllama import (
     ExllamaLinearKernel,
 )
@@ -57,6 +60,7 @@ __all__ = [
     "CPUWNA16LinearKernel",
     "CutlassW4A8LinearKernel",
     "Dynamic4bitLinearKernel",
+    "EmulationWNA16LinearKernel",
     "ExllamaLinearKernel",
     "HummingLinearKernel",
     "MacheteLinearKernel",

@@ -679,6 +679,16 @@ class RoutedExperts(PluggableLayer):
         if full_load:
             shard_dim += 1
 
+        expected_shard_sizes = getattr(param, "expected_shard_sizes", None)
+        if (
+            expected_shard_sizes is not None
+            and loaded_weight.shape[shard_dim] not in expected_shard_sizes
+        ):
+            raise ValueError(
+                f"{weight_name} has shard size {loaded_weight.shape[shard_dim]}; "
+                f"expected one of {expected_shard_sizes}"
+            )
+
         expert_data = param.data if full_load else param.data[expert_id]
 
         if "bias" in weight_name:

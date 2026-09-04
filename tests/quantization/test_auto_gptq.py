@@ -10,13 +10,30 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import vllm.envs as envs
+import vllm.model_executor.layers.quantization.auto_gptq as auto_gptq
 from tests.quantization.utils import is_quant_method_supported
+from vllm.model_executor.kernels.linear import (
+    MPLinearLayerConfig,
+    choose_mp_linear_kernel,
+)
+from vllm.model_executor.kernels.linear.mixed_precision.emulation import (
+    EmulationWNA16LinearKernel,
+)
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.quantization.auto_gptq import (
     AutoGPTQConfig,
     AutoGPTQLinearMethod,
     AutoGPTQMoEMethod,
 )
+from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+    marlin_packed_zero,
+)
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    gptq_pack,
+    gptq_quantize_weights,
+)
+from vllm.scalar_type import scalar_types
 
 PROMPT = "On the surface of Mars, we found"
 
@@ -60,12 +77,40 @@ def test_auto_gptq_config_get_name():
     assert AutoGPTQConfig.get_name() == "auto_gptq"
 
 
+def test_auto_gptq_config_allows_partial_expert_group(monkeypatch):
+    captured = {}
+    sentinel = SimpleNamespace(input_dtype=None)
+
+    def supports(layer, group_size, **kwargs):
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr(auto_gptq, "check_moe_marlin_supports_layer", supports)
+    monkeypatch.setattr(
+        auto_gptq,
+        "get_moe_quant_method",
+        lambda *args, **kwargs: sentinel,
+    )
+    monkeypatch.setattr(auto_gptq, "get_marlin_input_dtype", lambda prefix: None)
+    config = AutoGPTQConfig(4, 128, False, True, False, {}, {})
+    layer = object.__new__(RoutedExperts)
+
+    assert config.get_quant_method(layer, "model.layers.0.moe") is sentinel
+    assert captured == {
+        "allow_tile_padding": True,
+        "allow_group_padding": True,
+    }
+
+
 def test_auto_gptq_moe_creates_zero_initialized_expert_biases():
     method = object.__new__(AutoGPTQMoEMethod)
     method.quant_config = AutoGPTQConfig(4, 128, False, True, False, {}, {})
     method.input_dtype = None
     method.experts_cls = None
-    method.moe = SimpleNamespace(w13_num_shards=2)
+    method.moe = SimpleNamespace(
+        w13_num_shards=2,
+        intermediate_size_per_partition_unpadded=704,
+    )
     layer = torch.nn.Module()
 
     method.create_weights(
@@ -107,6 +152,27 @@ def test_auto_gptq_moe_allocates_exporter_padded_reduction():
     assert layer.w2_qzeros.shape == (2, 6, 32)
     assert layer.w2_g_idx.shape == (2, 768)
     assert layer.w2_g_idx_sort_indices.shape == (2, 768)
+    assert layer.w2_qweight.expected_shard_sizes == (88, 96)
+    assert layer.w2_scales.expected_shard_sizes == (6,)
+    packed_zero = marlin_packed_zero(method.quant_config.quant_type)
+    assert torch.all(layer.w2_qweight == packed_zero)
+
+    loaded = torch.randint(
+        torch.iinfo(torch.int32).min,
+        torch.iinfo(torch.int32).max,
+        (88, 256),
+        dtype=torch.int32,
+    )
+    destination = RoutedExperts._narrow_expert_data_for_padding(
+        layer.w2_qweight.data[0],
+        loaded,
+        hidden_dim=1,
+        shard_dim=0,
+    )
+    destination.copy_(loaded)
+    method._fill_w2_qweight_padding(layer)
+    assert torch.equal(layer.w2_qweight[0, :88], loaded)
+    assert torch.all(layer.w2_qweight[:, 88:] == packed_zero)
 
 
 def test_auto_gptq_linear_keeps_packed_rows_and_partial_scale_group(monkeypatch):
@@ -147,6 +213,69 @@ def test_auto_gptq_linear_keeps_packed_rows_and_partial_scale_group(monkeypatch)
     assert layer.scales.shape == (17, 256)
     assert layer.qzeros.shape == (17, 32)
     assert layer.g_idx.shape == (2112,)
+
+
+def test_batch_invariant_gptq_linear_selects_emulation(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    config = MPLinearLayerConfig(
+        full_weight_shape=(2112, 256),
+        partition_weight_shape=(2112, 256),
+        weight_type=scalar_types.uint4b8,
+        act_type=torch.bfloat16,
+        group_size=128,
+        zero_points=False,
+        has_g_idx=False,
+    )
+
+    assert (
+        choose_mp_linear_kernel(config, compute_capability=0)
+        is EmulationWNA16LinearKernel
+    )
+
+
+def test_gptq_linear_emulation_dequantizes_partial_final_group():
+    size_k, size_n, group_size = 24, 16, 16
+    config = MPLinearLayerConfig(
+        full_weight_shape=(size_k, size_n),
+        partition_weight_shape=(size_k, size_n),
+        weight_type=scalar_types.uint4b8,
+        act_type=torch.bfloat16,
+        group_size=group_size,
+        zero_points=False,
+        has_g_idx=False,
+    )
+    kernel = EmulationWNA16LinearKernel(
+        config,
+        w_q_param_name="qweight",
+        w_s_param_name="scales",
+    )
+    padded_weight = torch.zeros(32, size_n, dtype=torch.bfloat16)
+    padded_weight[:size_k] = torch.randn(size_k, size_n, dtype=torch.bfloat16)
+    reference, quantized, scales, _, _ = gptq_quantize_weights(
+        padded_weight,
+        scalar_types.uint4b8,
+        group_size,
+        act_order=False,
+    )
+    layer = torch.nn.Module()
+    layer.register_parameter(
+        "qweight",
+        torch.nn.Parameter(
+            gptq_pack(quantized[:size_k], 4, size_k, size_n),
+            requires_grad=False,
+        ),
+    )
+    layer.register_parameter(
+        "scales",
+        torch.nn.Parameter(scales, requires_grad=False),
+    )
+
+    kernel.process_weights_after_loading(layer)
+    inputs = torch.randn(3, size_k, dtype=torch.bfloat16)
+    output = kernel.apply_weights(layer, inputs)
+
+    assert layer.qweight.shape == (size_k, size_n)
+    torch.testing.assert_close(output, inputs @ reference[:size_k])
 
 
 def test_routed_experts_loads_per_expert_biases():

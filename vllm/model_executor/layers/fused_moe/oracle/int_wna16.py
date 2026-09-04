@@ -668,6 +668,7 @@ def _process_weights_marlin(
         )
 
     # --- Repack weights ---
+    w13_size_k = marlin_w13_qweight.shape[1] * pack_factor
     marlin_w13_qweight = ops.gptq_marlin_moe_repack(
         marlin_w13_qweight,
         w13_g_idx_sort_indices,
@@ -688,7 +689,7 @@ def _process_weights_marlin(
     # --- Permute scales ---
     marlin_w13_scales = marlin_moe_permute_scales(
         s=marlin_w13_scales,
-        size_k=layer.intermediate_size_per_partition,
+        size_k=w13_size_k,
         size_n=marlin_w13_scales.shape[2],
         group_size=group_size,
         is_a_8bit=is_a_8bit,
