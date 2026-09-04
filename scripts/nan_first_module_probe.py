@@ -18,6 +18,7 @@ VLLM_ENABLE_V1_MULTIPROCESSING=0 before importing vLLM.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
@@ -41,6 +42,11 @@ def parse_args() -> argparse.Namespace:
         default=12,
         help="how many offending modules to print",
     )
+    p.add_argument(
+        "--checkpoint-keys",
+        default="router",
+        help="list checkpoint tensor names containing this substring",
+    )
     return p.parse_args()
 
 
@@ -58,6 +64,39 @@ def _bad(tensors: list[torch.Tensor]) -> bool:
     return any(
         t.is_floating_point() and not torch.isfinite(t).all() for t in tensors
     )
+
+
+def report_checkpoint_keys(path: str, needle: str) -> None:
+    """List checkpoint tensor names matching ``needle``, from the index."""
+    index = os.path.join(path, "model.safetensors.index.json")
+    if not os.path.isfile(index):
+        print(f"=== no safetensors index at {index}")
+        return
+    with open(index, encoding="utf-8") as handle:
+        names = json.load(handle).get("weight_map", {})
+    matches = sorted({n for n in names if needle in n})
+    print(f"=== {len(matches)} checkpoint tensor(s) containing {needle!r}")
+    for name in matches[:20]:
+        print(f"  ckpt  {name}")
+
+
+def report_unloaded_params(model: torch.nn.Module) -> int:
+    """Name parameters holding non-finite values after weight loading.
+
+    A parameter the loader never wrote keeps its ``torch.empty`` contents, so
+    a non-finite parameter is almost always a checkpoint key that did not map
+    to this module. Checking before the forward separates that from a kernel
+    that computes a NaN.
+    """
+    bad = [
+        name
+        for name, param in model.named_parameters()
+        if param.is_floating_point() and not torch.isfinite(param).all()
+    ]
+    print(f"=== {len(bad)} parameter(s) non-finite after load")
+    for name in bad[:20]:
+        print(f"  UNLOADED  {name}")
+    return len(bad)
 
 
 def _describe(module: torch.nn.Module) -> str:
@@ -105,6 +144,9 @@ def main() -> int:
         enforce_eager=True,
         trust_remote_code=True,
     )
+
+    report_checkpoint_keys(args.model, args.checkpoint_keys)
+    llm.apply_model(report_unloaded_params)
 
     events: list[dict] = []
     llm.apply_model(lambda model: probe(model, events))
