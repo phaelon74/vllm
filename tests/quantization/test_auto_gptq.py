@@ -119,6 +119,14 @@ def test_auto_gptq_linear_keeps_packed_rows_and_partial_scale_group(monkeypatch)
         "choose_mp_linear_kernel",
         lambda config: DummyKernel,
     )
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
     method = object.__new__(AutoGPTQLinearMethod)
     method.quant_config = AutoGPTQConfig(4, 128, False, True, False, {}, {})
     method.input_dtype = None
