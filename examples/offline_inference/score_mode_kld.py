@@ -1867,6 +1867,7 @@ def calculate_kld(
     report["timings"] = timings
     report["unique_tokens"] = unique_tokens
     report["num_rows"] = len(windows)
+    report["context_length"] = context_length
     report["kld_vocab_size"] = kld_vocab
     report["model_runner_v2"] = student_uses_v2
     report["student_lm_head"] = student_head

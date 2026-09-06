@@ -1045,6 +1045,30 @@ def score_report(
     return os.path.join(config.work, "reports", f"{tag}.json")
 
 
+def _expected_geometry(config: Config) -> tuple[int, int]:
+    """The row count and context length the active configuration scores at.
+
+    A token suite owns both: its partition fixes the row set and its manifest
+    fixes the context length, so `rows` and `context_length` on the config
+    describe a dataset-driven run only. Reading them here instead would compare a
+    suite-driven report against a geometry nothing ever scored.
+    """
+    if not config.suite_dir:
+        return config.rows, config.context_length
+    with open(
+        os.path.join(config.suite_dir, "suite-manifest.json"), encoding="utf-8"
+    ) as handle:
+        suite = json.load(handle)
+    context_length = suite.get("context_length") or config.context_length
+    if config.suite_partition == "all":
+        return len(suite.get("contexts") or ()), context_length
+    with open(
+        os.path.join(config.suite_dir, "partitions.json"), encoding="utf-8"
+    ) as handle:
+        partitions = json.load(handle)
+    return len(partitions.get(config.suite_partition) or ()), context_length
+
+
 def _score_report_is_current(
     report_path: str,
     teacher: str,
@@ -1797,9 +1821,10 @@ def _candidate_complete(
         return False
     qxq = payload["qxq_cell"]
     reference_config = os.path.join(model.reference_path, "config.json")
+    rows, context_length = _expected_geometry(config)
     if (
-        payload.get("num_rows") != config.rows
-        or payload.get("context_length") != config.context_length
+        payload.get("num_rows") != rows
+        or payload.get("context_length") != context_length
         or payload.get("candidate_hf_repo") != cand.hf_repo
         or payload.get("candidate_revision") != cand.revision
         or payload.get("reference_weights_sha256")
@@ -2216,6 +2241,7 @@ def _assembled_report(
     cand: Candidate,
 ) -> str | None:
     """Resolve one exact report; never guess among prefix-compatible runs."""
+    rows, context_length = _expected_geometry(config)
     attribution = os.path.join(
         config.work, "attribution", f"{cand.name}.json"
     )
@@ -2231,8 +2257,8 @@ def _assembled_report(
                 report = json.load(handle)
             qxq = report.get("qxq_cell") or {}
             if (
-                report.get("num_rows") == config.rows
-                and report.get("context_length") == config.context_length
+                report.get("num_rows") == rows
+                and report.get("context_length") == context_length
                 and report.get("candidate_hf_repo") == cand.hf_repo
                 and report.get("candidate_revision") == cand.revision
                 and report.get("reference_weights_sha256")
@@ -2255,8 +2281,8 @@ def _assembled_report(
         with open(path, encoding="utf-8") as handle:
             report = json.load(handle)
         if (
-            report.get("num_rows") == config.rows
-            and report.get("context_length") == config.context_length
+            report.get("num_rows") == rows
+            and report.get("context_length") == context_length
         ):
             candidates.append(path)
     if len(candidates) > 1:
