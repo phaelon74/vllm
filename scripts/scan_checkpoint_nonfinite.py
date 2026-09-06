@@ -47,19 +47,21 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def nonfinite_count(tensor: torch.Tensor) -> int:
-    """Count non-finite elements, including in FP8 encodings.
+def nonfinite_mask(tensor: torch.Tensor) -> torch.Tensor:
+    """Mark non-finite elements, including in FP8 encodings.
 
     ``torch.isfinite`` has no kernel for the float8 variants at all, so the FP8
     cases are decided on their bit patterns instead of by casting.
     """
     if tensor.dtype == torch.float8_e4m3fn:
-        bits = tensor.view(torch.uint8) & 0x7F
-        return int((bits == 0x7F).sum())
+        return (tensor.view(torch.uint8) & 0x7F) == 0x7F
     if tensor.dtype == torch.float8_e5m2:
-        bits = tensor.view(torch.uint8) & 0x7F
-        return int((bits >= 0x7C).sum())
-    return int((~torch.isfinite(tensor)).sum())
+        return (tensor.view(torch.uint8) & 0x7F) >= 0x7C
+    return ~torch.isfinite(tensor)
+
+
+def nonfinite_count(tensor: torch.Tensor) -> int:
+    return int(nonfinite_mask(tensor).sum())
 
 
 def _zero_count(tensor: torch.Tensor) -> int:

@@ -24,7 +24,7 @@ import os
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
 import torch  # noqa: E402
-from scan_checkpoint_nonfinite import nonfinite_count  # noqa: E402
+from scan_checkpoint_nonfinite import nonfinite_count, nonfinite_mask  # noqa: E402
 
 from vllm import LLM, SamplingParams  # noqa: E402
 
@@ -63,6 +63,25 @@ def _tensors(value) -> list[torch.Tensor]:
 
 def _bad(tensors: list[torch.Tensor]) -> bool:
     return any(t.is_floating_point() and nonfinite_count(t) for t in tensors)
+
+
+def _first_bad_row(tensors: list[torch.Tensor]) -> int | None:
+    """Index of the first row along dim 0 holding a non-finite value.
+
+    Prefill activations are token-major, so this names the token position where
+    a fault begins. A fault that starts partway through and persists implicates
+    position-dependent state -- an attention window or chunk boundary -- while a
+    scattered one implicates the tokens themselves and the experts they route
+    to.
+    """
+    for tensor in tensors:
+        if not tensor.is_floating_point() or tensor.dim() == 0:
+            continue
+        rows = nonfinite_mask(tensor).reshape(tensor.shape[0], -1).any(dim=1)
+        hits = rows.nonzero()
+        if hits.numel():
+            return int(hits[0])
+    return None
 
 
 def report_checkpoint_keys(path: str, needle: str) -> None:
@@ -115,12 +134,14 @@ def probe(model: torch.nn.Module, events: list[dict]) -> list:
 
     def make_hook(name: str):
         def hook(module, args, output):
+            outputs = _tensors(output)
             events.append(
                 {
                     "name": name,
                     "module": module,
                     "in_bad": _bad(_tensors(args)),
-                    "out_bad": _bad(_tensors(output)),
+                    "out_bad": _bad(outputs),
+                    "row": _first_bad_row(outputs),
                 }
             )
 
@@ -151,8 +172,11 @@ def main() -> int:
     llm.apply_model(lambda model: probe(model, events))
 
     tokenizer = llm.get_tokenizer()
-    ids = tokenizer.encode("The rain in Spain falls mainly on the plain. " * 64)
-    ids = ids[: args.tokens]
+    sentence = "The rain in Spain falls mainly on the plain. "
+    unit = max(1, len(tokenizer.encode(sentence)))
+    ids = tokenizer.encode(sentence * (args.tokens // unit + 2))[: args.tokens]
+    if len(ids) < args.tokens:
+        print(f"=== WARNING: prompt is {len(ids)} tokens, not {args.tokens}")
     print(f"=== probing {len(ids)} tokens through {args.model}")
 
     llm.generate(
@@ -170,13 +194,19 @@ def main() -> int:
 
     print(f"=== {len(origins)} module(s) turned finite inputs into non-finite output")
     for event in origins[: args.report]:
-        print(f"  ORIGIN  {event['name']}: {_describe(event['module'])}")
+        print(
+            f"  ORIGIN  {event['name']} at row {event['row']}: "
+            f"{_describe(event['module'])}"
+        )
     if not origins:
         print("  none; the first non-finite value entered before any hooked module")
     print("=== first outputs to go non-finite, in execution order")
     for event in offenders[: args.report]:
         flag = "in-bad " if event["in_bad"] else "in-ok  "
-        print(f"  {flag} {event['name']}: {type(event['module']).__name__}")
+        print(
+            f"  {flag} {event['name']} at row {event['row']}: "
+            f"{type(event['module']).__name__}"
+        )
     return 1
 
 
