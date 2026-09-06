@@ -24,6 +24,7 @@ import os
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
 import torch  # noqa: E402
+from scan_checkpoint_nonfinite import nonfinite_count  # noqa: E402
 
 from vllm import LLM, SamplingParams  # noqa: E402
 
@@ -61,9 +62,7 @@ def _tensors(value) -> list[torch.Tensor]:
 
 
 def _bad(tensors: list[torch.Tensor]) -> bool:
-    return any(
-        t.is_floating_point() and not torch.isfinite(t).all() for t in tensors
-    )
+    return any(t.is_floating_point() and nonfinite_count(t) for t in tensors)
 
 
 def report_checkpoint_keys(path: str, needle: str) -> None:
@@ -91,7 +90,7 @@ def report_unloaded_params(model: torch.nn.Module) -> int:
     bad = [
         name
         for name, param in model.named_parameters()
-        if param.is_floating_point() and not torch.isfinite(param).all()
+        if param.is_floating_point() and nonfinite_count(param)
     ]
     print(f"=== {len(bad)} parameter(s) non-finite after load")
     for name in bad[:20]:

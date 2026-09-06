@@ -47,10 +47,10 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _nonfinite_count(tensor: torch.Tensor) -> int:
+def nonfinite_count(tensor: torch.Tensor) -> int:
     """Count non-finite elements, including in FP8 encodings.
 
-    ``torch.isfinite`` has no CPU kernel for every float8 variant, so the FP8
+    ``torch.isfinite`` has no kernel for the float8 variants at all, so the FP8
     cases are decided on their bit patterns instead of by casting.
     """
     if tensor.dtype == torch.float8_e4m3fn:
@@ -85,7 +85,7 @@ def scan(path: str, report: int) -> int:
                     continue
                 tensor = handle.get_tensor(key)
                 scanned += 1
-                count = _nonfinite_count(tensor)
+                count = nonfinite_count(tensor)
                 if count:
                     bad.append(f"{key} {tuple(tensor.shape)} {count} non-finite")
                 if "scale" in key:
