@@ -53,6 +53,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="score logits at every prompt position, as KLD scoring does",
     )
+    p.add_argument(
+        "--context-file",
+        nargs="+",
+        default=(),
+        help=(
+            "suite context JSON files to replay instead of a synthetic prompt; "
+            "real token content decides which experts route"
+        ),
+    )
     return p.parse_args()
 
 
@@ -158,6 +167,30 @@ def probe(model: torch.nn.Module, events: list[dict]) -> list:
     return handles
 
 
+def _prompts(args: argparse.Namespace, llm: LLM) -> list[tuple[str, list[int]]]:
+    """Label and token ids for each prompt to probe.
+
+    Real suite contexts are preferred over synthetic text because expert
+    routing is content-dependent: a repeated sentence exercises a narrow slice
+    of the experts and can miss a fault that diverse text hits.
+    """
+    if args.context_file:
+        prompts = []
+        for path in args.context_file:
+            with open(path, encoding="utf-8") as handle:
+                payload = json.load(handle)
+            prompts.append((os.path.basename(path), payload["tokens"]))
+        return prompts
+
+    sentence = "The rain in Spain falls mainly on the plain. "
+    repeats = max(1, args.tokens // 4)
+    ids = llm.get_tokenizer().encode(sentence * repeats)
+    while len(ids) < args.tokens:
+        repeats *= 2
+        ids = llm.get_tokenizer().encode(sentence * repeats)
+    return [("synthetic repeated text", ids[: args.tokens])]
+
+
 def main() -> int:
     args = parse_args()
     llm = LLM(
@@ -176,25 +209,24 @@ def main() -> int:
     events: list[dict] = []
     llm.apply_model(lambda model: probe(model, events))
 
-    tokenizer = llm.get_tokenizer()
-    sentence = "The rain in Spain falls mainly on the plain. "
-    repeats = max(1, args.tokens // 4)
-    ids = tokenizer.encode(sentence * repeats)
-    while len(ids) < args.tokens:
-        repeats *= 2
-        ids = tokenizer.encode(sentence * repeats)
-    ids = ids[: args.tokens]
-    print(f"=== probing {len(ids)} tokens through {args.model}")
+    print(f"=== probing {args.model}")
+    failures = 0
+    for label, ids in _prompts(args, llm):
+        events.clear()
+        print(f"=== {len(ids)} tokens from {label}")
+        llm.generate(
+            {"prompt_token_ids": ids},
+            sampling_params=SamplingParams(
+                max_tokens=1,
+                temperature=0.0,
+                prompt_logprobs=0 if args.prompt_logprobs else None,
+            ),
+        )
+        failures += _report(events, args.report)
+    return 1 if failures else 0
 
-    llm.generate(
-        {"prompt_token_ids": ids},
-        sampling_params=SamplingParams(
-            max_tokens=1,
-            temperature=0.0,
-            prompt_logprobs=0 if args.prompt_logprobs else None,
-        ),
-    )
 
+def _report(events: list[dict], report: int) -> int:
     offenders = [e for e in events if e["out_bad"]]
     origins = [e for e in offenders if not e["in_bad"]]
     print(f"=== {len(events)} module calls, {len(offenders)} with non-finite output")
@@ -204,7 +236,7 @@ def main() -> int:
         return 0
 
     print(f"=== {len(origins)} module(s) turned finite inputs into non-finite output")
-    for event in origins[: args.report]:
+    for event in origins[:report]:
         print(
             f"  ORIGIN  {event['name']} at row {event['row']}: "
             f"{_describe(event['module'])}"
@@ -212,7 +244,7 @@ def main() -> int:
     if not origins:
         print("  none; the first non-finite value entered before any hooked module")
     print("=== first outputs to go non-finite, in execution order")
-    for event in offenders[: args.report]:
+    for event in offenders[:report]:
         flag = "in-bad " if event["in_bad"] else "in-ok  "
         print(
             f"  {flag} {event['name']} at row {event['row']}: "
