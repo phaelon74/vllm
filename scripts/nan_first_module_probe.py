@@ -54,6 +54,11 @@ def parse_args() -> argparse.Namespace:
         help="score logits at every prompt position, as KLD scoring does",
     )
     p.add_argument(
+        "--moe-backend",
+        default=None,
+        help="override kernel_config.moe_backend, e.g. marlin or emulation",
+    )
+    p.add_argument(
         "--context-file",
         nargs="+",
         default=(),
@@ -193,6 +198,9 @@ def _prompts(args: argparse.Namespace, llm: LLM) -> list[tuple[str, list[int]]]:
 
 def main() -> int:
     args = parse_args()
+    extra = {}
+    if args.moe_backend:
+        extra["kernel_config"] = {"moe_backend": args.moe_backend}
     llm = LLM(
         model=args.model,
         quantization=args.quantization,
@@ -201,6 +209,7 @@ def main() -> int:
         max_model_len=args.max_model_len,
         enforce_eager=True,
         trust_remote_code=True,
+        **extra,
     )
 
     report_checkpoint_keys(args.model, args.checkpoint_keys)
