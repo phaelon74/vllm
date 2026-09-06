@@ -1516,6 +1516,18 @@ def calculate_kld(
     student_kwargs = dict(llm_kwargs or {})
     if routing_manifest is not None:
         student_kwargs["enable_return_routed_experts"] = True
+    if "moe_backend" not in student_kwargs and _quantizes_activations_to_fp4(
+        model_path
+    ):
+        # Auto-selection ranks vLLM's CUTLASS FP4 experts ahead of every path an
+        # exact-repeat probe has cleared, and that kernel takes finite inputs to
+        # NaN on W4A4 content. Marlin is not the answer either: its MoE path
+        # drops activation scales, so it would score a W4A4 checkpoint as W4A16
+        # and report fidelity the checkpoint never delivers. Emulation quantizes
+        # both activation stages in the checkpoint's own scheme. Student only:
+        # the reference is unquantized and has no NVFP4 experts to emulate.
+        student_kwargs["moe_backend"] = "emulation"
+        print("  W4A4 NVFP4 checkpoint: pinning the emulation MoE backend")
     with _phase(timings, "student_load"):
         llm = LLM(model=model_path, **student_kwargs)
     moe_backends: list[dict[str, Any]] = []
@@ -2798,15 +2810,6 @@ def main():
     if moe_backend:
         llm_kwargs["moe_backend"] = moe_backend
         print(f"MoE backend override (VLLM_MOE_BACKEND): {moe_backend}")
-    elif _quantizes_activations_to_fp4(args.model):
-        # Auto-selection ranks vLLM's CUTLASS FP4 experts ahead of every path an
-        # exact-repeat probe has cleared, and that kernel takes finite inputs to
-        # NaN on W4A4 content. Marlin is not the answer either: its MoE path
-        # drops activation scales, so it would score a W4A4 checkpoint as W4A16
-        # and report fidelity the checkpoint never delivers. Emulation quantizes
-        # both activation stages in the checkpoint's own scheme.
-        llm_kwargs["moe_backend"] = "emulation"
-        print("W4A4 NVFP4 checkpoint: pinning the emulation MoE backend")
 
     if args.stride is None:
         stride = args.context_length
