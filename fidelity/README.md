@@ -409,13 +409,23 @@ are diagnostic only and never authorize a drifting score. An uncertified or
 nondeterministic backend fails compliance; it is never replaced by a QDQ
 estimate.
 
-Certified backends are those whose expert implementation supports batch
-invariance and is not expert-parallel: batch-invariant Triton, CUTLASS NVFP4,
-Humming, and patched Marlin after the canonical-order and full-K ports.
+Certified backends are those whose expert implementation an exact-repeat probe
+has cleared on real content and which is not expert-parallel: batch-invariant
+Triton, patched Marlin after the canonical-order and full-K ports, and the
+NVFP4 QDQ emulation experts. A kernel's own `_supports_batch_invariance` is a
+claim, not evidence, so certification fails closed on anything absent from that
+set. CUTLASS NVFP4 is not certified: it declares batch invariance and still
+takes finite inputs to NaN on W4A4 NVFP4 content, which a scored run would
+otherwise report as a broken KLD instead of an uncertified backend.
 Qwen GDN attention is certified only on its NVIDIA CUDA, non-speculative
 per-sequence path; FlashInfer GDN context parallelism is disabled there.
 Weight-only W4A16 NVFP4 linear layers use deterministic emulation because
-dense Marlin is not batch invariant.
+dense Marlin is not batch invariant. W4A4 NVFP4 experts score on the same
+emulation, which quantize-dequantizes both activation stages in the
+checkpoint's own scheme; Marlin is refused there because its MoE path drops
+activation scales and would score a W4A4 checkpoint as W4A16, reporting
+fidelity the checkpoint never delivers. An NVFP4 result therefore measures the
+quantization scheme rather than a native FP4 kernel's own rounding.
 DeepGEMM, FlashInfer MoE, AITER, XPU, CPU, and EP paths remain uncertified
 until an exact probe passes. Scoring sets `VLLM_BATCH_INVARIANT=1`, disables
 DeepGEMM and FlashInfer autotune, and pins NCCL/cuBLAS determinism flags.
