@@ -48,6 +48,11 @@ def parse_args() -> argparse.Namespace:
         default="router",
         help="list checkpoint tensor names containing this substring",
     )
+    p.add_argument(
+        "--prompt-logprobs",
+        action="store_true",
+        help="score logits at every prompt position, as KLD scoring does",
+    )
     return p.parse_args()
 
 
@@ -173,15 +178,21 @@ def main() -> int:
 
     tokenizer = llm.get_tokenizer()
     sentence = "The rain in Spain falls mainly on the plain. "
-    unit = max(1, len(tokenizer.encode(sentence)))
-    ids = tokenizer.encode(sentence * (args.tokens // unit + 2))[: args.tokens]
-    if len(ids) < args.tokens:
-        print(f"=== WARNING: prompt is {len(ids)} tokens, not {args.tokens}")
+    repeats = max(1, args.tokens // 4)
+    ids = tokenizer.encode(sentence * repeats)
+    while len(ids) < args.tokens:
+        repeats *= 2
+        ids = tokenizer.encode(sentence * repeats)
+    ids = ids[: args.tokens]
     print(f"=== probing {len(ids)} tokens through {args.model}")
 
     llm.generate(
         {"prompt_token_ids": ids},
-        sampling_params=SamplingParams(max_tokens=1, temperature=0.0),
+        sampling_params=SamplingParams(
+            max_tokens=1,
+            temperature=0.0,
+            prompt_logprobs=0 if args.prompt_logprobs else None,
+        ),
     )
 
     offenders = [e for e in events if e["out_bad"]]
