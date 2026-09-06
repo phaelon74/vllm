@@ -44,6 +44,14 @@ def parse_args() -> argparse.Namespace:
         default=12,
         help="how many offending tensors to print per checkpoint",
     )
+    p.add_argument(
+        "--stats",
+        default=None,
+        help=(
+            "also report per-expert extremes for tensors whose name contains "
+            "this substring, to expose an outlier expert scale"
+        ),
+    )
     return p.parse_args()
 
 
@@ -70,7 +78,34 @@ def _zero_count(tensor: torch.Tensor) -> int:
     return int((tensor == 0).sum())
 
 
-def scan(path: str, report: int) -> int:
+def expert_extremes(key: str, tensor: torch.Tensor) -> str | None:
+    """Describe the widest per-expert magnitude spread in an expert tensor.
+
+    Expert weights are stored expert-major, so reducing over every other
+    dimension gives one magnitude per expert. A single expert whose scale sits
+    orders of magnitude above the rest dequantizes to weights that overflow at
+    runtime even though nothing in the file is non-finite -- and only the tokens
+    routed to it go bad, which is what makes the fault content-dependent.
+    """
+    if tensor.dim() < 2:
+        return None
+    try:
+        widened = tensor.to(torch.float32)
+    except NotImplementedError:
+        return f"{key} {tuple(tensor.shape)}: no CPU cast for {tensor.dtype}"
+    values = widened.abs().reshape(tensor.shape[0], -1)
+    per_expert = values.amax(dim=1)
+    top = int(per_expert.argmax())
+    median = float(per_expert.median())
+    peak = float(per_expert[top])
+    ratio = peak / median if median else float("inf")
+    return (
+        f"{key} {tuple(tensor.shape)}: expert {top} peaks at {peak:.6g}, "
+        f"median expert {median:.6g}, ratio {ratio:.1f}x"
+    )
+
+
+def scan(path: str, report: int, stats: str | None = None) -> int:
     shards = sorted(glob.glob(os.path.join(path, "*.safetensors")))
     print(f"=== {path}")
     if not shards:
@@ -79,6 +114,7 @@ def scan(path: str, report: int) -> int:
 
     bad: list[str] = []
     zeroed: list[str] = []
+    spread: list[str] = []
     scanned = 0
     for shard in shards:
         with safe_open(shard, framework="pt", device="cpu") as handle:
@@ -97,6 +133,10 @@ def scan(path: str, report: int) -> int:
                             f"{key} {tuple(tensor.shape)} {zeros} zero of "
                             f"{tensor.numel()}"
                         )
+                if stats and stats in key:
+                    described = expert_extremes(key, tensor)
+                    if described:
+                        spread.append(described)
 
     print(f"  scanned {scanned} float tensor(s) across {len(shards)} shard(s)")
     print(f"  {len(bad)} tensor(s) hold non-finite values")
@@ -105,12 +145,17 @@ def scan(path: str, report: int) -> int:
     print(f"  {len(zeroed)} scale tensor(s) hold zeros")
     for line in zeroed[:report]:
         print(f"    ZEROSCALE  {line}")
+    if spread:
+        spread.sort(key=lambda line: -float(line.rsplit(" ratio ", 1)[1][:-1]))
+        print(f"  widest per-expert spreads of {len(spread)} matching tensor(s)")
+        for line in spread[:report]:
+            print(f"    SPREAD  {line}")
     return len(bad)
 
 
 def main() -> int:
     args = parse_args()
-    return 1 if sum(scan(p, args.report) for p in args.paths) else 0
+    return 1 if sum(scan(p, args.report, args.stats) for p in args.paths) else 0
 
 
 if __name__ == "__main__":
