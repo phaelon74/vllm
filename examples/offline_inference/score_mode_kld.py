@@ -95,6 +95,27 @@ def apply_eager_llm_kwargs(llm_kwargs: dict[str, Any]) -> None:
     llm_kwargs["enable_flashinfer_autotune"] = False
 
 
+def _quantizes_activations_to_fp4(model_path: str) -> bool:
+    """Whether a checkpoint quantizes activations to 4-bit float (W4A4).
+
+    W4A16 and W4A4 exports of the same model differ only here, and the
+    difference decides which MoE kernels can score the checkpoint faithfully.
+    Read from the checkpoint rather than inferred from a repo name, which says
+    nothing reliable about the scheme.
+    """
+    config_path = os.path.join(model_path, "config.json")
+    if not os.path.isfile(config_path):
+        return False
+    with open(config_path, encoding="utf-8") as handle:
+        quant = json.load(handle).get("quantization_config") or {}
+    groups = quant.get("config_groups") or {}
+    for group in groups.values():
+        activations = (group or {}).get("input_activations") or {}
+        if activations.get("num_bits") == 4 and activations.get("type") == "float":
+            return True
+    return False
+
+
 def allow_apply_model_rpc() -> None:
     """Permit ``LLM.apply_model`` to reach an out-of-process engine core.
 
@@ -2777,6 +2798,15 @@ def main():
     if moe_backend:
         llm_kwargs["moe_backend"] = moe_backend
         print(f"MoE backend override (VLLM_MOE_BACKEND): {moe_backend}")
+    elif _quantizes_activations_to_fp4(args.model):
+        # Auto-selection ranks vLLM's CUTLASS FP4 experts ahead of every path an
+        # exact-repeat probe has cleared, and that kernel takes finite inputs to
+        # NaN on W4A4 content. Marlin is not the answer either: its MoE path
+        # drops activation scales, so it would score a W4A4 checkpoint as W4A16
+        # and report fidelity the checkpoint never delivers. Emulation quantizes
+        # both activation stages in the checkpoint's own scheme.
+        llm_kwargs["moe_backend"] = "emulation"
+        print("W4A4 NVFP4 checkpoint: pinning the emulation MoE backend")
 
     if args.stride is None:
         stride = args.context_length

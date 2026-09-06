@@ -1037,6 +1037,22 @@ def inspect_model_lm_heads(model: torch.nn.Module) -> dict[str, Any]:
     }
 
 
+# Expert implementations an exact-repeat probe has actually cleared on real
+# content. A kernel's own ``_supports_batch_invariance`` is a claim, not
+# evidence: CutlassExpertsFp4 returns True and still takes finite inputs to NaN
+# on W4A4 NVFP4 checkpoints, which a scored run reports as a broken KLD rather
+# than as an uncertified backend. Certification therefore fails closed -- a
+# kernel absent from this set is uncertified no matter what it declares.
+_EXACT_REPEAT_CERTIFIED_EXPERTS = frozenset(
+    {
+        "MarlinExperts",
+        "BatchedMarlinExperts",
+        "TritonExperts",
+        "Nvfp4QuantizationEmulationTritonExperts",
+    }
+)
+
+
 def inspect_model_moe_backends(model: torch.nn.Module) -> dict[str, Any]:
     """Record the loaded MoE router and expert implementation on one worker."""
     from vllm.model_executor.layers.fused_moe.layer import MoERunner
@@ -1062,7 +1078,8 @@ def inspect_model_moe_backends(model: torch.nn.Module) -> dict[str, Any]:
         expert_name = type(experts).__name__ if experts is not None else None
         moe_config = getattr(module, "moe_config", None)
         use_ep = bool(getattr(moe_config, "use_ep", False))
-        certified = supports_batch_invariant and not use_ep
+        probe_certified = expert_name in _EXACT_REPEAT_CERTIFIED_EXPERTS
+        certified = supports_batch_invariant and probe_certified and not use_ep
         layers.append(
             {
                 "name": name,
@@ -1081,6 +1098,7 @@ def inspect_model_moe_backends(model: torch.nn.Module) -> dict[str, Any]:
                 "ep_size": getattr(moe_config, "ep_size", None),
                 "tp_size": getattr(moe_config, "tp_size", None),
                 "batch_invariant_supported": supports_batch_invariant,
+                "exact_repeat_probed": probe_certified,
                 "certified_for_exact_repeat": certified,
             }
         )
