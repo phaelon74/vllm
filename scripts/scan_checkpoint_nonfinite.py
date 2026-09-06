@@ -48,8 +48,8 @@ def parse_args() -> argparse.Namespace:
         "--stats",
         default=None,
         help=(
-            "also report per-expert extremes for tensors whose name contains "
-            "this substring, to expose an outlier expert scale"
+            "also report the widest row magnitude spread for tensors whose name "
+            "contains this substring, to expose an outlier scale"
         ),
     )
     return p.parse_args()
@@ -78,14 +78,15 @@ def _zero_count(tensor: torch.Tensor) -> int:
     return int((tensor == 0).sum())
 
 
-def expert_extremes(key: str, tensor: torch.Tensor) -> str | None:
-    """Describe the widest per-expert magnitude spread in an expert tensor.
+def row_extremes(key: str, tensor: torch.Tensor) -> str | None:
+    """Describe the widest magnitude spread across a tensor's rows.
 
-    Expert weights are stored expert-major, so reducing over every other
-    dimension gives one magnitude per expert. A single expert whose scale sits
-    orders of magnitude above the rest dequantizes to weights that overflow at
-    runtime even though nothing in the file is non-finite -- and only the tokens
-    routed to it go bad, which is what makes the fault content-dependent.
+    Dimension 0 is whatever the checkpoint puts first: experts when the export
+    fuses them, output rows when it stores one tensor per expert. Either way a
+    row sitting orders of magnitude above the median dequantizes to weights that
+    can overflow at runtime while every stored value stays finite. Note that an
+    FP8 e4m3 scale of exactly 448 is that type's maximum, so it marks ordinary
+    saturation of the block holding the amax rather than a defect.
     """
     if tensor.dim() < 2:
         return None
@@ -94,14 +95,14 @@ def expert_extremes(key: str, tensor: torch.Tensor) -> str | None:
     except NotImplementedError:
         return f"{key} {tuple(tensor.shape)}: no CPU cast for {tensor.dtype}"
     values = widened.abs().reshape(tensor.shape[0], -1)
-    per_expert = values.amax(dim=1)
-    top = int(per_expert.argmax())
-    median = float(per_expert.median())
-    peak = float(per_expert[top])
+    per_row = values.amax(dim=1)
+    top = int(per_row.argmax())
+    median = float(per_row.median())
+    peak = float(per_row[top])
     ratio = peak / median if median else float("inf")
     return (
-        f"{key} {tuple(tensor.shape)}: expert {top} peaks at {peak:.6g}, "
-        f"median expert {median:.6g}, ratio {ratio:.1f}x"
+        f"{key} {tuple(tensor.shape)}: row {top} peaks at {peak:.6g}, "
+        f"median row {median:.6g}, ratio {ratio:.1f}x"
     )
 
 
@@ -134,7 +135,7 @@ def scan(path: str, report: int, stats: str | None = None) -> int:
                             f"{tensor.numel()}"
                         )
                 if stats and stats in key:
-                    described = expert_extremes(key, tensor)
+                    described = row_extremes(key, tensor)
                     if described:
                         spread.append(described)
 
@@ -147,7 +148,7 @@ def scan(path: str, report: int, stats: str | None = None) -> int:
         print(f"    ZEROSCALE  {line}")
     if spread:
         spread.sort(key=lambda line: -float(line.rsplit(" ratio ", 1)[1][:-1]))
-        print(f"  widest per-expert spreads of {len(spread)} matching tensor(s)")
+        print(f"  widest row spreads of {len(spread)} matching tensor(s)")
         for line in spread[:report]:
             print(f"    SPREAD  {line}")
     return len(bad)
