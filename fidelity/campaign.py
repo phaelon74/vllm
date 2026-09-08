@@ -1076,12 +1076,25 @@ def _score_report_is_current(
     measure_routing: bool,
     paired_routing: bool,
     bind_reference_weights: bool,
+    capture: str | None = None,
 ) -> bool:
     try:
         with open(report_path, encoding="utf-8") as handle:
             cached = json.load(handle)
     except (OSError, json.JSONDecodeError):
         return False
+    # A reference capture that was rebuilt since this report scored leaves the
+    # report citing a manifest that no longer exists. Assembly publishes the
+    # capture beside the report, so keeping the report would bind a published
+    # number to a manifest nothing hashed to -- Law 5 and Law 14 both refuse it
+    # at the end of a full campaign rather than here, where a rescore is cheap.
+    if capture is not None:
+        manifest = os.path.join(capture, "manifest.json")
+        if (
+            os.path.isfile(manifest)
+            and cached.get("capture_manifest_sha256") != file_sha256(manifest)
+        ):
+            return False
     routing_current = (
         _paired_report_is_current(cached)
         if paired_routing
@@ -1260,6 +1273,7 @@ def score_one(
             measure_routing=measure_routing,
             paired_routing=paired_routing,
             bind_reference_weights=bind_reference_weights,
+            capture=capture,
         ):
             print(f"=== {tag} already scored")
             bind_weights(report, student, observed=False)
