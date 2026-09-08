@@ -45,12 +45,6 @@
           "revision": "20df0542b1a86ce19f495ac2eca2c7c12bce82f9"
         },
         {
-          "name": "cklaus-gemma-4-26B-A4B-it-NVFP4",
-          "path": "/media/fmodels2/cklaus/gemma-4-26B-A4B-it-NVFP4",
-          "hf_repo": "cklaus/gemma-4-26B-A4B-it-NVFP4",
-          "revision": "54218eb0fd33da17632f0d91be841d09a7724a6c"
-        },
-        {
           "name": "Neural-ICE-Gemma-4-26B-A4B-it-NVFP4",
           "path": "/media/fmodels2/Neural-ICE/Gemma-4-26B-A4B-it-NVFP4",
           "hf_repo": "Neural-ICE/Gemma-4-26B-A4B-it-NVFP4",
@@ -81,6 +75,14 @@
           "revision": "f88123cf7fa9d270a92375e3904223136792992f"
         }
       ]
+    }
+  ],
+  "excluded_candidates": [
+    {
+      "model": "gemma-4-26B-A4B-it",
+      "hf_repo": "cklaus/gemma-4-26B-A4B-it-NVFP4",
+      "revision": "54218eb0fd33da17632f0d91be841d09a7724a6c",
+      "reason": "Scored on vLLM fdc0b57e while every other candidate scored on c798225a, so its report binds a reference capture the family no longer publishes (Law 12) and it ranks in a comparability group of one. Withdrawn rather than rescored: no measurement of this checkpoint is in question, only the provenance it carries."
     }
   ],
   "suite_dir": "/media/fmodels2/Local-Inference-Lab/suites/gemma4-26b-a4b-1024x2048-v1"
