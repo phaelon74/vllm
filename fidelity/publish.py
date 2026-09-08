@@ -394,7 +394,8 @@ def build_index(
 ) -> str:
     """Stage the small, findable index: one-pagers, leaderboard, laws."""
     staging = tempfile.mkdtemp(prefix="lil-index-")
-    shutil.copy2(os.path.join(HERE, "LAWS.md"), os.path.join(staging, "LAWS.md"))
+    for doc in ("LAWS.md", "QXQ.md"):
+        shutil.copy2(os.path.join(HERE, doc), os.path.join(staging, doc))
     for name in ("leaderboard.md", "leaderboard.csv"):
         src = os.path.join(library, name)
         if os.path.isfile(src):

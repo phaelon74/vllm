@@ -2773,11 +2773,12 @@ def cmd_assemble(config: Config, python: str, force: bool = False) -> int:
             shutil.copytree(env_src, env_dst, dirs_exist_ok=True)
         _scrub_environment(env_dst)
         # Law 12 reads the artifact directory, and each model root is published as
-        # a self-contained repo, so the laws ship inside it as well as at the
-        # library root. Both copies land before checksums.txt is written.
-        laws = os.path.join(HERE, "LAWS.md")
-        shutil.copy2(laws, os.path.join(config.library, "LAWS.md"))
-        shutil.copy2(laws, os.path.join(model_root, "LAWS.md"))
+        # a self-contained repo, so the laws and the QxQ methodology ship inside it
+        # as well as at the library root. Both land before checksums.txt is written.
+        for doc in ("LAWS.md", "QXQ.md"):
+            src = os.path.join(HERE, doc)
+            shutil.copy2(src, os.path.join(config.library, doc))
+            shutil.copy2(src, os.path.join(model_root, doc))
 
         if config.suite_dir and os.path.isdir(config.suite_dir):
             suite_dst = os.path.join(model_root, "suite")
