@@ -1053,6 +1053,87 @@ _EXACT_REPEAT_CERTIFIED_EXPERTS = frozenset(
 )
 
 
+_FP4_ACTIVATION_SCALES = (
+    ("w13_input_global_scale", "w13_input_scale"),
+    ("w2_input_global_scale", "w2_input_scale"),
+)
+
+
+def _activation_scale_substitution(layer: torch.nn.Module) -> dict[str, Any] | None:
+    """What the loaded kernel did to the checkpoint's per-expert activation scales.
+
+    The NVFP4 emulation experts replace every expert's scale with one scalar per
+    layer, and vLLM's own note on that line says the largest global scale likely
+    overflows the FP8 range for the rest. A number scored that way describes an
+    activation scale the checkpoint does not specify, so what happened is recorded
+    here, from the loaded layer, rather than inferred from the checkpoint later.
+
+    `spread` is the ratio of the largest usable per-expert scale to the smallest,
+    which is how far the substitution had to reach. `unusable` counts slots that
+    are zero or non-finite: a missing `input_scale` key leaves the registered
+    parameter at whatever `torch.empty` returned, so it is not safe to assume a
+    gap reads as zero.
+    """
+    found: dict[str, Any] = {}
+    for source, applied in _FP4_ACTIVATION_SCALES:
+        per_expert = getattr(layer, source, None)
+        in_use = getattr(layer, applied, None)
+        if not isinstance(per_expert, torch.Tensor):
+            continue
+        if not isinstance(in_use, torch.Tensor):
+            continue
+        values = per_expert.detach().to(torch.float32).flatten()
+        usable = values[torch.isfinite(values) & (values > 0)]
+        record: dict[str, Any] = {
+            "slots": int(values.numel()),
+            "distinct": int(torch.unique(values).numel()),
+            "unusable": int(values.numel() - usable.numel()),
+            "applied_elements": int(in_use.detach().numel()),
+        }
+        if usable.numel():
+            record["spread"] = float(usable.max() / usable.min())
+        record["collapsed"] = bool(
+            record["applied_elements"] == 1 and record["distinct"] > 1
+        )
+        found[source] = record
+    return found or None
+
+
+def _summarize_substitutions(layers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One record per quantization parameter this run did not use as exported.
+
+    Kept separate from the per-layer detail so a compliance check and a
+    comparability key can read a short, stable shape: what was substituted, how
+    many layers it reached, and the worst spread it had to cover. An empty list
+    means every scored layer used the checkpoint's own parameters.
+    """
+    summary: list[dict[str, Any]] = []
+    for source, _ in _FP4_ACTIVATION_SCALES:
+        affected = [
+            (layer.get("activation_scales") or {}).get(source) or {}
+            for layer in layers
+        ]
+        collapsed = [record for record in affected if record.get("collapsed")]
+        if not collapsed:
+            continue
+        spreads = [
+            record["spread"] for record in collapsed if "spread" in record
+        ]
+        summary.append(
+            {
+                "parameter": source,
+                "kind": "per_expert_collapsed_to_layer_scalar",
+                "layers": len(collapsed),
+                "layers_scored": len(layers),
+                "max_spread": max(spreads) if spreads else None,
+                "unusable_slots": sum(
+                    int(record.get("unusable") or 0) for record in collapsed
+                ),
+            }
+        )
+    return summary
+
+
 def inspect_model_moe_backends(model: torch.nn.Module) -> dict[str, Any]:
     """Record the loaded MoE router and expert implementation on one worker."""
     from vllm.model_executor.layers.fused_moe.layer import MoERunner
@@ -1100,9 +1181,12 @@ def inspect_model_moe_backends(model: torch.nn.Module) -> dict[str, Any]:
                 "batch_invariant_supported": supports_batch_invariant,
                 "exact_repeat_probed": probe_certified,
                 "certified_for_exact_repeat": certified,
+                "activation_scales": _activation_scale_substitution(
+                    module.routed_experts
+                ),
             }
         )
-    return {"layers": layers}
+    return {"layers": layers, "substitutions": _summarize_substitutions(layers)}
 
 
 def inspect_model_recurrent_backends(model: torch.nn.Module) -> dict[str, Any]:
