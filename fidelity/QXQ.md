@@ -183,8 +183,31 @@ reads the checkpoint: any entry in `quantization_config.config_groups` whose
 `input_activations` declares `num_bits: 4` and `type: "float"` makes it W4A4.
 
 For those checkpoints the scorer pins `moe_backend="emulation"`, which
-quantize-dequantizes both activation stages in the checkpoint's own scheme and is
-batch invariant by construction.
+quantize-dequantizes both activation stages and is batch invariant by
+construction.
+
+**This path is not yet faithful for MoE, and no W4A4 result may be published on
+it.** The emulation branch of `convert_to_nvfp4_moe_kernel_format` collapses the
+per-expert activation scales to one scalar per layer —
+`a13_scale = 1.0 / a13_scale.max()` — and warns when the per-expert values differ.
+vLLM's own comment on that line records the consequence: taking the largest global
+scale "likely results in overflowing the FP8 range for other experts." A
+checkpoint whose per-expert scales span an order of magnitude is therefore scored
+against an activation scale it never uses, and the resulting mean is biased by an
+amount nothing in the run discloses.
+
+So W4A4 NVFP4 currently has **no faithful batch-invariant MoE path at all**:
+
+| Path | Per-expert activation scales | Exact repeat |
+| --- | --- | --- |
+| CUTLASS / FlashInfer FP4 | honoured | uncertified, and NaN on calibration gaps |
+| Marlin | dropped entirely (scores W4A16) | certified |
+| Emulation | collapsed to a layer maximum | certified |
+
+Until the emulation experts apply each expert's own scale, a W4A4 candidate is
+withdrawn via `excluded_candidates` rather than published. Four NVFP4 candidates
+in the gemma-4-26B-A4B-it family were withdrawn for exactly this reason after
+their scoring logs were found to carry the collapse warning.
 
 Two details matter and both were bugs first:
 
@@ -197,12 +220,19 @@ and would run, but its MoE path drops activation scales — it would score a W4A
 checkpoint as though it were W4A16 and report a fidelity the checkpoint never
 delivers. A wrong number that passes every law is worse than a refusal.
 
-The honest consequence, stated in the published card: an NVFP4 result measures
-the quantization scheme rather than a native FP4 kernel's own rounding. Read the
-family's leaderboard with that in mind. Two NVFP4 exports in the
-gemma-4-26B-A4B-it family carry byte-identical QDQ diagnostics (0.66652247 and
-1.43642041) and yet score QxQ 1.16299506 and 1.75580190 — a 0.6 nat spread that
-lives entirely in the activation scheme and kernel path, not in the weights.
+A weight-only W4A16 NVFP4 result measures the quantization scheme rather than a
+native FP4 kernel's own rounding, and that limit is stated on the published card.
+
+A cautionary note on reading results from this path. Before the collapse above was
+understood, four NVFP4 exports carrying byte-identical QDQ diagnostics (0.66652247
+and 1.43642041) scored QxQ between 1.16299506 and 1.82545539, and that 0.6 nat
+spread was written up here as living "entirely in the activation scheme and kernel
+path." That reading was unsupported. Those checkpoints differ in how widely their
+per-expert activation scales spread, so they differ in how much the layer-maximum
+substitution costs them, and the spread was substantially an artifact of the
+measurement path. It is recorded here because it is the exact shape of mistake this
+document exists to prevent: a real, reproducible, bitwise-exact number that is
+nonetheless measuring the harness rather than the checkpoint.
 
 ## 8. Checkpoint defects the pipeline had to fix, not tolerate
 

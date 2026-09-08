@@ -420,12 +420,16 @@ otherwise report as a broken KLD instead of an uncertified backend.
 Qwen GDN attention is certified only on its NVIDIA CUDA, non-speculative
 per-sequence path; FlashInfer GDN context parallelism is disabled there.
 Weight-only W4A16 NVFP4 linear layers use deterministic emulation because
-dense Marlin is not batch invariant. W4A4 NVFP4 experts score on the same
-emulation, which quantize-dequantizes both activation stages in the
-checkpoint's own scheme; Marlin is refused there because its MoE path drops
-activation scales and would score a W4A4 checkpoint as W4A16, reporting
-fidelity the checkpoint never delivers. An NVFP4 result therefore measures the
+dense Marlin is not batch invariant, and such a result measures the
 quantization scheme rather than a native FP4 kernel's own rounding.
+W4A4 NVFP4 MoE has no faithful batch-invariant path and is not publishable:
+CUTLASS and FlashInfer honour per-expert activation scales but are uncertified
+and go NaN on checkpoints with calibration gaps, Marlin drops activation scales
+and would score W4A4 as W4A16, and the emulation experts collapse the
+per-expert activation scales to one layer maximum — which vLLM's own note says
+likely overflows the FP8 range for the remaining experts. A W4A4 candidate is
+withdrawn via `excluded_candidates` until emulation applies each expert's own
+scale. See [`QXQ.md`](QXQ.md) for the full account.
 DeepGEMM, FlashInfer MoE, AITER, XPU, CPU, and EP paths remain uncertified
 until an exact probe passes. Scoring sets `VLLM_BATCH_INVARIANT=1`, disables
 DeepGEMM and FlashInfer autotune, and pins NCCL/cuBLAS determinism flags.
