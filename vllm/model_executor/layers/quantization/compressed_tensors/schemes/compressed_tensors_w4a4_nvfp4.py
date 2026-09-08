@@ -13,6 +13,10 @@ from vllm.model_executor.layers.fusion.quant_activation import (
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
+from vllm.model_executor.layers.quantization.utils.nvfp4_activation_scales import (
+    fill_uncalibrated_nvfp4_activation_scales,
+    unwritten_nvfp4_activation_scale,
+)
 from vllm.model_executor.parameter import (
     GroupQuantScaleParameter,
     ModelWeightParameter,
@@ -85,7 +89,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
 
         if not self.use_a16:
             input_global_scale = PerTensorScaleParameter(
-                data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                data=unwritten_nvfp4_activation_scale(len(output_partition_sizes)),
                 weight_loader=weight_loader,
             )
             layer.register_parameter("input_global_scale", input_global_scale)
@@ -114,6 +118,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         )
 
         if not self.use_a16:
+            fill_uncalibrated_nvfp4_activation_scales(layer)
             if torch.unique(layer.input_global_scale).numel() != 1:
                 logger.warning_once(
                     "In NVFP4 linear, the input global scale is different"

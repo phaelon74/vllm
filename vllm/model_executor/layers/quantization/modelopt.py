@@ -64,6 +64,10 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     get_marlin_input_dtype,
 )
+from vllm.model_executor.layers.quantization.utils.nvfp4_activation_scales import (
+    fill_uncalibrated_nvfp4_activation_scales,
+    unwritten_nvfp4_activation_scale,
+)
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     MXFP8_SCALE_DTYPE,
@@ -1524,17 +1528,16 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             global_num_experts if self.use_global_sf else num_experts
         )
         w13_input_scale = PerTensorScaleParameter(
-            data=torch.empty(
+            data=unwritten_nvfp4_activation_scale(
                 global_sf_num_experts,
                 w13_num_shards,
-                dtype=torch.float32,
             ),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w13_input_scale", w13_input_scale)
 
         w2_input_scale = PerTensorScaleParameter(
-            data=torch.empty(global_sf_num_experts, dtype=torch.float32),
+            data=unwritten_nvfp4_activation_scale(global_sf_num_experts),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w2_input_scale", w2_input_scale)
@@ -1553,6 +1556,8 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
                 "Accuracy may be affected."
             )
         w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0].contiguous()
+
+        fill_uncalibrated_nvfp4_activation_scales(layer)
 
         (
             w13,

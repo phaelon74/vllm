@@ -106,8 +106,9 @@ completion order. No allowlist entry overrides this.
 ## 5. Certification fails closed
 
 A kernel's `_supports_batch_invariance()` is a claim about itself. It is not
-evidence, and at least one kernel's claim is false in a way that silently
-destroys the measurement (§6).
+evidence. `CutlassExpertsFp4` declared True and still produced NaN on W4A4
+checkpoints; the NaN was uninitialized per-expert activation scales, not the
+kernel, but the lesson stands: a self-declaration is not a probe.
 
 `inspect_model_moe_backends` in `vllm/v1/sample/kld.py` therefore grants
 `certified_for_exact_repeat` only when all three of these hold:
@@ -119,7 +120,11 @@ destroys the measurement (§6).
 3. The run is not expert-parallel.
 
 The allowlist currently holds `MarlinExperts`, `BatchedMarlinExperts`,
-`TritonExperts`, and `Nvfp4QuantizationEmulationTritonExperts`.
+`TritonExperts`, `Nvfp4QuantizationEmulationTritonExperts`, and
+`CutlassExpertsFp4`. CUTLASS earned its place after the SM120 bitwise
+permutation test (24/24, `atol=0`) and after the W4A4 NaN was shown to be a
+loader gap, not a kernel defect. The run's own zero-tolerance exact-repeat
+control remains the binding gate.
 
 The default is refusal. An unprobed backend — including one that arrives with a
 future vLLM bump — is uncertified until somebody probes it, and an uncertified
@@ -130,13 +135,31 @@ producing garbage that the harness dutifully writes down as a fidelity result.
 DeepGEMM, FlashInfer MoE, AITER, XPU, CPU, and every expert-parallel path remain
 uncertified.
 
-## 6. Case study: a kernel that declares batch invariance and returns NaN
+## 6. Case study: uninitialized scales, not a broken kernel
 
 `CutlassExpertsFp4` self-declares batch invariance. Under
-`VLLM_BATCH_INVARIANT=1`, on W4A4 NVFP4 checkpoints, it takes finite inputs to
-NaN. The scorer then refuses a non-finite KLD and the engine dies, which is how
-this surfaced: two NVFP4 candidates failing with `KLD is not finite`, no report
-produced, and nothing to indicate the kernel rather than the checkpoint.
+`VLLM_BATCH_INVARIANT=1`, on two W4A4 NVFP4 checkpoints, it took finite inputs
+to NaN. The scorer refused a non-finite KLD and the engine died. The first
+reading was that the kernel's claim was false. That was wrong.
+
+The kernel is bitwise batch-invariant on this hardware. The CUDA grouped GEMM
+asserts at compile time that it uses `PersistentTileSchedulerSm100Group` "for
+batch invariance", and `tests/v1/determinism/test_cutlass_batch_invariance.py`
+passed 24/24 on SM120 at `atol=0, rtol=0` across both activations, both expert
+counts (40, 64), both top-k values, and all three shape cases.
+
+The NaN was uninitialized memory. NVFP4 allocated per-expert activation scales
+with `torch.empty`. Checkpoints that omitted `input_scale` keys for some experts
+in some layers — `bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4` (14 layers short)
+and `Neural-ICE/Gemma-4-26B-A4B-it-NVFP4` (16 layers short) — left those slots
+holding whatever was on the GPU. CUTLASS consumes one scale per expert
+(`a1_gscale` / `a2_gscale` of length `e`); a NaN slot damages that expert. The
+unsloth export, with every slot written, never went NaN.
+
+Loading does not catch this. Strict all-parameters-loaded tracking is off by
+default for quantized models, and any module with `process_weights_after_loading`
+has every parameter force-marked as loaded, so a partially filled tensor is
+invisible to it by construction.
 
 Localizing it took two purpose-built tools.
 
@@ -159,21 +182,21 @@ scoring harness does and what a generation-only probe does not.
 With both, the failure is exactly reproducible: `moe.experts` at layer 0, row 814
 of `context-0002`, and layer 14, row 170 of `context-0004`.
 
-The `--moe-backend` override then isolated the kernel:
+The `--moe-backend` override then isolated the failure to the native path on
+the two incomplete checkpoints, not to batch invariance itself:
 
 | `VLLM_BATCH_INVARIANT` | Backend | Result |
 | --- | --- | --- |
 | 0 | `FLASHINFER_CUTLASS` (auto) | pass |
-| 1 | `VLLM_CUTLASS` (auto) | **NaN** |
-| 1 | `marlin` (forced) | pass |
-| 1 | `emulation` (forced) | pass |
+| 1 | `VLLM_CUTLASS` (auto) | **NaN** on incomplete exports |
+| 1 | `marlin` (forced) | pass (drops activation scales) |
+| 1 | `emulation` (forced) | pass (collapses per-expert scales) |
 
-The bug is specific to the CUTLASS FP4 experts under batch invariance, not to
-NVFP4, not to the checkpoints, and not to batch invariance itself. It is why §5
-fails closed: this kernel's self-declaration was the only thing standing between
-a broken forward pass and a published fidelity number.
+The fail-closed allowlist was the right reaction to a NaN that looked like a
+kernel defect. Once the scales were the cause, keeping CUTLASS off the list
+was the thing standing between native BxQ and a published number.
 
-## 7. W4A4 NVFP4 scores on faithful emulation
+## 7. W4A4 NVFP4 scores on native CUTLASS
 
 A W4A16 export and a W4A4 export of the same model differ only in whether
 activations are also quantized, and that difference decides which kernels can
@@ -182,99 +205,64 @@ so `_quantizes_activations_to_fp4` in `examples/offline_inference/score_mode_kld
 reads the checkpoint: any entry in `quantization_config.config_groups` whose
 `input_activations` declares `num_bits: 4` and `type: "float"` makes it W4A4.
 
-For those checkpoints the scorer pins `moe_backend="emulation"`, which
-quantize-dequantizes both activation stages and is batch invariant by
-construction.
+For those checkpoints the scorer pins `moe_backend="cutlass"`. vLLM CUTLASS
+is the only native W4A4 MoE path that keeps a per-expert activation-scale
+vector. FlashInfer collapses every expert to one scalar via
+`amax_for_moe_activation_quant(...).repeat(num_experts)` — the same defect as
+emulation. Marlin drops activation scales and would score W4A4 as W4A16.
 
-**This path is not yet faithful for MoE.** The emulation branch of
-`convert_to_nvfp4_moe_kernel_format` collapses the per-expert activation scales to
-one scalar per layer — `a13_scale = 1.0 / a13_scale.max()` — and warns when the
-per-expert values differ. vLLM's own comment on that line records the consequence:
-taking the largest global scale "likely results in overflowing the FP8 range for
-other experts." A checkpoint whose per-expert scales span an order of magnitude is
-therefore scored against an activation scale it never uses.
+Unwritten slots are now a NaN sentinel, filled from the maximum of the present
+per-expert scales before CUTLASS fuses them into the weight alphas. Too large
+wastes quantization range; too small overflows e4m3. A layer with no finite
+positive slot is refused rather than invented. The fill is recorded on the
+layer at fill time as `uncalibrated_experts_filled_from_layer_max` and Law 17
+discloses it. A complete export such as unsloth records an empty substitution
+list: native CUTLASS used the checkpoint's own scales.
 
-Note which value survives. Since `a2_scale` holds `1 / w2_input_global_scale` at
-that point, `1.0 / a2_scale.max()` applies the *smallest* per-expert scale — the one
-calibrated for the expert with the smallest activations. Every expert with larger
-activations then has its block scales pushed past the e4m3 ceiling of 448 and
-clipped. The substitution damages the experts it did not come from, and the wider
-the spread the more of them it damages.
+| Path | Per-expert activation scales | Exact repeat |
+| --- | --- | --- |
+| vLLM CUTLASS FP4 | honoured (per-expert vector) | certified on SM120 |
+| FlashInfer FP4 | collapsed to one scalar for the layer | uncertified |
+| Marlin | dropped entirely (scores W4A16) | certified |
+| Emulation | collapsed to a layer maximum | certified |
 
-Measured on `unsloth/gemma-4-26B-A4B-it-NVFP4`, the substitution is one-sided and
-large:
+**The pin belongs on the student only.** It is applied to `student_kwargs`, not
+the shared `llm_kwargs`. Applied to the latter it propagates to the unquantized
+BF16 teacher, which has no such scheme, and reference engine initialization fails.
+
+A weight-only W4A16 NVFP4 result still measures the quantization scheme rather than
+a native FP4 kernel's own rounding, because dense Marlin is not batch invariant
+and those linear layers use deterministic emulation. That limit is stated on the
+published card.
+
+### History: the emulation collapse we published through
+
+Before the loader gap was understood, W4A4 scoring was pinned to emulation.
+The emulation branch of `convert_to_nvfp4_moe_kernel_format` collapses the
+per-expert activation scales to one scalar per layer —
+`a13_scale = 1.0 / a13_scale.max()` — and vLLM's own comment says taking the
+largest global scale "likely results in overflowing the FP8 range for other
+experts." Since `a2_scale` holds `1 / w2_input_global_scale`, `.max()` applies
+the *smallest* per-expert scale. Measured on
+`unsloth/gemma-4-26B-A4B-it-NVFP4`:
 
 | Parameter | Slots | Distinct values | Worst spread | Collapsed |
 | --- | --- | --- | --- | --- |
 | `w13_input_global_scale` | 256 | 1 | 1.0x | no |
 | `w2_input_global_scale` | 128 | 86–99 | 150.5x | yes, all 30 layers |
 
-So `gate_up` is genuinely uniform and untouched, while `down_proj` carries 86 to 99
-distinct per-expert scales in every layer, spanning up to a factor of 150 — all
-replaced by one number. No slot was zero or non-finite, so for this export the
-substitution is the only defect: exact repeat still certifies.
+Four NVFP4 exports carrying byte-identical QDQ diagnostics (0.66652247 and
+1.43642041) scored QxQ between 1.16299506 and 1.82545539 on that path, and that
+0.6 nat spread was written up as living "entirely in the activation scheme and
+kernel path." That reading was unsupported. The spread was substantially an
+artifact of the measurement. It stays here because it is the exact shape of
+mistake this document exists to prevent: a real, reproducible, bitwise-exact
+number that is nonetheless measuring the harness rather than the checkpoint.
 
-So W4A4 NVFP4 currently has **no faithful batch-invariant MoE path at all**:
-
-| Path | Per-expert activation scales | Exact repeat |
-| --- | --- | --- |
-| CUTLASS / FlashInfer FP4 | honoured | uncertified, and NaN on calibration gaps |
-| Marlin | dropped entirely (scores W4A16) | certified |
-| Emulation | collapsed to a layer maximum | certified |
-
-A candidate is **not withdrawn** for this. Withdrawal is for a result that cannot
-be interpreted at all — one bound to a capture nothing publishes, say. A
-substituted activation scale produces a number that means something precise; it is
-the *label* that would be wrong, not the measurement. The remedy is disclosure,
-and it is now Law 17:
-
-- Scoring reads the loaded layers and writes `quantization_substitutions` on the
-  report — parameter, kind, layers reached out of layers scored, worst spread, and
-  any unusable slots — taking the worst case across tensor-parallel ranks.
-- The substituted parameter names enter the comparability key, so substituted
-  results rank against each other and never against faithful ones. The spread is
-  disclosed but deliberately kept *out* of the key: a wide spread does not make a
-  result less comparable to its peers, it moves the whole group further from the
-  deployment all of them describe.
-- Each cell reports `measured`, `substituted`, or `unavailable` with a reason, and
-  the card prints the reason under the intervention table.
-- A report carrying no substitution field at all fails. Silence is not the same
-  claim as "none", which is why the protocol version was bumped to 5 rather than
-  grandfathering older reports.
-
-Four NVFP4 candidates in the gemma-4-26B-A4B-it family carry this disclosure.
-
-One consequence worth stating, because it decides which of the three numbers to
-trust. The substitution reaches QxQ and BxQ alike — both run the student's own
-kernels — so it partly cancels in `QxQ − BxQ`. Not exactly: clipping is nonlinear,
-and the two runs route to different experts, so different experts get damaged. The
-routing delta is the sounder of the three numbers on a substituted candidate,
-without being clean.
-
-Two details matter and both were bugs first:
-
-**The pin belongs on the student only.** It is applied to `student_kwargs`, not
-the shared `llm_kwargs`. Applied to the latter it propagates to the unquantized
-BF16 teacher, which has no such scheme, and reference engine initialization fails.
-
-**Marlin is refused here, not merely not preferred.** Marlin is batch invariant
-and would run, but its MoE path drops activation scales — it would score a W4A4
-checkpoint as though it were W4A16 and report a fidelity the checkpoint never
-delivers. A wrong number that passes every law is worse than a refusal.
-
-A weight-only W4A16 NVFP4 result measures the quantization scheme rather than a
-native FP4 kernel's own rounding, and that limit is stated on the published card.
-
-A cautionary note on reading results from this path. Before the collapse above was
-understood, four NVFP4 exports carrying byte-identical QDQ diagnostics (0.66652247
-and 1.43642041) scored QxQ between 1.16299506 and 1.82545539, and that 0.6 nat
-spread was written up here as living "entirely in the activation scheme and kernel
-path." That reading was unsupported. Those checkpoints differ in how widely their
-per-expert activation scales spread, so they differ in how much the layer-maximum
-substitution costs them, and the spread was substantially an artifact of the
-measurement path. It is recorded here because it is the exact shape of mistake this
-document exists to prevent: a real, reproducible, bitwise-exact number that is
-nonetheless measuring the harness rather than the checkpoint.
+Law 17 still exists for the remaining real substitutions — an uncalibrated
+expert filled from the layer maximum is one — so a substituted result ranks
+only against candidates measured the same way, and is never withdrawn for
+having a disclosed fill.
 
 ## 8. Checkpoint defects the pipeline had to fix, not tolerate
 
@@ -304,7 +292,7 @@ module probe is what separated them, naming `layers.0.router.proj` rather than
 `moe.experts`. The fix dequantizes those tensors into BF16 at load time in
 `Gemma4Model.load_weights`, with tests in `tests/kernels/moe/test_gemma4router.py`
 covering the transposed packed values and the refusal of an indivisible group
-count. That checkpoint now scores 1.17816288 and passes all sixteen laws.
+count. That checkpoint now scores 1.17816288 and passes all seventeen laws.
 
 ## 9. The runtime the numbers are bound to
 
@@ -410,8 +398,10 @@ suite, geometry, runtime, or laws version, and not against any published
 elsewhere. The comparability key is printed with every leaderboard group for
 exactly this reason.
 
-**An NVFP4 result measures the scheme, not a native FP4 kernel.** See §7. The
-faithful-emulation path is a deliberate substitution, disclosed rather than hidden.
+**A W4A4 NVFP4 MoE result is a native CUTLASS number.** See §7. FlashInfer and
+emulation collapse per-expert activation scales; those paths are not how a
+W4A4 candidate is scored. A W4A16 dense NVFP4 result still measures the scheme
+rather than a native FP4 kernel, because dense Marlin is not batch invariant.
 
 **The QDQ ladder is diagnostic, never a candidate.** Those cells round weights on
 synthetic BF16 checkpoints and route naturally. They are not QxQ or BxQ, they are

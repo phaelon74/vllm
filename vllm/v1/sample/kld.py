@@ -1039,16 +1039,19 @@ def inspect_model_lm_heads(model: torch.nn.Module) -> dict[str, Any]:
 
 # Expert implementations an exact-repeat probe has actually cleared on real
 # content. A kernel's own ``_supports_batch_invariance`` is a claim, not
-# evidence: CutlassExpertsFp4 returns True and still takes finite inputs to NaN
-# on W4A4 NVFP4 checkpoints, which a scored run reports as a broken KLD rather
-# than as an uncertified backend. Certification therefore fails closed -- a
-# kernel absent from this set is uncertified no matter what it declares.
+# evidence, so certification fails closed on anything absent from this set.
+# CutlassExpertsFp4 earned its place after the SM120 bitwise permutation test
+# in tests/v1/determinism/test_cutlass_batch_invariance.py (24/24, atol=0) and
+# after the W4A4 NaN was shown to be uninitialized per-expert activation scales,
+# not the kernel. The run's own zero-tolerance exact-repeat control remains the
+# binding gate.
 _EXACT_REPEAT_CERTIFIED_EXPERTS = frozenset(
     {
         "MarlinExperts",
         "BatchedMarlinExperts",
         "TritonExperts",
         "Nvfp4QuantizationEmulationTritonExperts",
+        "CutlassExpertsFp4",
     }
 )
 
@@ -1062,18 +1065,22 @@ _FP4_ACTIVATION_SCALES = (
 def _activation_scale_substitution(layer: torch.nn.Module) -> dict[str, Any] | None:
     """What the loaded kernel did to the checkpoint's per-expert activation scales.
 
-    The NVFP4 emulation experts replace every expert's scale with one scalar per
-    layer, and vLLM's own note on that line says the largest global scale likely
-    overflows the FP8 range for the rest. A number scored that way describes an
-    activation scale the checkpoint does not specify, so what happened is recorded
-    here, from the loaded layer, rather than inferred from the checkpoint later.
-
-    `spread` is the ratio of the largest usable per-expert scale to the smallest,
-    which is how far the substitution had to reach. `unusable` counts slots that
-    are zero or non-finite: a missing `input_scale` key leaves the registered
-    parameter at whatever `torch.empty` returned, so it is not safe to assume a
-    gap reads as zero.
+    Two substitutions are recorded, from the loaded layer rather than inferred
+    later. Emulation still collapses every expert's scale to one scalar per
+    layer. A checkpoint that omitted per-expert keys is filled from the layer
+    maximum at load time, and after that fill the tensor looks finite, so the
+    gap is read from ``layer._nvfp4_uncalibrated_fill`` rather than from the
+    values. ``unusable`` on a fill record is the slot count before the fill.
     """
+    from vllm.model_executor.layers.quantization.utils.nvfp4_activation_scales import (
+        UNCALIBRATED_FILL_ATTR,
+    )
+
+    fills = {
+        record.get("parameter"): record
+        for record in getattr(layer, UNCALIBRATED_FILL_ATTR, None) or ()
+        if isinstance(record, dict) and record.get("parameter")
+    }
     found: dict[str, Any] = {}
     for source, applied in _FP4_ACTIVATION_SCALES:
         per_expert = getattr(layer, source, None)
@@ -1095,7 +1102,20 @@ def _activation_scale_substitution(layer: torch.nn.Module) -> dict[str, Any] | N
         record["collapsed"] = bool(
             record["applied_elements"] == 1 and record["distinct"] > 1
         )
+        fill = fills.get(source)
+        if fill is not None:
+            record["filled"] = fill
+            record["unusable"] = int(fill.get("unusable") or 0)
         found[source] = record
+    if fills and not found:
+        # Fill was recorded on a name the post-load tensor no longer uses.
+        for name, fill in fills.items():
+            found[name] = {
+                "slots": int(fill.get("slots") or 0),
+                "filled": fill,
+                "unusable": int(fill.get("unusable") or 0),
+                "collapsed": False,
+            }
     return found or None
 
 
@@ -1108,29 +1128,48 @@ def _summarize_substitutions(layers: list[dict[str, Any]]) -> list[dict[str, Any
     means every scored layer used the checkpoint's own parameters.
     """
     summary: list[dict[str, Any]] = []
-    for source, _ in _FP4_ACTIVATION_SCALES:
+    kinds = (
+        ("collapsed", "per_expert_collapsed_to_layer_scalar"),
+        ("filled", "uncalibrated_experts_filled_from_layer_max"),
+    )
+    sources = [source for source, _ in _FP4_ACTIVATION_SCALES]
+    extra = {
+        source
+        for layer in layers
+        for source in (layer.get("activation_scales") or {})
+        if source not in sources
+    }
+    for source in (*sources, *sorted(extra)):
         affected = [
             (layer.get("activation_scales") or {}).get(source) or {}
             for layer in layers
         ]
-        collapsed = [record for record in affected if record.get("collapsed")]
-        if not collapsed:
-            continue
-        spreads = [
-            record["spread"] for record in collapsed if "spread" in record
-        ]
-        summary.append(
-            {
-                "parameter": source,
-                "kind": "per_expert_collapsed_to_layer_scalar",
-                "layers": len(collapsed),
-                "layers_scored": len(layers),
-                "max_spread": max(spreads) if spreads else None,
-                "unusable_slots": sum(
-                    int(record.get("unusable") or 0) for record in collapsed
-                ),
-            }
-        )
+        for flag, kind in kinds:
+            matched = [record for record in affected if record.get(flag)]
+            if not matched:
+                continue
+            numeric: list[float] = []
+            unusable = 0
+            for record in matched:
+                detail = record[flag]
+                if isinstance(detail, dict):
+                    spread = detail.get("max_spread") or record.get("spread")
+                    unusable += int(detail.get("unusable") or 0)
+                else:
+                    spread = record.get("spread")
+                    unusable += int(record.get("unusable") or 0)
+                if isinstance(spread, (int, float)):
+                    numeric.append(float(spread))
+            summary.append(
+                {
+                    "parameter": source,
+                    "kind": kind,
+                    "layers": len(matched),
+                    "layers_scored": len(layers),
+                    "max_spread": max(numeric) if numeric else None,
+                    "unusable_slots": unusable,
+                }
+            )
     return summary
 
 

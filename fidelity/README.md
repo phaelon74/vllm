@@ -411,26 +411,24 @@ estimate.
 
 Certified backends are those whose expert implementation an exact-repeat probe
 has cleared on real content and which is not expert-parallel: batch-invariant
-Triton, patched Marlin after the canonical-order and full-K ports, and the
-NVFP4 QDQ emulation experts. A kernel's own `_supports_batch_invariance` is a
-claim, not evidence, so certification fails closed on anything absent from that
-set. CUTLASS NVFP4 is not certified: it declares batch invariance and still
-takes finite inputs to NaN on W4A4 NVFP4 content, which a scored run would
-otherwise report as a broken KLD instead of an uncertified backend.
+Triton, patched Marlin after the canonical-order and full-K ports, the NVFP4
+QDQ emulation experts, and `CutlassExpertsFp4` after the SM120 bitwise
+permutation test (24/24, `atol=0`). A kernel's own `_supports_batch_invariance`
+is a claim, not evidence, so certification fails closed on anything absent from
+that set. The W4A4 NaN that first excluded CUTLASS was uninitialized per-expert
+activation scales (`torch.empty` plus omitted checkpoint keys), not the kernel.
 Qwen GDN attention is certified only on its NVIDIA CUDA, non-speculative
 per-sequence path; FlashInfer GDN context parallelism is disabled there.
 Weight-only W4A16 NVFP4 linear layers use deterministic emulation because
 dense Marlin is not batch invariant, and such a result measures the
 quantization scheme rather than a native FP4 kernel's own rounding.
-W4A4 NVFP4 MoE has no faithful batch-invariant path yet: CUTLASS and FlashInfer
-honour per-expert activation scales but are uncertified and go NaN on
-checkpoints with calibration gaps, Marlin drops activation scales and would
-score W4A4 as W4A16, and the emulation experts collapse the per-expert
-activation scales to one layer maximum — which vLLM's own note says likely
-overflows the FP8 range for the remaining experts. Such a candidate is scored
-and published with that substitution disclosed and bound into its
-comparability key, never withdrawn: the number is real, and only an unqualified
-label for it would be false. See [`QXQ.md`](QXQ.md) for the full account.
+W4A4 NVFP4 MoE scores on native vLLM CUTLASS, which keeps a per-expert
+activation-scale vector. FlashInfer collapses those scales to one scalar for
+the layer; Marlin drops them and would score W4A4 as W4A16; emulation
+collapses them to a layer maximum. Unwritten per-expert slots are a NaN
+sentinel filled from the layer maximum, disclosed under Law 17 as
+`uncalibrated_experts_filled_from_layer_max`. A complete export records no
+substitution. See [`QXQ.md`](QXQ.md) for the full account.
 DeepGEMM, FlashInfer MoE, AITER, XPU, CPU, and EP paths remain uncertified
 until an exact probe passes. Scoring sets `VLLM_BATCH_INVARIANT=1`, disables
 DeepGEMM and FlashInfer autotune, and pins NCCL/cuBLAS determinism flags.

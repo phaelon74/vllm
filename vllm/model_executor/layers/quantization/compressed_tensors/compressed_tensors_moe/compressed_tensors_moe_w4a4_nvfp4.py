@@ -26,6 +26,10 @@ from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa E501
     CompressedTensorsMoEMethod,
 )
+from vllm.model_executor.layers.quantization.utils.nvfp4_activation_scales import (
+    fill_uncalibrated_nvfp4_activation_scales,
+    unwritten_nvfp4_activation_scale,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Dynamic,
     kNvfp4Static,
@@ -163,9 +167,10 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         )
         set_weight_attrs(w2_weight_scale_2, extra_weight_attrs)
 
-        # Input Global Scales
+        # Input Global Scales. NaN until a checkpoint key writes the slot, so
+        # an omitted per-expert key cannot run as uninitialized memory.
         w13_input_scale = torch.nn.Parameter(
-            torch.empty(num_experts, w13_num_shards, dtype=torch.float32),
+            unwritten_nvfp4_activation_scale(num_experts, w13_num_shards),
             requires_grad=False,
         )
         layer.register_parameter("w13_input_global_scale", w13_input_scale)
@@ -175,7 +180,8 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         set_weight_attrs(w13_input_scale, extra_weight_attrs)
 
         w2_input_scale = torch.nn.Parameter(
-            torch.empty(num_experts, dtype=torch.float32), requires_grad=False
+            unwritten_nvfp4_activation_scale(num_experts),
+            requires_grad=False,
         )
         layer.register_parameter("w2_input_global_scale", w2_input_scale)
         extra_weight_attrs.update(
@@ -210,6 +216,10 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
                 "Accuracy may be affected.",
             )
         w13_weight_global_scale = layer.w13_weight_global_scale[:, 0].contiguous()
+
+        # Before 1/G: a missing key is still NaN. After inversion it is Inf,
+        # and CutlassExpertsFp4 multiplies it into the weight alphas in place.
+        fill_uncalibrated_nvfp4_activation_scales(layer)
 
         # Shuffle weights into the NvFp4 kernel format.
         (

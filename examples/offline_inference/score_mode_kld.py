@@ -1542,15 +1542,13 @@ def calculate_kld(
     if "moe_backend" not in student_kwargs and _quantizes_activations_to_fp4(
         model_path
     ):
-        # Auto-selection ranks vLLM's CUTLASS FP4 experts ahead of every path an
-        # exact-repeat probe has cleared, and that kernel takes finite inputs to
-        # NaN on W4A4 content. Marlin is not the answer either: its MoE path
-        # drops activation scales, so it would score a W4A4 checkpoint as W4A16
-        # and report fidelity the checkpoint never delivers. Emulation quantizes
-        # both activation stages in the checkpoint's own scheme. Student only:
-        # the reference is unquantized and has no NVFP4 experts to emulate.
-        student_kwargs["moe_backend"] = "emulation"
-        print("  W4A4 NVFP4 checkpoint: pinning the emulation MoE backend")
+        # Auto-selection would also pick vLLM CUTLASS under batch invariance.
+        # Pin it so a published W4A4 number is the kernel the SM120 bitwise
+        # probe cleared, not FlashInfer (which collapses per-expert scales) and
+        # not emulation (which does the same). Student only: the reference is
+        # unquantized and has no NVFP4 experts.
+        student_kwargs["moe_backend"] = "cutlass"
+        print("  W4A4 NVFP4 checkpoint: pinning the CUTLASS MoE backend")
     with _phase(timings, "student_load"):
         llm = LLM(model=model_path, **student_kwargs)
     moe_backends: list[dict[str, Any]] = []

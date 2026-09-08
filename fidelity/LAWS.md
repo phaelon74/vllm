@@ -606,13 +606,14 @@ measured on its own parameters. A report that carries no substitution field at a
 fails: silence is not the same claim as "none".
 
 **Why.** A kernel can be perfectly deterministic, pass every certification this
-program runs, and still not be computing what the checkpoint describes. The NVFP4
-emulation experts replace each expert's activation scale with one scalar for the
-whole layer, and vLLM's own note on that line says the substituted value likely
-overflows the FP8 range for the remaining experts. Measured on a real export, that
-one scale stood in for 99 distinct per-expert values spanning a factor of 150. The
-resulting mean KLD is real, repeats bitwise, and is a faithful measurement — of a
-procedure the checkpoint did not specify.
+program runs, and still not be computing what the checkpoint describes. Two
+substitutions this program has actually measured: the NVFP4 emulation experts
+replace each expert's activation scale with one scalar for the whole layer
+(measured once at a factor of 150 on a real export, and no longer the scoring
+path), and a checkpoint that omitted per-expert keys has those slots filled from
+the layer maximum so CUTLASS does not run on uninitialized memory. Both produce
+a real, bitwise-repeatable mean that answers a slightly different question than
+the checkpoint posed.
 
 **Disclosure, not withdrawal.** This is the law's central choice. A substituted
 result is published. Withdrawal is reserved for a result that cannot be
