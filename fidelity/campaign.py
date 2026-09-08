@@ -1833,6 +1833,20 @@ def _candidate_complete(
         return False
     if not _paired_report_is_current(payload):
         return False
+    # Assembly publishes the reference capture beside this report, so a capture
+    # rebuilt since the report scored leaves the pair citing a manifest nothing
+    # hashes to. Laws 5 and 14 refuse that at the end of a whole campaign;
+    # catching it here costs one rescore instead of a reverted publication.
+    _, suffix, *_ = score_identity(
+        config, cand.name, cand.path, model.reference_path, config.rows
+    )
+    capture_manifest_path = os.path.join(
+        config.work, "captures", f"{model.name}-ref{suffix}", "manifest.json"
+    )
+    if os.path.isfile(capture_manifest_path) and payload.get(
+        "capture_manifest_sha256"
+    ) != file_sha256(capture_manifest_path):
+        return False
     qxq = payload["qxq_cell"]
     reference_config = os.path.join(model.reference_path, "config.json")
     rows, context_length = _expected_geometry(config)
