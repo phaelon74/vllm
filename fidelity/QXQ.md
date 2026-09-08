@@ -204,10 +204,14 @@ So W4A4 NVFP4 currently has **no faithful batch-invariant MoE path at all**:
 | Marlin | dropped entirely (scores W4A16) | certified |
 | Emulation | collapsed to a layer maximum | certified |
 
-Until the emulation experts apply each expert's own scale, a W4A4 candidate is
-withdrawn via `excluded_candidates` rather than published. Four NVFP4 candidates
-in the gemma-4-26B-A4B-it family were withdrawn for exactly this reason after
-their scoring logs were found to carry the collapse warning.
+A candidate is **not withdrawn** for this. Withdrawal is for a result that cannot
+be interpreted at all — one bound to a capture nothing publishes, say. A
+substituted activation scale produces a number that means something precise; it is
+the *label* that would be wrong, not the measurement. The remedy is disclosure:
+the substitution is recorded on the report, it enters the comparability key so
+substituted results rank against each other and not against faithful ones, and the
+leaderboard marks the affected cells. Four NVFP4 candidates in the
+gemma-4-26B-A4B-it family carry this disclosure.
 
 Two details matter and both were bugs first:
 

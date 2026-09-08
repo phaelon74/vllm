@@ -27,6 +27,30 @@
           "revision": "ed35d7abe5d940da41b4ff06eb482feb0be8cb44"
         },
         {
+          "name": "gemma-4-26B-A4B-it-NVFP4",
+          "path": "/media/fmodels2/RedHatAI/gemma-4-26B-A4B-it-NVFP4",
+          "hf_repo": "RedHatAI/gemma-4-26B-A4B-it-NVFP4",
+          "revision": "5557756b8dce33ac72f2bd702b11729fdba3b839"
+        },
+        {
+          "name": "Gemma-4-26B-A4B-it-NVFP4",
+          "path": "/media/fmodels2/bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4",
+          "hf_repo": "bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4",
+          "revision": "a15dd6f161881b62db952303a5bfb7be118ed15e"
+        },
+        {
+          "name": "unsloth-gemma-4-26B-A4B-it-NVFP4",
+          "path": "/media/fmodels2/unsloth/gemma-4-26B-A4B-it-NVFP4",
+          "hf_repo": "unsloth/gemma-4-26B-A4B-it-NVFP4",
+          "revision": "20df0542b1a86ce19f495ac2eca2c7c12bce82f9"
+        },
+        {
+          "name": "Neural-ICE-Gemma-4-26B-A4B-it-NVFP4",
+          "path": "/media/fmodels2/Neural-ICE/Gemma-4-26B-A4B-it-NVFP4",
+          "hf_repo": "Neural-ICE/Gemma-4-26B-A4B-it-NVFP4",
+          "revision": "659c96699c565f371094dd04f911858ca8e84789"
+        },
+        {
           "name": "gemma-4-26B-A4B-it-AWQ-4bit",
           "path": "/media/fmodels2/cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit",
           "hf_repo": "cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit",
@@ -59,30 +83,6 @@
       "hf_repo": "cklaus/gemma-4-26B-A4B-it-NVFP4",
       "revision": "54218eb0fd33da17632f0d91be841d09a7724a6c",
       "reason": "Scored on vLLM fdc0b57e while every other candidate scored on c798225a, so its report binds a reference capture the family no longer publishes (Law 12) and it ranks in a comparability group of one. Withdrawn rather than rescored: no measurement of this checkpoint is in question, only the provenance it carries."
-    },
-    {
-      "model": "gemma-4-26B-A4B-it",
-      "hf_repo": "RedHatAI/gemma-4-26B-A4B-it-NVFP4",
-      "revision": "5557756b8dce33ac72f2bd702b11729fdba3b839",
-      "reason": "W4A4 NVFP4 has no faithful batch-invariant MoE path today. CUTLASS and FlashInfer honour per-expert activation scales but are uncertified for exact repeat and return NaN on checkpoints with calibration gaps (vllm-project/vllm#45212); Marlin drops activation scales and would score W4A4 as W4A16; the emulation experts collapse per-expert activation scales to a single layer maximum, which vLLM's own note says likely overflows the FP8 range for the remaining experts. This candidate's run logged that collapse, so its mean measures a substituted activation scale rather than the deployed checkpoint. Withdrawn until emulation applies each expert's own scale."
-    },
-    {
-      "model": "gemma-4-26B-A4B-it",
-      "hf_repo": "bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4",
-      "revision": "a15dd6f161881b62db952303a5bfb7be118ed15e",
-      "reason": "Same as RedHatAI/gemma-4-26B-A4B-it-NVFP4: the run logged the emulation collapse of per-expert activation scales to a layer maximum, so the mean does not measure deployed W4A4 numerics. This export additionally lacks input_scale for 4 experts in layer 0 and 2 in layer 14, the two positions where the CUTLASS path produced NaN."
-    },
-    {
-      "model": "gemma-4-26B-A4B-it",
-      "hf_repo": "unsloth/gemma-4-26B-A4B-it-NVFP4",
-      "revision": "20df0542b1a86ce19f495ac2eca2c7c12bce82f9",
-      "reason": "Same as RedHatAI/gemma-4-26B-A4B-it-NVFP4: the run logged the emulation collapse of per-expert activation scales to a layer maximum, so the mean does not measure deployed W4A4 numerics."
-    },
-    {
-      "model": "gemma-4-26B-A4B-it",
-      "hf_repo": "Neural-ICE/Gemma-4-26B-A4B-it-NVFP4",
-      "revision": "659c96699c565f371094dd04f911858ca8e84789",
-      "reason": "Same as bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4: the run logged the emulation collapse of per-expert activation scales, and the export lacks input_scale for 4 experts in layer 0 and 2 in layer 14."
     }
   ],
   "suite_dir": "/media/fmodels2/Local-Inference-Lab/suites/gemma4-26b-a4b-1024x2048-v1"
