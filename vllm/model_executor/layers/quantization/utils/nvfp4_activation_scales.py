@@ -10,8 +10,13 @@ calibrated value in some schemes; NaN is not, so an unwritten slot is
 distinguishable from a loaded one.
 
 A missing slot is filled from the maximum of the present positive scales on
-that tensor. Direction is not arbitrary: ``FP8_MAX = act_max[e] * (1 / G[e])``,
-so overflow happens when ``G`` is too small. Too large only wastes range.
+that tensor. The direction is not arbitrary. Both exporters store the
+reciprocal, ``s = amax / (FP8_MAX * FP4_MAX)``, so ``s`` rises with the
+activation range; the kernel consumes ``1 / s`` and a block's e4m3 scale is
+``(1 / s) * block_amax / FP4_MAX``, which saturates at 448 once ``s`` is
+smaller than that block really needed. Filling from the largest present ``s``
+therefore assumes the widest range in the layer: it cannot overflow, it only
+spends mantissa on a quiet expert. The minimum would do the opposite.
 
 The fill is recorded on the layer at fill time. After it, the tensor looks
 finite and no later inspector can tell a gap was there.

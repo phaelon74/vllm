@@ -101,18 +101,24 @@ def _merge_substitutions(workers: list[dict[str, Any]]) -> list[dict[str, Any]]:
     Each worker inspects its own shard, so a spread that only one rank sees is
     still a spread the scored number carries. Reported worst-first, because the
     largest spread is what a reader has to discount by.
+
+    Keyed by parameter *and* kind: one parameter can carry two different
+    substitutions at once, as an incomplete checkpoint scored on emulation would
+    be both filled and collapsed on ``w2_input_global_scale``. Keeping only the
+    wider of the two would disclose one and bury the other.
     """
-    worst: dict[str, dict[str, Any]] = {}
+    worst: dict[tuple[str, str], dict[str, Any]] = {}
     for worker in workers:
         for record in worker.get("substitutions") or ():
             name = record.get("parameter")
             if not name:
                 continue
-            seen = worst.get(name)
+            key = (str(name), str(record.get("kind")))
+            seen = worst.get(key)
             if seen is None or (record.get("max_spread") or 0) > (
                 seen.get("max_spread") or 0
             ):
-                worst[name] = dict(record)
+                worst[key] = dict(record)
     return sorted(
         worst.values(), key=lambda item: -(item.get("max_spread") or 0)
     )
@@ -1926,6 +1932,14 @@ def calculate_kld(
     report["model_runner_v2"] = student_uses_v2
     report["student_lm_head"] = student_head
     report["student_model"] = os.path.abspath(model_path)
+    # Unconditional, and top level as well as inside the routing binding: a
+    # compliance check and a comparability key must be able to ask what the run
+    # substituted without reaching through a paired-routing structure that a
+    # dense candidate has no reason to carry. Empty here means the backend
+    # inspection found nothing, or that no inspection ran at all; Law 17 tells
+    # those apart from the backend identity rather than reading emptiness as a
+    # clean bill of health.
+    report["quantization_substitutions"] = _merge_substitutions(moe_backends)
     if manifest is not None:
         report["teacher_lm_head"] = manifest.get("lm_head")
         report["reference_weights_sha256"] = manifest.get(
@@ -2140,11 +2154,6 @@ def calculate_kld(
             },
             "natural_control_parity": control_evidence,
         }
-        # Top level as well as inside the routing binding: a compliance check and
-        # a comparability key must be able to ask what the run substituted without
-        # reaching through a paired-routing structure that a dense candidate has
-        # no reason to carry.
-        report["quantization_substitutions"] = _merge_substitutions(moe_backends)
         report["paired_routing_protocol_version"] = (
             PAIRED_ROUTED_SCORE_PROTOCOL_VERSION
         )

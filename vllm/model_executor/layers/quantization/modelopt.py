@@ -1175,7 +1175,7 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
 
         # Input Global Scale
         input_global_scale = PerTensorScaleParameter(
-            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+            data=unwritten_nvfp4_activation_scale(len(output_partition_sizes)),
             weight_loader=weight_loader,
         )
         layer.register_parameter("input_scale", input_global_scale)
@@ -1204,6 +1204,10 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         expose_input_quant_key(layer, self.kernel)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # An omitted shard leaves its slot unwritten, and the .max() below
+        # propagates NaN across the whole fused layer rather than one shard.
+        fill_uncalibrated_nvfp4_activation_scales(layer)
+
         if (
             torch.unique(layer.input_scale).numel() != 1
             or torch.unique(layer.weight_scale_2).numel() != 1

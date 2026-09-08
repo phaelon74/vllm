@@ -48,6 +48,19 @@ def test_zero_is_a_loaded_value_and_is_not_filled():
     torch.testing.assert_close(scale, torch.tensor([0.0, 1.0e-4, 1.0e-4]))
 
 
+def test_exported_zero_survives_disclosure_alongside_a_fill():
+    """A repaired gap must not hide a scale the checkpoint exported as zero."""
+    layer = torch.nn.Module()
+    layer.w2_input_global_scale = torch.nn.Parameter(
+        torch.tensor([0.0, 1.0e-4, float("nan"), 2.0e-3])
+    )
+    layer.w2_input_scale = torch.nn.Parameter(torch.ones(4))
+    fill_uncalibrated_nvfp4_activation_scales(layer)
+    record = _activation_scale_substitution(layer)["w2_input_global_scale"]
+    assert record["filled"]["unusable"] == 1
+    assert record["unusable"] == 1
+
+
 def test_fully_unwritten_scale_is_refused():
     scale = unwritten_nvfp4_activation_scale(8)
     with pytest.raises(ValueError, match="no finite positive slot"):

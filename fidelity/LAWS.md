@@ -603,7 +603,11 @@ what was put in its place, reports how many of the scored layers it reached, and
 bounds how far the replacement had to stretch. The substitution enters the
 candidate's comparability key, so a substituted result never ranks against one
 measured on its own parameters. A report that carries no substitution field at all
-fails: silence is not the same claim as "none".
+fails: silence is not the same claim as "none". An empty field is a pass only when
+the run actually walked the loaded kernels and found nothing replaced. A run with
+no kernel inspection to walk, such as a dense candidate with no routed experts, is
+not applicable rather than clean; an empty field must never be read as a clean bill
+of health for parameters nobody looked at.
 
 **Why.** A kernel can be perfectly deterministic, pass every certification this
 program runs, and still not be computing what the checkpoint describes. Two

@@ -405,9 +405,11 @@ def substituted_parameters(c: Campaign) -> list[str]:
     """Names of quantization parameters the scored run did not use as exported."""
     records = c.report.get("quantization_substitutions") or ()
     return sorted(
-        str(record.get("parameter"))
-        for record in records
-        if isinstance(record, dict) and record.get("parameter")
+        {
+            str(record.get("parameter"))
+            for record in records
+            if isinstance(record, dict) and record.get("parameter")
+        }
     )
 
 
@@ -1130,6 +1132,15 @@ def routing_floor_state(report: dict[str, Any] | None) -> str:
     return "unmeasured"
 
 
+def _inspected_quantization_parameters(c: Campaign) -> bool:
+    """Whether this run walked loaded kernels for substituted parameters."""
+    bxq = c.report.get("bxq_cell")
+    backend = bxq.get("backend_evidence") if isinstance(bxq, dict) else None
+    if not isinstance(backend, dict):
+        return False
+    return bool(backend.get("workers")) and "substitutions" in backend
+
+
 def law_17_substitution_disclosure(c: Campaign) -> Finding:
     """A parameter the run did not use as exported is named, sized, and bounded.
 
@@ -1150,6 +1161,19 @@ def law_17_substitution_disclosure(c: Campaign) -> Finding:
             "whether it used the checkpoint's own quantization parameters",
         )
     if not records:
+        # Empty is two different claims. If the run inspected the loaded kernels
+        # and found nothing replaced, that is a pass. If nothing was inspected,
+        # as on a dense candidate with no routed experts to walk, the run simply
+        # does not know, and saying otherwise would launder silence into a clean
+        # bill of health.
+        if not _inspected_quantization_parameters(c):
+            return Finding(
+                17,
+                title,
+                NOT_APPLICABLE,
+                "no backend inspection ran, so the run makes no claim about "
+                "which quantization parameters it used",
+            )
         return Finding(
             17,
             title,

@@ -428,7 +428,10 @@ the layer; Marlin drops them and would score W4A4 as W4A16; emulation
 collapses them to a layer maximum. Unwritten per-expert slots are a NaN
 sentinel filled from the layer maximum, disclosed under Law 17 as
 `uncalibrated_experts_filled_from_layer_max`. A complete export records no
-substitution. See [`QXQ.md`](QXQ.md) for the full account.
+substitution. A candidate carrying a substitution is scored and published with
+it disclosed and bound into its comparability key, never withdrawn: the number
+is real, and only an unqualified label for it would be false. See
+[`QXQ.md`](QXQ.md) for the full account.
 DeepGEMM, FlashInfer MoE, AITER, XPU, CPU, and EP paths remain uncertified
 until an exact probe passes. Scoring sets `VLLM_BATCH_INVARIANT=1`, disables
 DeepGEMM and FlashInfer autotune, and pins NCCL/cuBLAS determinism flags.

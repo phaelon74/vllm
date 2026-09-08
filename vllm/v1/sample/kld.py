@@ -1070,7 +1070,13 @@ def _activation_scale_substitution(layer: torch.nn.Module) -> dict[str, Any] | N
     layer. A checkpoint that omitted per-expert keys is filled from the layer
     maximum at load time, and after that fill the tensor looks finite, so the
     gap is read from ``layer._nvfp4_uncalibrated_fill`` rather than from the
-    values. ``unusable`` on a fill record is the slot count before the fill.
+    values.
+
+    The two unusable counts mean different things and are deliberately not
+    merged: ``unusable`` is what is still unusable *after* any fill, which is a
+    scale the checkpoint itself exported as zero, while ``filled.unusable`` is
+    how many slots the fill covered. Collapsing them into one number would hide
+    an exported zero behind a repaired gap.
     """
     from vllm.model_executor.layers.quantization.utils.nvfp4_activation_scales import (
         UNCALIBRATED_FILL_ATTR,
@@ -1105,7 +1111,6 @@ def _activation_scale_substitution(layer: torch.nn.Module) -> dict[str, Any] | N
         fill = fills.get(source)
         if fill is not None:
             record["filled"] = fill
-            record["unusable"] = int(fill.get("unusable") or 0)
         found[source] = record
     if fills and not found:
         # Fill was recorded on a name the post-load tensor no longer uses.
