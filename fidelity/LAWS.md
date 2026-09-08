@@ -1,6 +1,6 @@
 # Local Inference Lab — Distribution Fidelity Laws
 
-**Laws version:** 12
+**Laws version:** 13
 **Status:** draft, pending coordination with `local-inference-lab` on the
 publication namespace and suite format.
 
@@ -103,6 +103,15 @@ samples to agree exactly in routes and per-position KLD. Uncertified or
 nondeterministic backends fail. Version-11 paired reports must be rescored
 rather than relabeled. The paired routed-score and BxQ protocol versions are
 now 4.
+
+Version 13 adds Law 17. Versions 1 through 12 checked at length that a kernel
+computed repeatably and never asked whether it computed what the checkpoint
+exported, so a batch-invariant, fully certified run could substitute a
+quantization parameter and publish the result under the checkpoint's name. A
+version-12 report does not record what it substituted and cannot be relabeled as
+one that substituted nothing; the record comes from the loaded model during
+scoring. Version-12 paired reports must be rescored. The paired routed-score and
+BxQ protocol versions are now 5.
 
 These laws govern every distribution-fidelity measurement this program
 publishes. They are not guidance. The pipeline refuses to produce or upload an
@@ -585,6 +594,73 @@ existed whose weights have since been released, where no digest can be recovered
 without a rescore. The deviation is printed beside the number, which then states
 that its weights are unbound. Not permitted for a new measurement, and never
 permitted for a refused identical mean.
+
+## Law 17 — Numerical substitution disclosure
+
+**Required.** When the kernel that scored a candidate did not use a quantization
+parameter as the checkpoint exported it, the result names that parameter, states
+what was put in its place, reports how many of the scored layers it reached, and
+bounds how far the replacement had to stretch. The substitution enters the
+candidate's comparability key, so a substituted result never ranks against one
+measured on its own parameters. A report that carries no substitution field at all
+fails: silence is not the same claim as "none".
+
+**Why.** A kernel can be perfectly deterministic, pass every certification this
+program runs, and still not be computing what the checkpoint describes. The NVFP4
+emulation experts replace each expert's activation scale with one scalar for the
+whole layer, and vLLM's own note on that line says the substituted value likely
+overflows the FP8 range for the remaining experts. Measured on a real export, that
+one scale stood in for 99 distinct per-expert values spanning a factor of 150. The
+resulting mean KLD is real, repeats bitwise, and is a faithful measurement — of a
+procedure the checkpoint did not specify.
+
+**Disclosure, not withdrawal.** This is the law's central choice. A substituted
+result is published. Withdrawal is reserved for a result that cannot be
+interpreted at all, such as one bound to a reference capture the family no longer
+publishes; it is not a penalty for a number that came out badly, and a fidelity
+index that quietly drops the checkpoints its kernels handle worst is not an index
+of checkpoints but of kernel coverage. The failure mode here is never the
+measurement, it is an unqualified label on it. So the remedy is a label.
+
+**The spread is disclosed but does not bound comparability.** Only the identity of
+the substituted parameter enters the comparability key. Two candidates the kernel
+substituted the same way remain rankable against each other — which is the entire
+purpose of keeping them — while the spread tells a reader how much to discount the
+absolute value. A wide spread does not make a result less comparable to its peers;
+it makes the whole group further from the deployment all of them describe.
+
+**Per-cell states.** Each cell of a routed result reports one of three states.
+`measured` used the checkpoint's own parameters. `substituted` holds a real
+repeatable number obtained under a named replacement. `unavailable` holds no
+number, with the reason it could not be taken. The three are not collapsible: an
+absent cell and a substituted one are both unlike a plain measurement and nothing
+like each other. Where a substitution reaches both cells of a routed pair it
+partly cancels in `QxQ − BxQ`, but never exactly — clipping is nonlinear and the
+two runs route to different experts — so the delta is the sounder of the three
+numbers without being clean.
+
+**Check.** Compliance requires `quantization_substitutions` on the report. Each
+entry states its parameter, kind, affected and scored layer counts, and worst
+spread; a missing field, a malformed entry, or one that omits its spread fails.
+The check then confirms the comparability key still binds the substituted
+parameters. Scoring records the field from the loaded model, per tensor-parallel
+worker, reporting the worst case across ranks.
+
+**What is inspected so far, stated as a limit.** Routed expert layers are
+inspected; dense linear layers are not. This is a real gap and it fails closed:
+a dense family scored today reports no substitution field and Law 17 refuses it,
+which is the correct outcome — the law says nothing about that checkpoint until
+someone measures it. Recording an empty list instead would assert that nothing was
+substituted, and for NVFP4 that assertion would be false: the dense path collapses
+the input scale across each fused parallel layer exactly as the expert path does,
+under vLLM's own warning that it will likely reduce accuracy. Closing the gap
+needs more than a new inspector, because that path deletes `input_scale` once it
+has taken the maximum. The evidence does not survive loading, so it has to be
+captured while the substitution happens rather than observed afterwards.
+
+**Override.** Not permitted. An approval could only assert that an undisclosed
+substitution is acceptable, which is the one thing this law exists to refuse.
+A result whose substitution cannot be determined is unavailable, not approved.
 
 ## Numbering
 

@@ -95,6 +95,29 @@ def apply_eager_llm_kwargs(llm_kwargs: dict[str, Any]) -> None:
     llm_kwargs["enable_flashinfer_autotune"] = False
 
 
+def _merge_substitutions(workers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Worst case per substituted parameter across the tensor-parallel workers.
+
+    Each worker inspects its own shard, so a spread that only one rank sees is
+    still a spread the scored number carries. Reported worst-first, because the
+    largest spread is what a reader has to discount by.
+    """
+    worst: dict[str, dict[str, Any]] = {}
+    for worker in workers:
+        for record in worker.get("substitutions") or ():
+            name = record.get("parameter")
+            if not name:
+                continue
+            seen = worst.get(name)
+            if seen is None or (record.get("max_spread") or 0) > (
+                seen.get("max_spread") or 0
+            ):
+                worst[name] = dict(record)
+    return sorted(
+        worst.values(), key=lambda item: -(item.get("max_spread") or 0)
+    )
+
+
 def _quantizes_activations_to_fp4(model_path: str) -> bool:
     """Whether a checkpoint quantizes activations to 4-bit float (W4A4).
 
@@ -429,7 +452,7 @@ def _dump_positions(chunks: Any, score_from: int, path: str) -> None:
 
 ROUTING_MANIFEST = "routing-manifest.json"
 ROUTING_TRACE_PROTOCOL_VERSION = 2
-PAIRED_ROUTED_SCORE_PROTOCOL_VERSION = 4
+PAIRED_ROUTED_SCORE_PROTOCOL_VERSION = 5
 EXACT_REPEAT_PROTOCOL = "exact_repeat_certification_v1"
 CONTROL_POSITION_BASE_TOLERANCE = 0.0
 CONTROL_MEAN_BASE_TOLERANCE = 0.0
@@ -2115,9 +2138,15 @@ def calculate_kld(
                 ),
                 "recurrent_layer_profiles": sorted(recurrent_profiles),
                 "workers": len(moe_backends),
+                "substitutions": _merge_substitutions(moe_backends),
             },
             "natural_control_parity": control_evidence,
         }
+        # Top level as well as inside the routing binding: a compliance check and
+        # a comparability key must be able to ask what the run substituted without
+        # reaching through a paired-routing structure that a dense candidate has
+        # no reason to carry.
+        report["quantization_substitutions"] = _merge_substitutions(moe_backends)
         report["paired_routing_protocol_version"] = (
             PAIRED_ROUTED_SCORE_PROTOCOL_VERSION
         )

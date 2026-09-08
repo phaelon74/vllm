@@ -67,7 +67,7 @@ FP32_COPIES = 4
 # Peak vs live tensors; expandable_segments keeps this from growing further.
 ALLOCATOR_SLACK = 1.25
 TP_CANDIDATES = (1, 2, 4, 8)
-PAIRED_ROUTED_SCORE_PROTOCOL_VERSION = 4
+PAIRED_ROUTED_SCORE_PROTOCOL_VERSION = 5
 ROUTING_TRACE_PROTOCOL_VERSION = 2
 _REFERENCE_WEIGHT_DIGESTS: dict[str, str] = {}
 

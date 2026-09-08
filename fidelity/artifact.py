@@ -21,9 +21,10 @@ import sys
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from compliance import cell_state  # noqa: E402 - sibling module
 from redaction import redact_env  # noqa: E402 - sibling module
 
-LAWS_VERSION = 12
+LAWS_VERSION = 13
 PROGRAM = "Local Inference Lab"
 # Vendor calibration on packed int4. QDQ still matches format only.
 _CALIBRATED_ALGORITHMS = frozenset({"awq", "gptq", "autoround"})
@@ -749,24 +750,35 @@ def _paired_routing_intervention(receipt: dict[str, Any]) -> list[str]:
         "computes its own gating weights for those experts.",
         "",
     ]
+    # Both cells run the same student kernels, so a substitution reaches both and
+    # partly cancels in the difference. Not exactly: clipping is nonlinear and the
+    # two runs route to different experts, so the delta is the sounder of the three
+    # numbers without being clean.
+    states = {
+        name: cell_state({**receipt, name: body}, name)
+        for name, body in (("qxq_cell", qxq), ("bxq_cell", bxq))
+    }
     out += _table(
         [
             (
                 "QxQ",
                 "student natural IDs; student gating weights",
                 _kld(qxq.get("mean_kld")),
+                states["qxq_cell"]["state"],
                 _link(qxq),
             ),
             (
                 "BxQ",
                 "BF16 teacher IDs; student gating weights",
                 _kld(bxq.get("mean_kld")),
+                states["bxq_cell"]["state"],
                 _link(bxq),
             ),
             (
                 "QxQ - BxQ",
                 "paired routing-intervention delta; not additive attribution",
                 "n/a" if delta is None else f"{float(delta):+.8f}",
+                "",
                 "",
             ),
             (
@@ -778,10 +790,20 @@ def _paired_routing_intervention(receipt: dict[str, Any]) -> list[str]:
                     else "diagnostic only"
                 ),
                 "",
+                "",
             ),
         ],
-        ("Run", "Routing", "Mean KLD", "Support"),
+        ("Run", "Routing", "Mean KLD", "Measurability", "Support"),
     )
+    for name, state in states.items():
+        if state["state"] != "measured":
+            out += [
+                "",
+                f"**{name.split('_')[0].upper()} is {state['state']}:** "
+                f"{state['reason']}. The number is real and repeats bitwise, but it "
+                "answers a question the checkpoint did not pose, so it ranks only "
+                "against candidates measured the same way.",
+            ]
     out += [
         "",
         f"Natural QxQ selections changed from the teacher at "
@@ -2195,7 +2217,7 @@ def selftest() -> int:
             "routing_trace_sha256": trace,
             "routing_trace_manifest": "routing-manifest.json",
             "routing_mode": "teacher_ids_student_weights",
-            "protocol_version": 4,
+            "protocol_version": 5,
             "routing_trace_protocol_version": 2,
             "candidate_weights_unchanged": True,
             "backend_evidence": {

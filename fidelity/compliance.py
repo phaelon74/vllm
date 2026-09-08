@@ -27,8 +27,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-LAWS_VERSION = 12
-BXQ_PROTOCOL_VERSION = 4
+LAWS_VERSION = 13
+# v5 adds the substitution record Law 17 reads. A report scored before it cannot
+# say whether it used the checkpoint's own quantization parameters, so the bump
+# makes every earlier routed report stale rather than grandfathering the silence.
+BXQ_PROTOCOL_VERSION = 5
 ROUTING_TRACE_PROTOCOL_VERSION = 2
 
 # The identity a capture is bound to. Law 5 requires the scored report to carry
@@ -387,6 +390,79 @@ def comparability_key(c: Campaign) -> dict[str, Any]:
         "compiled_extensions_sha256": runtime.get(
             "compiled_extensions_sha256"
         ),
+        # A run that substituted a quantization parameter measured a different
+        # procedure than one that used the checkpoint's own. Both are real
+        # measurements; ranking them together would compare the procedures rather
+        # than the checkpoints, so the substitution bounds the group. Only what was
+        # substituted enters the key, never the spread: two candidates substituted
+        # the same way remain comparable to each other, which is the whole point of
+        # keeping them instead of withdrawing them.
+        "substituted_parameters": substituted_parameters(c),
+    }
+
+
+def substituted_parameters(c: Campaign) -> list[str]:
+    """Names of quantization parameters the scored run did not use as exported."""
+    records = c.report.get("quantization_substitutions") or ()
+    return sorted(
+        str(record.get("parameter"))
+        for record in records
+        if isinstance(record, dict) and record.get("parameter")
+    )
+
+
+MEASURED = "measured"
+SUBSTITUTED = "substituted"
+UNAVAILABLE = "unavailable"
+
+
+def cell_state(report: dict[str, Any], cell: str) -> dict[str, Any]:
+    """Whether a cell holds a measurement, a substituted one, or nothing at all.
+
+    Three states, because two were never enough. A cell that could not be scored
+    and a cell scored on a parameter the kernel replaced are both unlike a plain
+    measurement, but they are nothing like each other: the first has no number, the
+    second has a real and repeatable one that answers a slightly different
+    question. Collapsing them would either discard a usable result or dress up an
+    absent one.
+
+    Derived from what the report already records rather than stored alongside it,
+    so a state cannot drift from the evidence it describes.
+    """
+    body = report.get(cell)
+    value = body.get("mean_kld") if isinstance(body, dict) else None
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        stated = body.get("unavailable_reason") if isinstance(body, dict) else None
+        return {
+            "state": UNAVAILABLE,
+            "reason": stated or "no finite mean KLD was recorded for this cell",
+        }
+    records = [
+        record
+        for record in report.get("quantization_substitutions") or ()
+        if isinstance(record, dict)
+    ]
+    if not records:
+        return {
+            "state": MEASURED,
+            "reason": "scored on the checkpoint's own quantization parameters",
+        }
+    worst = max(records, key=lambda record: record.get("max_spread") or 0)
+    spread = worst.get("max_spread")
+    return {
+        "state": SUBSTITUTED,
+        "reason": (
+            f"the kernel replaced {worst.get('parameter')} "
+            f"({worst.get('kind')}) across "
+            f"{worst.get('layers')}/{worst.get('layers_scored')} scored layers"
+            + (f", worst spread {float(spread):.4g}x" if spread else "")
+        ),
+        "parameters": sorted(
+            str(record.get("parameter"))
+            for record in records
+            if record.get("parameter")
+        ),
+        "max_spread": spread,
     }
 
 
@@ -1054,6 +1130,82 @@ def routing_floor_state(report: dict[str, Any] | None) -> str:
     return "unmeasured"
 
 
+def law_17_substitution_disclosure(c: Campaign) -> Finding:
+    """A parameter the run did not use as exported is named, sized, and bounded.
+
+    A kernel that substitutes a quantization parameter still produces a real,
+    repeatable measurement, so the result is published rather than withdrawn. What
+    it may not do is carry an unqualified label: the reader has to be told what was
+    replaced and how far the replacement reached, and the comparability key has to
+    keep the result away from candidates measured on their own parameters.
+    """
+    title = "Substitution disclosure"
+    records = c.report.get("quantization_substitutions")
+    if records is None:
+        return Finding(
+            17,
+            title,
+            FAIL,
+            "the run recorded no substitution field at all, so it cannot say "
+            "whether it used the checkpoint's own quantization parameters",
+        )
+    if not records:
+        return Finding(
+            17,
+            title,
+            PASS,
+            "every scored layer used the checkpoint's own quantization parameters",
+        )
+    described = []
+    for record in records:
+        if not isinstance(record, dict):
+            return Finding(17, title, FAIL, f"malformed substitution: {record!r}")
+        missing = [
+            key
+            for key in ("parameter", "kind", "layers", "layers_scored")
+            if record.get(key) in (None, "")
+        ]
+        if missing:
+            return Finding(
+                17,
+                title,
+                FAIL,
+                f"substitution of {record.get('parameter')!r} does not report "
+                f"{', '.join(missing)}",
+            )
+        spread = record.get("max_spread")
+        if not isinstance(spread, (int, float)):
+            return Finding(
+                17,
+                title,
+                FAIL,
+                f"substitution of {record['parameter']!r} reports no spread, so "
+                "nothing says how far the replacement reached",
+            )
+        described.append(
+            f"{record['parameter']} {record['kind']} across "
+            f"{record['layers']}/{record['layers_scored']} layers, "
+            f"worst spread {spread:.4g}x"
+            + (
+                f", {record['unusable_slots']} unusable slot(s)"
+                if record.get("unusable_slots")
+                else ""
+            )
+        )
+    # A regression guard, not a recomputation: the key is built from the same
+    # record, so this cannot catch a disagreement, only the removal of the field
+    # that keeps substituted results out of a faithful ranking.
+    if "substituted_parameters" not in comparability_key(c):
+        return Finding(
+            17,
+            title,
+            FAIL,
+            "the comparability key no longer carries substituted_parameters, so "
+            "this result could be ranked against one measured faithfully",
+        )
+    return Finding(17, title, PASS, "; ".join(described))
+
+
 # Registered after every check is defined. Numbering is append-only, so Law 14
 # sits at the end even though it is evaluated with the rest.
 LAWS: tuple[tuple[int, Callable[[Campaign], Finding]], ...] = (
@@ -1072,6 +1224,7 @@ LAWS: tuple[tuple[int, Callable[[Campaign], Finding]], ...] = (
     (14, law_14_component_attribution),
     (15, law_15_domain_disclosure),
     (16, law_16_weight_binding),
+    (17, law_17_substitution_disclosure),
 )
 
 

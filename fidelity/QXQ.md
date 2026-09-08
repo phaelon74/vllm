@@ -186,15 +186,33 @@ For those checkpoints the scorer pins `moe_backend="emulation"`, which
 quantize-dequantizes both activation stages and is batch invariant by
 construction.
 
-**This path is not yet faithful for MoE, and no W4A4 result may be published on
-it.** The emulation branch of `convert_to_nvfp4_moe_kernel_format` collapses the
-per-expert activation scales to one scalar per layer —
-`a13_scale = 1.0 / a13_scale.max()` — and warns when the per-expert values differ.
-vLLM's own comment on that line records the consequence: taking the largest global
-scale "likely results in overflowing the FP8 range for other experts." A
-checkpoint whose per-expert scales span an order of magnitude is therefore scored
-against an activation scale it never uses, and the resulting mean is biased by an
-amount nothing in the run discloses.
+**This path is not yet faithful for MoE.** The emulation branch of
+`convert_to_nvfp4_moe_kernel_format` collapses the per-expert activation scales to
+one scalar per layer — `a13_scale = 1.0 / a13_scale.max()` — and warns when the
+per-expert values differ. vLLM's own comment on that line records the consequence:
+taking the largest global scale "likely results in overflowing the FP8 range for
+other experts." A checkpoint whose per-expert scales span an order of magnitude is
+therefore scored against an activation scale it never uses.
+
+Note which value survives. Since `a2_scale` holds `1 / w2_input_global_scale` at
+that point, `1.0 / a2_scale.max()` applies the *smallest* per-expert scale — the one
+calibrated for the expert with the smallest activations. Every expert with larger
+activations then has its block scales pushed past the e4m3 ceiling of 448 and
+clipped. The substitution damages the experts it did not come from, and the wider
+the spread the more of them it damages.
+
+Measured on `unsloth/gemma-4-26B-A4B-it-NVFP4`, the substitution is one-sided and
+large:
+
+| Parameter | Slots | Distinct values | Worst spread | Collapsed |
+| --- | --- | --- | --- | --- |
+| `w13_input_global_scale` | 256 | 1 | 1.0x | no |
+| `w2_input_global_scale` | 128 | 86–99 | 150.5x | yes, all 30 layers |
+
+So `gate_up` is genuinely uniform and untouched, while `down_proj` carries 86 to 99
+distinct per-expert scales in every layer, spanning up to a factor of 150 — all
+replaced by one number. No slot was zero or non-finite, so for this export the
+substitution is the only defect: exact repeat still certifies.
 
 So W4A4 NVFP4 currently has **no faithful batch-invariant MoE path at all**:
 
@@ -207,11 +225,31 @@ So W4A4 NVFP4 currently has **no faithful batch-invariant MoE path at all**:
 A candidate is **not withdrawn** for this. Withdrawal is for a result that cannot
 be interpreted at all — one bound to a capture nothing publishes, say. A
 substituted activation scale produces a number that means something precise; it is
-the *label* that would be wrong, not the measurement. The remedy is disclosure:
-the substitution is recorded on the report, it enters the comparability key so
-substituted results rank against each other and not against faithful ones, and the
-leaderboard marks the affected cells. Four NVFP4 candidates in the
-gemma-4-26B-A4B-it family carry this disclosure.
+the *label* that would be wrong, not the measurement. The remedy is disclosure,
+and it is now Law 17:
+
+- Scoring reads the loaded layers and writes `quantization_substitutions` on the
+  report — parameter, kind, layers reached out of layers scored, worst spread, and
+  any unusable slots — taking the worst case across tensor-parallel ranks.
+- The substituted parameter names enter the comparability key, so substituted
+  results rank against each other and never against faithful ones. The spread is
+  disclosed but deliberately kept *out* of the key: a wide spread does not make a
+  result less comparable to its peers, it moves the whole group further from the
+  deployment all of them describe.
+- Each cell reports `measured`, `substituted`, or `unavailable` with a reason, and
+  the card prints the reason under the intervention table.
+- A report carrying no substitution field at all fails. Silence is not the same
+  claim as "none", which is why the protocol version was bumped to 5 rather than
+  grandfathering older reports.
+
+Four NVFP4 candidates in the gemma-4-26B-A4B-it family carry this disclosure.
+
+One consequence worth stating, because it decides which of the three numbers to
+trust. The substitution reaches QxQ and BxQ alike — both run the student's own
+kernels — so it partly cancels in `QxQ − BxQ`. Not exactly: clipping is nonlinear,
+and the two runs route to different experts, so different experts get damaged. The
+routing delta is the sounder of the three numbers on a substituted candidate,
+without being clean.
 
 Two details matter and both were bugs first:
 
