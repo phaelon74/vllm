@@ -15,8 +15,11 @@ reciprocal, ``s = amax / (FP8_MAX * FP4_MAX)``, so ``s`` rises with the
 activation range; the kernel consumes ``1 / s`` and a block's e4m3 scale is
 ``(1 / s) * block_amax / FP4_MAX``, which saturates at 448 once ``s`` is
 smaller than that block really needed. Filling from the largest present ``s``
-therefore assumes the widest range in the layer: it cannot overflow, it only
-spends mantissa on a quiet expert. The minimum would do the opposite.
+therefore assumes the widest range in the layer and cannot saturate; the
+minimum would do the opposite. It is not free, though: an over-large ``s``
+pushes a quiet block's e4m3 scale down, and past a spread of roughly a hundred
+that scale reaches the e4m3 subnormals and starts losing mantissa. This is why
+the spread is disclosed rather than the fill simply being called safe.
 
 The fill is recorded on the layer at fill time. After it, the tensor looks
 finite and no later inspector can tell a gap was there.
