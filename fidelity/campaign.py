@@ -1833,19 +1833,25 @@ def _candidate_complete(
         return False
     if not _paired_report_is_current(payload):
         return False
-    # Assembly publishes the reference capture beside this report, so a capture
-    # rebuilt since the report scored leaves the pair citing a manifest nothing
-    # hashes to. Laws 5 and 14 refuse that at the end of a whole campaign;
-    # catching it here costs one rescore instead of a reverted publication.
+    # Hold this report to the same currency bar the scorer applies, on the same
+    # arguments `_score_candidate` scores with. Checking only the capture on disk
+    # is order-dependent: the first candidate of a run sees the capture its own
+    # predecessor wrote, matches it, and is skipped, while a later rescore
+    # replaces the capture and strands the skipped report on a dead manifest and
+    # an older commit. Laws 5, 12, and 14 then refuse it after a whole campaign.
     _, suffix, *_ = score_identity(
         config, cand.name, cand.path, model.reference_path, config.rows
     )
-    capture_manifest_path = os.path.join(
-        config.work, "captures", f"{model.name}-ref{suffix}", "manifest.json"
-    )
-    if os.path.isfile(capture_manifest_path) and payload.get(
-        "capture_manifest_sha256"
-    ) != file_sha256(capture_manifest_path):
+    if not _score_report_is_current(
+        report,
+        model.reference_path,
+        measure_routing=routed,
+        paired_routing=routed,
+        bind_reference_weights=False,
+        capture=os.path.join(
+            config.work, "captures", f"{model.name}-ref{suffix}"
+        ),
+    ):
         return False
     qxq = payload["qxq_cell"]
     reference_config = os.path.join(model.reference_path, "config.json")
