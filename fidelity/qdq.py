@@ -816,10 +816,12 @@ def _declared_kv_cache_scheme(
 ) -> dict[str, Any] | None:
     """The KV cache quantization a config declares, if any.
 
-    vLLM honours a declared scheme whenever `kv_cache_dtype` is left at "auto",
-    which is what scoring does, so a checkpoint declaring one was measured with
-    a quantized KV cache and a checkpoint declaring none was not. That is a
-    difference in what actually ran and nothing else on the card records it.
+    Scoring pins an unquantized cache, so this is not what ran: it is what a
+    reader deploying the checkpoint will get by default, since vLLM honours the
+    declaration whenever `kv_cache_dtype` is left at "auto". It also dates a
+    result. Any report scored before the pin was taken under exactly this
+    declaration, which is what `scripts/scan_published_kv_cache_schemes.py`
+    reads it for.
     """
     for section in sections:
         scheme = section.get("kv_cache_scheme")
