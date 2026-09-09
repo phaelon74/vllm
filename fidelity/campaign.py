@@ -1867,8 +1867,6 @@ def _candidate_complete(
     routed: bool,
     weight_gib: float | None = None,
 ) -> bool:
-    if not routed:
-        return _find(config.work, cand.name + "-v") is not None
     report = score_report(
         config,
         cand.name,
@@ -1884,7 +1882,7 @@ def _candidate_complete(
             payload = json.load(handle)
     except (OSError, json.JSONDecodeError):
         return False
-    if not _paired_report_is_current(payload):
+    if routed and not _paired_report_is_current(payload):
         return False
     # Hold this report to the same currency bar the scorer applies, on the same
     # arguments `_score_candidate` scores with. Checking only the capture on disk
@@ -1911,8 +1909,6 @@ def _candidate_complete(
         ),
     ):
         return False
-    qxq = payload["qxq_cell"]
-    reference_config = os.path.join(model.reference_path, "config.json")
     rows, context_length = _expected_geometry(config)
     if (
         payload.get("num_rows") != rows
@@ -1921,7 +1917,25 @@ def _candidate_complete(
         or payload.get("candidate_revision") != cand.revision
         or payload.get("reference_weights_sha256")
         != reference_weights_identity(model.reference_path)
-        or qxq.get("partition") != config.partition
+    ):
+        return False
+    if not routed:
+        # A dense candidate has no routed cell to read a partition, a reference
+        # digest, or a token hash out of, which is why this used to settle for the
+        # existence of a file with a matching prefix. That skipped every dense
+        # candidate that had ever been scored, at any geometry, on any commit,
+        # under any KV cache: four laws-13 reports here were declared complete
+        # while the three never scored before were the only ones that ran.
+        # `_score_report_is_current` above has already held this report's capture
+        # to the manifest on disk, and that manifest binds the suite, the tokens,
+        # and the geometry, so the binding is checked -- through the capture
+        # rather than through a cell this report has no reason to carry.
+        bind_weights(report, cand.path, observed=False)
+        return True
+    qxq = payload["qxq_cell"]
+    reference_config = os.path.join(model.reference_path, "config.json")
+    if (
+        qxq.get("partition") != config.partition
         or not os.path.isfile(reference_config)
         or qxq.get("reference_config_sha256") != file_sha256(reference_config)
     ):
@@ -2169,12 +2183,14 @@ def cmd_score(config: Config, python: str) -> int:
 
         for cand in model.candidates:
             # Ask whether this candidate needs scoring before paying to fetch
-            # it. A routed check needs the report filename, so an absent
-            # checkpoint is sized from the Hub; only if that fails do we fetch
-            # first, which is what the check used to do for every candidate and
-            # is why a current one downloaded 27 GB to be released untouched.
+            # it. The check needs the report filename, which carries the planned
+            # TP, so an absent checkpoint is sized from the Hub; only if that
+            # fails do we fetch first, which is what the check used to do for
+            # every candidate and is why a current one downloaded 27 GB to be
+            # released untouched. Dense candidates need this too, now that their
+            # check resolves an exact filename rather than any matching prefix.
             weight_gib = None
-            if routed and not _has_checkpoint_weights(cand.path):
+            if not _has_checkpoint_weights(cand.path):
                 weight_gib = plan_weight_gib_from_hub(config, model, cand)
                 if weight_gib is None:
                     try:
@@ -2322,18 +2338,6 @@ def cmd_smoke(
         print("SMOKE FAIL: selected candidates have no routed reference", file=sys.stderr)
         return 1
     return 1 if refused else 0
-
-
-def _find(work: str, pattern: str) -> str | None:
-    """Locate a produced artifact by tag prefix, newest first."""
-    root = os.path.join(work, "reports")
-    if not os.path.isdir(root):
-        return None
-    matches = sorted(
-        (f for f in os.listdir(root) if f.startswith(pattern) and f.endswith(".json")),
-        reverse=True,
-    )
-    return os.path.join(root, matches[0]) if matches else None
 
 
 def _assembled_report(
