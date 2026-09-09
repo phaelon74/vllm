@@ -1,6 +1,6 @@
 # Local Inference Lab — Distribution Fidelity Laws
 
-**Laws version:** 13
+**Laws version:** 14
 **Status:** draft, pending coordination with `local-inference-lab` on the
 publication namespace and suite format.
 

@@ -33,7 +33,6 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from artifact import (  # noqa: E402 - sibling module
-    LAWS_VERSION,
     candidate_identity,
     front_matter,
 )

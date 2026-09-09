@@ -21,10 +21,12 @@ import sys
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from compliance import cell_state  # noqa: E402 - sibling module
+# Imported, never restated. A second copy of this number renders cards under a
+# laws version the receipts beside them disagree with, and the selftest that
+# compares it to LAWS.md passes while both are stale.
+from compliance import LAWS_VERSION, cell_state  # noqa: E402 - sibling module
 from redaction import redact_env  # noqa: E402 - sibling module
 
-LAWS_VERSION = 13
 PROGRAM = "Local Inference Lab"
 # Vendor calibration on packed int4. QDQ still matches format only.
 _CALIBRATED_ALGORITHMS = frozenset({"awq", "gptq", "autoround"})
