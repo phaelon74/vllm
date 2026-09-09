@@ -298,7 +298,7 @@ Two independent quantizations do not agree to four decimal places on their own.
 The reading that fits is that once a tensor's per-expert scales are replaced by
 one layer maximum on half the layers, the fill sets the number and the
 checkpoint's own choices stop being visible in it. On the same suite the clean
-NVFP4 exports separate normally — 1.16570700 for unsloth against 1.77968754 for
+NVFP4 exports separate normally — 1.13846019 for unsloth against 1.77968754 for
 RedHatAI — so the collapse is not the suite failing to discriminate.
 
 This is n=2 and therefore a strong hint rather than a proof; a fill-direction
@@ -354,11 +354,23 @@ scheme declared in the candidate's own config, so
 `unsloth/gemma-4-26B-A4B-it-NVFP4` — which declares an 8-bit float KV cache —
 had its attention read and written through a quantized cache while every
 candidate it was ranked against used an unquantized one. That is a difference in
-how the measurement was taken, not a property of the checkpoint being measured,
-and it inflated that candidate's KLD by an amount no one had bounded. The cache
-is never quantized: scoring holds 4096 tokens, so there is no memory pressure
-that quantizing it could relieve, and nothing to weigh against the loss of
-comparability. `assert_unquantized_kv_cache` reads the dtype the engine actually
+how the measurement was taken, not a property of the checkpoint being measured.
+The cache is never quantized: scoring holds 4096 tokens, so there is no memory
+pressure that quantizing it could relieve, and nothing to weigh against the loss
+of comparability.
+
+The rescore that followed measured what it had cost, and doubled as the cleanest
+determinism evidence in this document. unsloth is the only one of the nine
+candidates whose inspection reported a declared KV cache scheme, and it is the
+only one whose number moved: 1.16570700 to 1.13846019, so its declared FP8 cache
+had been costing it 0.02724681 nats, or 2.3% of its KLD, and enough to place it
+above `gemma-4-26B-A4B-it-W4A16` at 1.15926068 when it belongs below. Five of the
+remaining eight are quoted at their pre-pin values elsewhere in this document —
+0.69415039, 1.17816288 with its BxQ and delta, 1.77968754, 1.82281421, and
+1.82307292 — and every one came back identical to eight decimal places on a
+different `vllm_commit`. So the defect was worth a rescore and was not worth a
+panic, the blast radius was exactly the set the mechanism predicted, and the
+harness reproduced everything outside it. `assert_unquantized_kv_cache` reads the dtype the engine actually
 resolved and refuses both a quantized value and `auto`, because the failure being
 prevented is precisely a value nobody checked.
 
@@ -472,12 +484,13 @@ not rankable against deployed candidates, and the published tables separate them
 may quantize attention at one width and its experts at another, and may declare a
 KV cache scheme. `unsloth/gemma-4-26B-A4B-it-NVFP4` is `format:
 "mixed-precision"`: FP8 W8A8 attention, NVFP4 W4A4 experts and dense MLP, and a
-declared FP8 KV cache. Its QxQ of 1.16570700 against 1.77968754 for a complete
+declared FP8 KV cache. Its QxQ of 1.13846019 against 1.77968754 for a complete
 all-`Linear` NVFP4 export is therefore mostly the 8-bit attention, not a better
 NVFP4 export, and it lands between the all-FP8 candidate at 0.69415039 and the
-all-NVFP4 ones exactly where a hybrid should. That 1.16570700 was taken before
-§9's KV cache pin, so it also carries the FP8 cache the checkpoint declared; the
-laws-14 rescore separates the two, leaving only the weight scheme in the number. This is not a comparability failure — the key deliberately excludes
+all-NVFP4 ones exactly where a hybrid should. The declared KV cache is a separate
+matter and is no longer in that number: §9 pins an unquantized cache, which is
+worth 0.02724681 of the 0.64 separating it from the complete export, so the
+attention width still carries the result. This is not a comparability failure — the key deliberately excludes
 the candidate's scheme, because ranking schemes against one reference is the
 point — but it was a labelling one until `scheme_mix` and `kv_cache_scheme` were
 added to the inspection. Component coverage cannot substitute: it counts how many
