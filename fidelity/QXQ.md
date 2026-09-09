@@ -451,6 +451,21 @@ rather than a native FP4 kernel, because dense Marlin is not batch invariant.
 synthetic BF16 checkpoints and route naturally. They are not QxQ or BxQ, they are
 not rankable against deployed candidates, and the published tables separate them.
 
+**A scheme label names the narrowest group, not the whole model.** A checkpoint
+may quantize attention at one width and its experts at another, and may declare a
+KV cache scheme that vLLM honours because scoring leaves `kv_cache_dtype` at
+`auto`. `unsloth/gemma-4-26B-A4B-it-NVFP4` is `format: "mixed-precision"`: FP8
+W8A8 attention, NVFP4 W4A4 experts and dense MLP, and an FP8 KV cache. Its QxQ of
+1.16570700 against 1.77968754 for a complete all-`Linear` NVFP4 export is
+therefore mostly the 8-bit attention, not a better NVFP4 export, and it lands
+between the all-FP8 candidate at 0.69415039 and the all-NVFP4 ones exactly where a
+hybrid should. This is not a comparability failure — the key deliberately excludes
+the candidate's scheme, because ranking schemes against one reference is the
+point — but it was a labelling one until `scheme_mix` and `kv_cache_scheme` were
+added to the inspection. Component coverage cannot substitute: it counts how many
+weights are quantized, not at what width, so a hybrid and a uniform export both
+read `all`.
+
 **A flip rate is not an error rate.** Two experts disagreeing on a token is not
 by itself a wrong answer; the delta is what quantifies the cost. AutoRound's
 93.07% flip rate with a +0.275 delta is the point — high disagreement, bounded

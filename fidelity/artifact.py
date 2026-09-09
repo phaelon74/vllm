@@ -542,6 +542,27 @@ def _link(cell: dict[str, Any] | None) -> str:
     return " · ".join(links)
 
 
+def _kv_cache_fact(inspection: dict[str, Any]) -> str:
+    """How the KV cache was quantized during scoring, from what the config declared.
+
+    vLLM honours a declared scheme whenever `kv_cache_dtype` stays at "auto",
+    which is what scoring leaves it at. So this is not a property the card is
+    reporting for interest: it is a difference in what ran, between a candidate
+    that declared a scheme and one beside it that did not.
+    """
+    scheme = inspection.get("kv_cache_scheme")
+    if not isinstance(scheme, dict) or not scheme:
+        return "unquantized (no scheme declared)"
+    algo = scheme.get("quant_algo")
+    if algo:
+        return f"{algo}, honoured because scoring leaves kv_cache_dtype at auto"
+    strategy = scheme.get("strategy")
+    described = f"{scheme.get('num_bits')}-bit {scheme.get('type')}"
+    if strategy:
+        described += f", per {strategy}"
+    return f"{described}, honoured because scoring leaves kv_cache_dtype at auto"
+
+
 def _deployed_quantization(deployed: dict[str, Any]) -> list[str]:
     """What the shipped checkpoint actually quantized, and how finely.
 
@@ -563,8 +584,17 @@ def _deployed_quantization(deployed: dict[str, Any]) -> list[str]:
         size = f"{on_disk / 2**30:.2f} GiB"
         if inspection.get("weights_bytes_source") == "hub":
             size += " (as the Hub reports the pinned revision, not measured here)"
+    mix = inspection.get("scheme_mix")
+    mix = mix if isinstance(mix, dict) else None
+    kv_note = _kv_cache_fact(inspection)
+    scheme_value = str(inspection.get("detected_scheme") or "n/a")
+    if mix:
+        # The label names the narrowest group only. Saying so beside the label
+        # matters more than anywhere further down, because the leaderboard shows
+        # this value and nothing else about the scheme.
+        scheme_value += " (mixed precision, see below)"
     facts = [
-        ("Scheme", str(inspection.get("detected_scheme") or "n/a")),
+        ("Scheme", scheme_value),
         ("Block", str(inspection.get("detected_block") or "n/a")),
         ("Weights on disk", size),
         (
@@ -582,9 +612,36 @@ def _deployed_quantization(deployed: dict[str, Any]) -> list[str]:
                 or "n/a"
             ),
         ),
+        ("KV cache", kv_note),
     ]
     out += _table(facts, ("Property", "Value"))
     out.append("")
+    if mix:
+        out += [
+            f"**This checkpoint quantizes at more than one width** "
+            f"(`{mix.get('format') or 'format not declared'}`). The scheme above "
+            f"names the narrowest group, so it is not a description of the whole "
+            f"model, and two checkpoints carrying the same label can differ by "
+            f"more than any two exports of one format do.",
+            "",
+        ]
+        out += _table(
+            [
+                (
+                    (
+                        f"W{entry.get('weight_bits')}"
+                        f"A{entry.get('activation_bits')}"
+                        if entry.get("activation_bits")
+                        else f"W{entry.get('weight_bits')} weight-only"
+                    ),
+                    ", ".join(f"`{t}`" for t in entry.get("targets") or ())
+                    or "not named",
+                )
+                for entry in mix.get("groups") or ()
+            ],
+            ("Width", "Applies to"),
+        )
+        out.append("")
     coverage = inspection.get("coverage") or {}
     rows = []
     for component, counts in coverage.items():
@@ -597,6 +654,13 @@ def _deployed_quantization(deployed: dict[str, Any]) -> list[str]:
     if rows:
         out += _table(rows, ("Component", "Quantized weights", "Coverage"))
         out.append("")
+        if mix:
+            out += [
+                "These counts say how many weights are quantized, not at what "
+                "width. A component reading `all` here reads the same for every "
+                "width in the table above, so read the two together.",
+                "",
+            ]
     partial = [name for name, _, verdict in rows if verdict == "some"]
     if partial:
         matched = sum(

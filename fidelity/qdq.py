@@ -120,7 +120,7 @@ COMPONENTS = tuple(COMPONENT_PATTERNS)
 # reading taken by an older inspector outlives the code that produced it. Bump
 # this whenever detection or classification changes and every cache that
 # predates the change is re-read instead of trusted.
-INSPECT_VERSION = 4
+INSPECT_VERSION = 5
 # Variant-path suffix; full hex lives on inspect.json and the QDQ manifest.
 MATCH_DIGEST_LEN = 12
 
@@ -764,6 +764,80 @@ def _refuse_mixed_bit_widths(quant: dict[str, Any]) -> None:
     )
 
 
+def _declared_scheme_mix(sections: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Every quantized width a config declares, when it declares more than one.
+
+    A checkpoint may quantize attention at one width and the experts at another.
+    `detected_scheme` names a single format and reports whichever group resolves
+    first, so a hybrid reads as though the whole model used its narrowest format.
+    Two checkpoints then carry the same label while one keeps attention at 8
+    bits, which buys more fidelity than any difference between two exports of
+    the same format and is the thing a reader most needs told.
+
+    None when a config declares one width, which is the common case.
+    `_refuse_mixed_bit_widths` covers the AutoRound spelling of this, reading
+    `bits` and `extra_config`; a compressed-tensors config says it in
+    `config_groups` and passes that guard untouched.
+    """
+    for section in sections:
+        groups = section.get("config_groups")
+        if not isinstance(groups, dict):
+            continue
+        described: list[dict[str, Any]] = []
+        for name, group in sorted(groups.items()):
+            if not isinstance(group, dict):
+                continue
+            weights = group.get("weights") or {}
+            width = _as_int(weights.get("num_bits"))
+            # 16 bits and wider is a group left alone, not a second format.
+            if width is None or width >= 16:
+                continue
+            activations = group.get("input_activations") or {}
+            described.append(
+                {
+                    "group": str(name),
+                    "format": group.get("format"),
+                    "weight_bits": width,
+                    "activation_bits": _as_int(activations.get("num_bits")),
+                    "targets": [
+                        str(target)
+                        for target in (group.get("targets") or ())
+                        if target
+                    ],
+                }
+            )
+        if len({entry["weight_bits"] for entry in described}) > 1:
+            return {"format": section.get("format"), "groups": described}
+    return None
+
+
+def _declared_kv_cache_scheme(
+    sections: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """The KV cache quantization a config declares, if any.
+
+    vLLM honours a declared scheme whenever `kv_cache_dtype` is left at "auto",
+    which is what scoring does, so a checkpoint declaring one was measured with
+    a quantized KV cache and a checkpoint declaring none was not. That is a
+    difference in what actually ran and nothing else on the card records it.
+    """
+    for section in sections:
+        scheme = section.get("kv_cache_scheme")
+        if isinstance(scheme, dict) and scheme:
+            return {
+                "num_bits": _as_int(scheme.get("num_bits")),
+                "type": scheme.get("type"),
+                "strategy": scheme.get("strategy"),
+            }
+        # ModelOpt spells it as a string instead of a block.
+        algo = scheme if isinstance(scheme, str) else section.get(
+            "kv_cache_quant_algo"
+        )
+        if isinstance(algo, str) and algo:
+            return {"quant_algo": algo}
+    return None
+
+
 def _scale_shapes(model: str) -> dict[str, tuple[int, ...]]:
     """Map each quantized weight to its scale's shape, reading headers only.
 
@@ -1188,6 +1262,10 @@ def inspect(model: str) -> dict[str, Any]:
         "detected_scheme": detected_scheme,
         "detected_block": detected_block,
         "quant_algorithm": quant_algorithm,
+        # Both are absent for the single-format, unquantized-KV majority. Present,
+        # they say the label above describes only part of what was measured.
+        "scheme_mix": _declared_scheme_mix(sections),
+        "kv_cache_scheme": _declared_kv_cache_scheme(sections),
         "coverage": coverage,
         "quantized_names": sorted(quantized_names),
         "unloadable_reason": reason,
@@ -1210,6 +1288,29 @@ def render_inspection(report: dict[str, Any]) -> str:
         lines.append(f"  detected block: {report['detected_block']}")
     if report.get("quant_algorithm"):
         lines.append(f"  quant algorithm: {report['quant_algorithm']}")
+    mix = report.get("scheme_mix")
+    if mix:
+        lines.append(
+            f"  MIXED PRECISION ({mix.get('format') or 'format not declared'}): "
+            f"the scheme above names only the narrowest group"
+        )
+        for entry in mix.get("groups") or ():
+            activation = entry.get("activation_bits")
+            width = (
+                f"W{entry['weight_bits']}A{activation}"
+                if activation
+                else f"W{entry['weight_bits']} weight-only"
+            )
+            targets = ", ".join(entry.get("targets") or ()) or "unnamed"
+            lines.append(f"    {width}: {targets}")
+    kv = report.get("kv_cache_scheme")
+    if kv:
+        described = (
+            kv.get("quant_algo")
+            or f"{kv.get('num_bits')}-bit {kv.get('type')} "
+            f"({kv.get('strategy')})"
+        )
+        lines.append(f"  kv cache: {described}, honoured when dtype is auto")
     lines.append("  component coverage (quantized / total weights):")
     for component, counts in report["coverage"].items():
         if not counts["weights"] and not counts["quantized"]:
@@ -1672,6 +1773,63 @@ def selftest() -> int:
     else:
         raise AssertionError("two quantized widths in one config must refuse")
     print("  mixed widths: 16-bit overrides pass, 8-bit beside 4-bit refuses")
+
+    # The compressed-tensors spelling of a second format, which the refusal above
+    # does not read. Shape taken from unsloth/gemma-4-26B-A4B-it-NVFP4, whose FP8
+    # attention was labelled plain nvfp4 and outscored three all-NVFP4 exports by
+    # 0.6 nats for that reason alone.
+    hybrid = {
+        "quant_method": "compressed-tensors",
+        "format": "mixed-precision",
+        "kv_cache_scheme": {
+            "num_bits": 8, "type": "float", "strategy": "tensor"
+        },
+        "config_groups": {
+            "group_0": {
+                "format": "float-quantized",
+                "targets": [r"re:.*self_attn\.(q|k|v|o)_proj$"],
+                "weights": {"num_bits": 8},
+                "input_activations": {"num_bits": 8},
+            },
+            "group_1": {
+                "format": "nvfp4-pack-quantized",
+                "targets": [r"re:.*\.experts\.\d+\.(gate|up|down)_proj$"],
+                "weights": {"num_bits": 4},
+                "input_activations": {"num_bits": 4},
+            },
+        },
+    }
+    mix = _declared_scheme_mix([hybrid])
+    assert mix is not None and mix["format"] == "mixed-precision", mix
+    assert [entry["weight_bits"] for entry in mix["groups"]] == [8, 4], mix
+    assert mix["groups"][0]["activation_bits"] == 8, mix
+    kv = _declared_kv_cache_scheme([hybrid])
+    assert kv == {"num_bits": 8, "type": "float", "strategy": "tensor"}, kv
+
+    # One width across groups is not a mix, and no declared KV scheme is None.
+    uniform = {
+        "quant_method": "compressed-tensors",
+        "format": "nvfp4-pack-quantized",
+        "config_groups": {
+            "group_0": {
+                "targets": ["Linear"],
+                "weights": {"num_bits": 4},
+                "input_activations": {"num_bits": 4},
+            }
+        },
+    }
+    assert _declared_scheme_mix([uniform]) is None
+    assert _declared_kv_cache_scheme([uniform]) is None
+    # A 16-bit group is a module left alone, not a second format.
+    left_alone = json.loads(json.dumps(uniform))
+    left_alone["config_groups"]["group_1"] = {
+        "targets": ["lm_head"], "weights": {"num_bits": 16}
+    }
+    assert _declared_scheme_mix([left_alone]) is None
+    assert _declared_kv_cache_scheme(
+        [{"quant_method": "modelopt", "kv_cache_quant_algo": "FP8"}]
+    ) == {"quant_algo": "FP8"}
+    print("  mixed precision: config_groups widths and kv cache scheme disclosed")
 
     keys = {
         "model.layers.0.self_attn.q_proj.qweight",
