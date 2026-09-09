@@ -15,6 +15,10 @@ those, which ones a rescore will actually move.
 Reads each report's own ``candidate_hf_repo`` and ``candidate_revision`` and
 fetches only ``config.json`` and the ``hf_quant_config.json`` sidecar, so it
 answers for a candidate whose weights were deleted after scoring under a lease.
+Reports written before those fields existed name no checkpoint at all, so the
+campaign configs are consulted as a fallback and the answer is labelled with
+where the identity came from: the config pins the revision as of now, which is
+not necessarily the one a historical report scored.
 
 Detection is ``qdq.py``'s own, not a second implementation. Vendors declare the
 scheme in any of four places, and a scanner that disagreed with the inspector
@@ -28,6 +32,7 @@ import json
 import os
 import sys
 import tempfile
+from typing import Any
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "fidelity"))
@@ -40,6 +45,44 @@ RELABEL = "relabel"
 UNKNOWN = "unknown"
 
 CONFIG_FILES = ("config.json", "hf_quant_config.json")
+
+# Two configs naming different checkpoints for one published candidate. Recorded
+# rather than resolved: picking one would answer for a checkpoint that may not be
+# the one scored.
+CONFLICT = object()
+
+
+def candidate_repos(campaigns: str) -> dict[str, Any]:
+    """Hub identity per published candidate, from the campaign configs.
+
+    Reports written before `candidate_hf_repo` existed name no checkpoint, and the
+    campaign config is the only other place the binding is declared. It is weaker
+    evidence: the config carries the revision pinned *now*, which is not
+    necessarily the one a historical report scored, so a result resolved this way
+    is labelled as such rather than presented as though the report said it.
+    """
+    index: dict[str, Any] = {}
+    for path in sorted(glob.glob(os.path.join(campaigns, "*.json"))):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                config = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        for model in config.get("models") or ():
+            if not isinstance(model, dict):
+                continue
+            for cand in model.get("candidates") or ():
+                if not isinstance(cand, dict) or not cand.get("name"):
+                    continue
+                key = f"{model.get('name')}/{cand['name']}"
+                found = (cand.get("hf_repo"), cand.get("revision"))
+                if not found[0]:
+                    continue
+                if key in index and index[key] != found:
+                    index[key] = CONFLICT
+                elif key not in index:
+                    index[key] = found
+    return index
 
 
 def declared_kv_scheme(repo: str, revision: str | None) -> dict | None:
@@ -74,7 +117,9 @@ def declared_kv_scheme(repo: str, revision: str | None) -> dict | None:
         return _declared_kv_cache_scheme(quant_sections(staging, config))
 
 
-def classify(report: dict) -> tuple[str, str]:
+def classify(
+    report: dict, label: str, index: dict[str, Any]
+) -> tuple[str, str]:
     """One published report's standing against the KV cache pin.
 
     A report that records ``kv_cache_dtype`` at all was scored under the pin:
@@ -85,30 +130,40 @@ def classify(report: dict) -> tuple[str, str]:
     if report.get("kv_cache_dtype"):
         return CURRENT, f"scored with kv_cache_dtype={report['kv_cache_dtype']}"
 
+    caveat = ""
     repo = report.get("candidate_hf_repo")
-    if not repo:
-        return UNKNOWN, "predates the pin and records no Hub repo to ask"
     revision = report.get("candidate_revision")
+    if not repo:
+        declared = index.get(label)
+        if declared is CONFLICT:
+            return UNKNOWN, "campaign configs disagree about which checkpoint this is"
+        if not declared:
+            return UNKNOWN, "records no Hub repo, and no campaign config names one"
+        repo, revision = declared
+        caveat = " (repo from the campaign config, not the report)"
     try:
         scheme = declared_kv_scheme(repo, revision)
     except Exception as exc:  # noqa: BLE001 - a read failure is not a clearance
         return UNKNOWN, f"predates the pin and {repo} could not be read ({exc})"
 
     if scheme is None:
-        return RELABEL, "predates the pin but declares no KV scheme"
+        return RELABEL, f"{repo} declares no KV scheme{caveat}"
     described = scheme.get("quant_algo") or ", ".join(
         f"{key}={value}" for key, value in sorted(scheme.items()) if value
     )
-    return RESCORE, f"declares {described}, so it was cached quantized"
+    return RESCORE, f"{repo} declares {described}{caveat}"
 
 
-def scan(library: str, family: str | None) -> dict[str, list[tuple[str, str]]]:
+def scan(
+    library: str, family: str | None, campaigns: str
+) -> dict[str, list[tuple[str, str]]]:
     found: dict[str, list[tuple[str, str]]] = {
         CURRENT: [],
         RESCORE: [],
         RELABEL: [],
         UNKNOWN: [],
     }
+    index = candidate_repos(campaigns)
     pattern = os.path.join(library, family or "*", "*", "report.json")
     for path in sorted(glob.glob(pattern)):
         parts = path.split(os.sep)
@@ -119,7 +174,7 @@ def scan(library: str, family: str | None) -> dict[str, list[tuple[str, str]]]:
         except (OSError, json.JSONDecodeError) as exc:
             found[UNKNOWN].append((label, f"report unreadable ({exc})"))
             continue
-        state, detail = classify(report)
+        state, detail = classify(report, label, index)
         found[state].append((label, detail))
     return found
 
@@ -132,9 +187,14 @@ def main() -> int:
     parser.add_argument(
         "--family", help="one model family; default is every family published"
     )
+    parser.add_argument(
+        "--campaigns",
+        default=os.path.join(REPO_ROOT, "fidelity", "campaigns"),
+        help="campaign configs, read only for reports that name no Hub repo",
+    )
     args = parser.parse_args()
 
-    found = scan(args.library, args.family)
+    found = scan(args.library, args.family, args.campaigns)
     headings = {
         RESCORE: "RESCORE  the number is affected; its KLD includes a quantized cache",
         UNKNOWN: "UNKNOWN  cannot be cleared from here; treat as affected",
