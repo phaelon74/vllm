@@ -1233,6 +1233,61 @@ def inspect_model_moe_backends(model: torch.nn.Module) -> dict[str, Any]:
     return {"layers": layers, "substitutions": _summarize_substitutions(layers)}
 
 
+def inspect_model_nvfp4_dense_scales(model: torch.nn.Module) -> dict[str, Any]:
+    """Fill evidence from NVFP4 layers the routed-expert walk does not reach.
+
+    A dense NVFP4 projection can omit a shard's activation scale exactly as an
+    expert can, and the loader fills it the same way. Without this walk a dense
+    candidate would report no substitution and Law 17 would have nothing to
+    disclose, which is the silence the law exists to prevent.
+
+    Reported separately from the routed layers so the denominators stay honest:
+    a fill on 3 of 200 dense layers is a different claim than 3 of 30 experts.
+    """
+    from vllm.model_executor.layers.fused_moe.layer import MoERunner
+    from vllm.model_executor.layers.quantization.utils.nvfp4_activation_scales import (
+        UNCALIBRATED_FILL_ATTR,
+        UNCALIBRATED_SCAN_ATTR,
+    )
+
+    routed = {
+        id(module.routed_experts)
+        for module in model.modules()
+        if isinstance(module, MoERunner)
+    }
+    layers = []
+    for name, module in model.named_modules():
+        if not hasattr(module, UNCALIBRATED_SCAN_ATTR) or id(module) in routed:
+            continue
+        found: dict[str, Any] = {}
+        for record in getattr(module, UNCALIBRATED_FILL_ATTR, None) or ():
+            if not isinstance(record, dict) or not record.get("parameter"):
+                continue
+            found[str(record["parameter"])] = {
+                "slots": int(record.get("slots") or 0),
+                "filled": record,
+                # A dense scale that loaded as zero is not filled, and the
+                # post-fill tensor is gone by now, so this counts only the gap.
+                "unusable": 0,
+                "collapsed": False,
+            }
+        layers.append(
+            {
+                "name": name,
+                "quant_method": type(
+                    getattr(module, "quant_method", None)
+                ).__name__,
+                "scanned": list(getattr(module, UNCALIBRATED_SCAN_ATTR) or ()),
+                "activation_scales": found or None,
+            }
+        )
+    return {
+        "layers_scanned": len(layers),
+        "layers_filled": sum(1 for layer in layers if layer["activation_scales"]),
+        "substitutions": _summarize_substitutions(layers),
+    }
+
+
 def inspect_model_recurrent_backends(model: torch.nn.Module) -> dict[str, Any]:
     """Record loaded recurrent-attention implementations on one worker."""
     from vllm.model_executor.layers.mamba.abstract import MambaBase

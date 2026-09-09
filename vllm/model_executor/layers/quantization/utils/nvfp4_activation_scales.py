@@ -35,6 +35,10 @@ logger = init_logger(__name__)
 
 UNCALIBRATED_FILL_ATTR = "_nvfp4_uncalibrated_fill"
 UNCALIBRATED_FILL_KIND = "uncalibrated_experts_filled_from_layer_max"
+# Set on every layer the scan visited, filled or not. A disclosure needs a
+# denominator, and counting NVFP4 layers after load is guesswork: the dense
+# paths delete or overwrite the scale parameter they were named for.
+UNCALIBRATED_SCAN_ATTR = "_nvfp4_activation_scales_scanned"
 
 _NVFP4_ACTIVATION_SCALE_ATTRS = (
     "w13_input_global_scale",
@@ -101,13 +105,16 @@ def fill_uncalibrated_nvfp4_activation_scales(
     substitution on ``layer._nvfp4_uncalibrated_fill``.
     """
     records: list[dict[str, Any]] = []
+    scanned: list[str] = []
     for name in _NVFP4_ACTIVATION_SCALE_ATTRS:
         tensor = getattr(layer, name, None)
         if not isinstance(tensor, torch.Tensor):
             continue
+        scanned.append(name)
         record = fill_uncalibrated_nvfp4_activation_scale(tensor, name=name)
         if record is not None:
             records.append(record)
+    setattr(layer, UNCALIBRATED_SCAN_ATTR, scanned)
     if records:
         setattr(layer, UNCALIBRATED_FILL_ATTR, records)
         logger.warning_once(

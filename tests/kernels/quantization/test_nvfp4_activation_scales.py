@@ -6,6 +6,7 @@ import torch
 from vllm.model_executor.layers.quantization.utils.nvfp4_activation_scales import (
     UNCALIBRATED_FILL_ATTR,
     UNCALIBRATED_FILL_KIND,
+    UNCALIBRATED_SCAN_ATTR,
     fill_uncalibrated_nvfp4_activation_scale,
     fill_uncalibrated_nvfp4_activation_scales,
     unwritten_nvfp4_activation_scale,
@@ -13,6 +14,7 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_activation_scales impor
 from vllm.v1.sample.kld import (
     _activation_scale_substitution,
     _summarize_substitutions,
+    inspect_model_nvfp4_dense_scales,
 )
 
 
@@ -77,6 +79,47 @@ def test_layer_records_fill_evidence_before_values_look_finite():
     stored = getattr(layer, UNCALIBRATED_FILL_ATTR)
     assert stored[0]["unusable"] == 1
     assert torch.isfinite(layer.w2_input_global_scale).all()
+
+
+def test_scan_is_recorded_even_when_there_was_nothing_to_fill():
+    """The denominator has to exist before a numerator means anything."""
+    layer = torch.nn.Module()
+    layer.input_scale = torch.nn.Parameter(torch.tensor([1.0e-4]))
+    assert fill_uncalibrated_nvfp4_activation_scales(layer) == []
+    assert getattr(layer, UNCALIBRATED_SCAN_ATTR) == ["input_scale"]
+
+
+def test_dense_scan_counts_clean_layers_in_the_denominator():
+    model = torch.nn.Module()
+    clean, gapped = torch.nn.Module(), torch.nn.Module()
+    clean.input_global_scale = torch.nn.Parameter(torch.tensor([1.0e-4, 4.0e-4]))
+    gapped.input_global_scale = torch.nn.Parameter(
+        torch.tensor([1.0e-4, float("nan")])
+    )
+    model.add_module("clean_proj", clean)
+    model.add_module("gapped_proj", gapped)
+    for module in (clean, gapped):
+        fill_uncalibrated_nvfp4_activation_scales(module)
+
+    found = inspect_model_nvfp4_dense_scales(model)
+    assert found["layers_scanned"] == 2
+    assert found["layers_filled"] == 1
+    (record,) = found["substitutions"]
+    assert record["parameter"] == "input_global_scale"
+    assert record["kind"] == UNCALIBRATED_FILL_KIND
+    assert (record["layers"], record["layers_scored"]) == (1, 2)
+    assert record["unusable_slots"] == 1
+
+
+def test_dense_scan_on_a_model_with_no_nvfp4_layers_claims_nothing():
+    model = torch.nn.Module()
+    model.add_module("proj", torch.nn.Linear(4, 4))
+    found = inspect_model_nvfp4_dense_scales(model)
+    assert found == {
+        "layers_scanned": 0,
+        "layers_filled": 0,
+        "substitutions": [],
+    }
 
 
 def test_inspector_reads_fill_attr_not_the_now_finite_tensor():

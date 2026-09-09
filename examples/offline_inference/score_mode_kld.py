@@ -1559,6 +1559,12 @@ def calculate_kld(
         llm = LLM(model=model_path, **student_kwargs)
     moe_backends: list[dict[str, Any]] = []
     recurrent_backends: list[dict[str, Any]] = []
+    # Unconditional: a dense candidate has no routed experts to walk, but its
+    # NVFP4 projections can still have had an omitted shard scale filled, and
+    # Law 17 must be able to disclose that rather than report silence.
+    from vllm.v1.sample.kld import inspect_model_nvfp4_dense_scales
+
+    dense_scales = llm.apply_model(inspect_model_nvfp4_dense_scales)
     if routing_manifest is not None:
         from vllm.v1.sample.kld import (
             inspect_model_moe_backends,
@@ -1935,11 +1941,19 @@ def calculate_kld(
     # Unconditional, and top level as well as inside the routing binding: a
     # compliance check and a comparability key must be able to ask what the run
     # substituted without reaching through a paired-routing structure that a
-    # dense candidate has no reason to carry. Empty here means the backend
-    # inspection found nothing, or that no inspection ran at all; Law 17 tells
-    # those apart from the backend identity rather than reading emptiness as a
-    # clean bill of health.
-    report["quantization_substitutions"] = _merge_substitutions(moe_backends)
+    # dense candidate has no reason to carry.
+    report["quantization_substitutions"] = _merge_substitutions(
+        [*moe_backends, *dense_scales]
+    )
+    report["nvfp4_dense_scale_inspection"] = {
+        "workers": len(dense_scales),
+        "layers_scanned": sum(
+            int(worker.get("layers_scanned") or 0) for worker in dense_scales
+        ),
+        "layers_filled": sum(
+            int(worker.get("layers_filled") or 0) for worker in dense_scales
+        ),
+    }
     if manifest is not None:
         report["teacher_lm_head"] = manifest.get("lm_head")
         report["reference_weights_sha256"] = manifest.get(

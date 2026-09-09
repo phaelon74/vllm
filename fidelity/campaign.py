@@ -1007,6 +1007,7 @@ def score_identity(
     rows: int,
     suite_limit: int | None = None,
     plan_from: str | None = None,
+    weight_gib: float | None = None,
 ) -> tuple[str, str, int, float, float]:
     """The tag, suffix, and GPU plan a scoring run would use.
 
@@ -1014,8 +1015,15 @@ def score_identity(
     without producing it. `plan_from` stands in for the student when planning: a
     QDQ variant has the reference's geometry, and once its weights are pruned the
     variant on disk no longer implies the tensor-parallel degree it was scored at.
+
+    `weight_gib` stands in for the on-disk measurement when a leased checkpoint
+    has been released. The suffix carries the planned TP, so a caller that wants
+    the filename a scoring run would use has to supply the same weight figure
+    that run would have measured.
     """
-    plan = plan_gpus([plan_from or student, teacher], config)
+    plan = plan_gpus(
+        [plan_from or student, teacher], config, weight_gib=weight_gib
+    )
     # Everything the capture manifest binds itself to belongs in the directory
     # name, or a reused capture becomes a confusing abort instead of a recapture.
     if config.suite_dir:
@@ -1037,10 +1045,11 @@ def score_report(
     rows: int,
     suite_limit: int | None = None,
     plan_from: str | None = None,
+    weight_gib: float | None = None,
 ) -> str:
     """Where a scoring run's report would land."""
     tag, *_ = score_identity(
-        config, label, student, teacher, rows, suite_limit, plan_from
+        config, label, student, teacher, rows, suite_limit, plan_from, weight_gib
     )
     return os.path.join(config.work, "reports", f"{tag}.json")
 
@@ -1809,11 +1818,46 @@ def qdq_routing(reference_path: str) -> dict[str, Any] | None:
     return None
 
 
+def plan_weight_gib_from_hub(
+    config: Config, model: Model, cand: Candidate
+) -> float | None:
+    """The weight figure `plan_gpus` would reach for a released checkpoint.
+
+    A candidate under lease is deleted after scoring, and the completeness check
+    needs the report filename, which carries the planned TP, which follows from
+    the larger of the candidate and the reference. Asking the Hub for the
+    candidate's size reproduces that figure exactly, so an already-current
+    candidate is recognised without pulling its shards back to measure them.
+
+    None when the Hub cannot answer. The caller then fetches first and nothing
+    about the existing behaviour changes; a wrong guess here would look for a
+    report under a TP nothing ever scored at.
+    """
+    if not cand.hf_repo:
+        return None
+    try:
+        remote = remote_weights(cand.hf_repo, cand.revision)
+    except (SystemExit, Exception) as exc:  # noqa: BLE001 - never worth a stop
+        print(
+            f"WARNING  cannot size {cand.hf_repo} from the Hub ({exc}); "
+            f"fetching before the completeness check",
+            file=sys.stderr,
+        )
+        return None
+    if not remote.get("bytes"):
+        return None
+    return max(
+        checkpoint_gib(model.reference_path),
+        float(remote["bytes"]) / (1 << 30),
+    )
+
+
 def _candidate_complete(
     config: Config,
     model: Model,
     cand: Candidate,
     routed: bool,
+    weight_gib: float | None = None,
 ) -> bool:
     if not routed:
         return _find(config.work, cand.name + "-v") is not None
@@ -1823,6 +1867,7 @@ def _candidate_complete(
         cand.path,
         model.reference_path,
         config.rows,
+        weight_gib=weight_gib,
     )
     if not os.path.isfile(report):
         return False
@@ -1840,7 +1885,12 @@ def _candidate_complete(
     # replaces the capture and strands the skipped report on a dead manifest and
     # an older commit. Laws 5, 12, and 14 then refuse it after a whole campaign.
     _, suffix, *_ = score_identity(
-        config, cand.name, cand.path, model.reference_path, config.rows
+        config,
+        cand.name,
+        cand.path,
+        model.reference_path,
+        config.rows,
+        weight_gib=weight_gib,
     )
     if not _score_report_is_current(
         report,
@@ -2110,15 +2160,25 @@ def cmd_score(config: Config, python: str) -> int:
         # reference needs its own expert selections recorded once.
 
         for cand in model.candidates:
-            if routed:
-                try:
-                    ensure_candidate_weights(config, cand)
-                except CampaignError as exc:
-                    print(f"FAILED  {cand.name}: {exc}", file=sys.stderr)
-                    failed.append(f"{model.name}/{cand.name}")
-                    continue
+            # Ask whether this candidate needs scoring before paying to fetch
+            # it. A routed check needs the report filename, so an absent
+            # checkpoint is sized from the Hub; only if that fails do we fetch
+            # first, which is what the check used to do for every candidate and
+            # is why a current one downloaded 27 GB to be released untouched.
+            weight_gib = None
+            if routed and not _has_checkpoint_weights(cand.path):
+                weight_gib = plan_weight_gib_from_hub(config, model, cand)
+                if weight_gib is None:
+                    try:
+                        ensure_candidate_weights(config, cand)
+                    except CampaignError as exc:
+                        print(f"FAILED  {cand.name}: {exc}", file=sys.stderr)
+                        failed.append(f"{model.name}/{cand.name}")
+                        continue
             try:
-                complete = _candidate_complete(config, model, cand, routed)
+                complete = _candidate_complete(
+                    config, model, cand, routed, weight_gib=weight_gib
+                )
             except CampaignError as exc:
                 print(f"FAILED  {cand.name}: {exc}", file=sys.stderr)
                 failed.append(f"{model.name}/{cand.name}")
@@ -2128,8 +2188,7 @@ def cmd_score(config: Config, python: str) -> int:
                 maybe_release(config, cand)
                 continue
             try:
-                if not routed:
-                    ensure_candidate_weights(config, cand)
+                ensure_candidate_weights(config, cand)
                 _score_candidate(config, python, model, cand, routed)
             except CandidateRefused as exc:
                 print(f"REFUSED {cand.name}: {exc}", file=sys.stderr)
@@ -3037,6 +3096,16 @@ def selftest() -> int:
         with open(os.path.join(husk, "model.safetensors"), "wb") as handle:
             handle.write(b"x")
         assert _has_checkpoint_weights(husk)
+
+        # A candidate the Hub cannot be asked about must fall back to fetching
+        # rather than guess a TP, or the completeness check looks for a report
+        # under a filename nothing ever scored at.
+        local_only = Model("m", ref, [])
+        assert plan_weight_gib_from_hub(
+            Config(name="c", library=tmp, work=work, models=[local_only]),
+            local_only,
+            Candidate("no-repo", kept),
+        ) is None
 
         cache_dir = os.path.join(tmp, "ckpt")
         os.makedirs(cache_dir)

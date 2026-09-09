@@ -1133,7 +1133,14 @@ def routing_floor_state(report: dict[str, Any] | None) -> str:
 
 
 def _inspected_quantization_parameters(c: Campaign) -> bool:
-    """Whether this run walked loaded kernels for substituted parameters."""
+    """Whether this run walked loaded kernels for substituted parameters.
+
+    Either walk counts. A dense candidate has no routed experts, so the NVFP4
+    dense scan is the only evidence available that anything was looked at.
+    """
+    dense = c.report.get("nvfp4_dense_scale_inspection")
+    if isinstance(dense, dict) and dense.get("workers"):
+        return True
     bxq = c.report.get("bxq_cell")
     backend = bxq.get("backend_evidence") if isinstance(bxq, dict) else None
     if not isinstance(backend, dict):

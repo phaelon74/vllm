@@ -1,6 +1,6 @@
 # QxQ and BxQ — Routed-Model Distribution Fidelity
 
-**Applies to:** laws version 12, Law 14.
+**Applies to:** laws version 13, Laws 14 and 17.
 **Read first:** [`LAWS.md`](LAWS.md) for the laws, [`README.md`](README.md) for the
 harness.
 
@@ -219,6 +219,18 @@ layer at fill time as `uncalibrated_experts_filled_from_layer_max` and Law 17
 discloses it. A complete export such as unsloth records an empty substitution
 list: native CUTLASS used the checkpoint's own scales.
 
+Both halves of the model are walked, because a dense NVFP4 projection can omit a
+shard's scale exactly as an expert can. `inspect_model_moe_backends` covers the
+routed experts and `inspect_model_nvfp4_dense_scales` covers everything else,
+reported separately so the denominators stay meaningful — a fill on 3 of 200
+dense layers is a different claim than 3 of 30 experts. The fill records a scan
+marker on every layer it visits, filled or not, because counting NVFP4 layers
+after load is guesswork: the dense paths delete or overwrite the very parameter
+they were named for. Without the dense walk a dense W4A4 candidate reported no
+substitution, and Law 17 read that silence as a clean bill of health rather than
+as an absence of evidence, which is why it now returns `NOT_APPLICABLE` when
+nothing was inspected at all.
+
 | Path | Per-expert activation scales | Exact repeat |
 | --- | --- | --- |
 | vLLM CUTLASS FP4 | honoured (per-expert vector) | certified on SM120 |
@@ -263,6 +275,38 @@ Law 17 still exists for the remaining real substitutions — an uncalibrated
 expert filled from the layer maximum is one — so a substituted result ranks
 only against candidates measured the same way, and is never withdrawn for
 having a disclosed fill.
+
+### How far to discount a filled result
+
+The disclosure states a spread. It does not say what that spread costs, and the
+first native-CUTLASS campaign answered the question by accident.
+
+The two filled candidates landed on top of each other:
+
+| Candidate | Layers filled | Worst spread | QxQ | BxQ |
+| --- | --- | --- | --- | --- |
+| `Neural-ICE/Gemma-4-26B-A4B-it-NVFP4` | 15 of 30 | 230.6x | 1.82281421 | 1.58512109 |
+| `bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4` | 12 of 30 | 240.3x | 1.82307292 | 1.59361302 |
+
+0.00026 nats apart on QxQ, from different publishers, with different fill
+footprints, and with one quantizing its LM head while the other does not. They
+are not the same checkpoint: distinct `student_weights_sha256`, and distinct
+per-position KLD digests in `kld_evidence`, so the two runs did not produce
+bitwise-identical output either.
+
+Two independent quantizations do not agree to four decimal places on their own.
+The reading that fits is that once a tensor's per-expert scales are replaced by
+one layer maximum on half the layers, the fill sets the number and the
+checkpoint's own choices stop being visible in it. On the same suite the clean
+NVFP4 exports separate normally — 1.16570700 for unsloth against 1.77968754 for
+RedHatAI — so the collapse is not the suite failing to discriminate.
+
+This is n=2 and therefore a strong hint rather than a proof; a fill-direction
+sweep on one checkpoint would settle it, and has not been run. Treat a filled
+QxQ as an upper bound on that family of exports rather than a measurement of the
+particular one, which is what the separate comparability group already enforces.
+It is also the argument against ever promoting the fill out of the harness: see
+§13.
 
 ## 8. Checkpoint defects the pipeline had to fix, not tolerate
 
@@ -416,3 +460,47 @@ consequence.
 says two runs agree bit for bit. It says nothing about whether the kernel computes
 the right thing, which is what the zero baseline (Law 1) and the reference binding
 (Laws 12 and 16) are for.
+
+## 13. The fill is a harness policy, not a vLLM fix
+
+Half of the loader change here — allocating consumed NVFP4 scales as a NaN
+sentinel instead of `torch.empty`, so an unwritten slot is detectable rather
+than arbitrary — is not ours to contribute. Three open upstream PRs already do
+it on the same files by the same mechanism: #54444 on the ModelOpt linear
+methods and fused experts, #45320 on the ModelOpt per-expert scales, #52501 on
+the linear per-block `weight_scale`. A fourth, #55073, is actively reworking the
+same compressed-tensors and ModelOpt scale code.
+
+Where we differ is the policy after detection, and the difference is deliberate
+on both sides. All three upstream PRs **reject**: they raise at load time naming
+the parameter and the affected experts. #45320 states the position outright —
+"this remains fail-fast only, it does not guess missing calibration statistics
+or add an imputation policy." Filling from the layer maximum is exactly the
+imputation policy they declined.
+
+They are right for a serving engine, and the evidence for that is in §7's
+convergence table rather than in any argument from principle. A user served a
+filled checkpoint gets a model whose numerics are substantially set by an
+invented scale, with nothing on the surface to say so. Refusing to load is the
+better failure.
+
+The harness can do what the engine should not, because it discloses. Law 17
+records the fill on the report, the substituted parameters enter the
+comparability key, and a filled candidate ranks only against others measured the
+same way. That is the whole justification, and it does not transfer to a serving
+path that has no comparability key to put anything in.
+
+Two consequences follow.
+
+**Those two candidates will stop loading on stock vLLM.** When any of the
+rejecting PRs lands, `Neural-ICE/Gemma-4-26B-A4B-it-NVFP4` and
+`bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4` will refuse at load. Their
+published numbers stay valid for what they are and become unreproducible without
+this fill, so the fill has to be maintained as a standing, disclosed divergence
+rather than treated as a fix awaiting merge.
+
+**The contribution worth making is evidence, not code.** #45320, #54444, and
+#55073 all report that no end-to-end evaluation was run: no Blackwell hardware,
+or no affected checkpoint, or both. This harness has SM120, two affected
+checkpoints, and measured numbers for what the missing scales cost. That is the
+gap in those PRs, and it is not a competing patch.
