@@ -491,6 +491,7 @@ class TestManifestMismatches:
             "kld_vocab_size": 100,
             "tensor_parallel_size": 1,
             "enforce_eager": True,
+            "kv_cache_dtype": "bfloat16",
         }
         live = dict(captured)
         live["tokenizer"] = {"name_or_path": "student", "vocab_size": 100}
@@ -510,11 +511,54 @@ class TestManifestMismatches:
             "kld_vocab_size": 100,
             "tensor_parallel_size": 1,
             "enforce_eager": True,
+            "kv_cache_dtype": "bfloat16",
         }
         live = dict(captured)
         live["token_sha256"] = "bbb"
         errors = manifest_mismatches(captured, live)
         assert any("token_sha256" in e for e in errors)
+
+    def test_a_capture_that_records_no_kv_cache_dtype_is_refused(self):
+        """A pre-laws-14 capture cannot claim it cached unquantized.
+
+        It was taken when the dtype came from the candidate's own config, so
+        assuming bfloat16 on its behalf is exactly the guess the pin removes.
+        """
+        from vllm.v1.sample.kld import manifest_mismatches
+
+        captured = {
+            "token_sha256": "aaa",
+            "tokenizer": {"name_or_path": "same"},
+            "context_length": 2048,
+            "stride": 2048,
+            "rows": 100,
+            "score_from": 0,
+            "kld_vocab_size": 100,
+            "tensor_parallel_size": 1,
+            "enforce_eager": True,
+        }
+        errors = manifest_mismatches(
+            captured, {**captured, "kv_cache_dtype": "bfloat16"}
+        )
+        assert any("kv_cache_dtype" in e for e in errors)
+
+    def test_a_quantized_kv_cache_cannot_score_against_an_unquantized_capture(self):
+        from vllm.v1.sample.kld import manifest_mismatches
+
+        captured = {
+            "token_sha256": "aaa",
+            "tokenizer": {"name_or_path": "same"},
+            "context_length": 2048,
+            "stride": 2048,
+            "rows": 100,
+            "score_from": 0,
+            "kld_vocab_size": 100,
+            "tensor_parallel_size": 1,
+            "enforce_eager": True,
+            "kv_cache_dtype": "bfloat16",
+        }
+        errors = manifest_mismatches(captured, {**captured, "kv_cache_dtype": "fp8"})
+        assert any("kv_cache_dtype" in e for e in errors)
 
 
 def test_score_from_is_applied_to_every_row():

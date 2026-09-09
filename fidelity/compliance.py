@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-LAWS_VERSION = 13
+LAWS_VERSION = 14
 # v5 adds the substitution record Law 17 reads. A report scored before it cannot
 # say whether it used the checkpoint's own quantization parameters, so the bump
 # makes every earlier routed report stale rather than grandfathering the silence.
@@ -46,6 +46,7 @@ BOUND_FIELDS = (
     "kld_vocab_size",
     "tensor_parallel_size",
     "enforce_eager",
+    "kv_cache_dtype",
     "reference_config_sha256",
     "reference_weights_sha256",
     "runtime",
@@ -143,6 +144,18 @@ def law_1_zero_baseline(c: Campaign) -> Finding:
             FAIL,
             f"baseline ran on model_runner_v2={baseline_runner!r} but the "
             f"candidate ran on {c.report.get('model_runner_v2')!r}",
+        )
+    # A zero taken through a different KV cache than the candidate's does not
+    # establish that the candidate's path is exact, which is the only thing the
+    # baseline is here to establish.
+    baseline_kv = c.self_report.get("kv_cache_dtype")
+    if baseline_kv != c.report.get("kv_cache_dtype"):
+        return Finding(
+            1,
+            title,
+            FAIL,
+            f"baseline cached in {baseline_kv!r} but the candidate cached in "
+            f"{c.report.get('kv_cache_dtype')!r}",
         )
     return Finding(1, title, PASS, f"self-KLD exactly 0.0 over {positions} positions")
 
@@ -383,6 +396,14 @@ def comparability_key(c: Campaign) -> dict[str, Any]:
         "kld_vocab_size": c.manifest.get("kld_vocab_size"),
         "tensor_parallel_size": c.manifest.get("tensor_parallel_size"),
         "model_runner_v2": c.report.get("model_runner_v2"),
+        # A candidate that declared a KV cache scheme used to get one, because the
+        # harness left kv_cache_dtype at "auto" and vLLM honours the declaration.
+        # Its attention then ran at a different precision than every candidate it
+        # was ranked beside, and this key, whose whole job is to bound a ranking to
+        # runs that ran alike, had nothing to say about it. Scoring now pins an
+        # unquantized cache, and the resolved dtype is carried here so that a run
+        # taken under any other one cannot be ranked against these.
+        "kv_cache_dtype": c.report.get("kv_cache_dtype"),
         "torch": runtime.get("torch"),
         "driver": runtime.get("driver"),
         "gpu_names": runtime.get("gpu_names"),

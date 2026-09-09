@@ -36,6 +36,7 @@ from transformers import AutoTokenizer
 
 from vllm import LLM, SamplingParams
 from vllm.inputs import TokensPrompt
+from vllm.v1.sample.kld import UNQUANTIZED_KV_CACHE_DTYPE
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,7 @@ def apply_compiled_llm_kwargs(llm_kwargs: dict[str, Any]) -> None:
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     llm_kwargs["compilation_config"] = DETERMINISTIC_COMPILATION_CONFIG
     llm_kwargs["enable_flashinfer_autotune"] = False
+    llm_kwargs["kv_cache_dtype"] = UNQUANTIZED_KV_CACHE_DTYPE
 
 
 def apply_eager_llm_kwargs(llm_kwargs: dict[str, Any]) -> None:
@@ -93,6 +95,42 @@ def apply_eager_llm_kwargs(llm_kwargs: dict[str, Any]) -> None:
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     llm_kwargs["enforce_eager"] = True
     llm_kwargs["enable_flashinfer_autotune"] = False
+    # Explicit, never "auto": see UNQUANTIZED_KV_CACHE_DTYPE. Set on the shared
+    # kwargs so the reference and the candidate cache identically.
+    llm_kwargs["kv_cache_dtype"] = UNQUANTIZED_KV_CACHE_DTYPE
+
+
+def assert_unquantized_kv_cache(llm: Any, label: str) -> str:
+    """Confirm the engine really cached in an unquantized dtype. Returns it.
+
+    The pin is a request. What the engine resolved is the fact, and this project
+    does not accept a declaration in place of a reading: the whole reason the KV
+    cache needed pinning is that a value nobody checked turned out to differ
+    between two candidates that were ranked against each other.
+    """
+    from vllm.utils.torch_utils import is_quantized_kv_cache
+
+    resolved = None
+    for path in ("llm_engine", "engine"):
+        engine = getattr(llm, path, None)
+        config = getattr(engine, "vllm_config", None)
+        cache = getattr(config, "cache_config", None)
+        if cache is not None:
+            resolved = getattr(cache, "cache_dtype", None)
+            break
+    if resolved is None:
+        raise ValueError(
+            f"{label}: cannot read the resolved KV cache dtype, so cannot show "
+            f"it was left unquantized"
+        )
+    if resolved == "auto" or is_quantized_kv_cache(resolved):
+        raise ValueError(
+            f"{label}: KV cache resolved to {resolved!r}. Scoring pins "
+            f"{UNQUANTIZED_KV_CACHE_DTYPE!r} because a quantized KV cache is a "
+            f"property of the run and not of the checkpoint; 'auto' lets the "
+            f"candidate's own config decide and is refused for the same reason."
+        )
+    return str(resolved)
 
 
 def _merge_substitutions(workers: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -654,6 +692,7 @@ def _capture_reference_routing(
         enable_return_routed_experts=True,
         **llm_kwargs,
     )
+    assert_unquantized_kv_cache(llm, "routing capture")
     shape: tuple[int, int] | None = None
     worker_backends = llm.apply_model(inspect_model_moe_backends)
     worker_layer_maps = [
@@ -1223,6 +1262,7 @@ def calculate_kld(
             print(f"  Teacher LM head (static): {teacher_head_static['state']}")
             with _phase(timings, "teacher_load"):
                 ref_llm = LLM(model=reference_model_path, **(llm_kwargs or {}))
+            assert_unquantized_kv_cache(ref_llm, "reference")
             teacher_head_runtime = _runtime_lm_head_info(ref_llm)
             print(f"  Teacher LM head (runtime): {teacher_head_runtime['state']}")
             if teacher_head_runtime["state"] != "unquantized":
@@ -1336,6 +1376,9 @@ def calculate_kld(
                     "tensor_parallel_size", 1
                 ),
                 "enforce_eager": bool((llm_kwargs or {}).get("enforce_eager")),
+                "kv_cache_dtype": (llm_kwargs or {}).get(
+                    "kv_cache_dtype", UNQUANTIZED_KV_CACHE_DTYPE
+                ),
                 "enable_prefix_caching": bool(
                     (llm_kwargs or {}).get("enable_prefix_caching")
                 ),
@@ -1414,6 +1457,9 @@ def calculate_kld(
                 "tensor_parallel_size", 1
             ),
             "enforce_eager": bool((llm_kwargs or {}).get("enforce_eager")),
+            "kv_cache_dtype": (llm_kwargs or {}).get(
+                "kv_cache_dtype", UNQUANTIZED_KV_CACHE_DTYPE
+            ),
             "runtime": capture_runtime_manifest(),
         }
         mismatches = manifest_mismatches(manifest, live)
@@ -1557,6 +1603,7 @@ def calculate_kld(
         print("  W4A4 NVFP4 checkpoint: pinning the CUTLASS MoE backend")
     with _phase(timings, "student_load"):
         llm = LLM(model=model_path, **student_kwargs)
+    kv_cache_dtype = assert_unquantized_kv_cache(llm, "candidate")
     moe_backends: list[dict[str, Any]] = []
     recurrent_backends: list[dict[str, Any]] = []
     # Unconditional: a dense candidate has no routed experts to walk, but its
@@ -1936,6 +1983,9 @@ def calculate_kld(
     report["context_length"] = context_length
     report["kld_vocab_size"] = kld_vocab
     report["model_runner_v2"] = student_uses_v2
+    # The dtype the engine resolved, not the one requested: this is what the
+    # comparability key ranks on, so it has to be the reading.
+    report["kv_cache_dtype"] = kv_cache_dtype
     report["student_lm_head"] = student_head
     report["student_model"] = os.path.abspath(model_path)
     # Unconditional, and top level as well as inside the routing binding: a

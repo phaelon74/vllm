@@ -1104,6 +1104,14 @@ def _score_report_is_current(
             and cached.get("capture_manifest_sha256") != file_sha256(manifest)
         ):
             return False
+    # A report from before the KV cache was pinned does not say which cache it
+    # used, and one taken against a quantized cache measured that cache as much as
+    # it measured the checkpoint. Neither can be relabeled into a laws-14 result,
+    # and catching it here costs a rescore instead of a whole campaign.
+    from vllm.v1.sample.kld import UNQUANTIZED_KV_CACHE_DTYPE
+
+    if cached.get("kv_cache_dtype") != UNQUANTIZED_KV_CACHE_DTYPE:
+        return False
     routing_current = (
         _paired_report_is_current(cached)
         if paired_routing

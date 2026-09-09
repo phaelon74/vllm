@@ -135,6 +135,10 @@ def _identity(
         ),
         ("Tensor parallel", str(manifest.get("tensor_parallel_size"))),
         ("Eager enforced", str(manifest.get("enforce_eager"))),
+        (
+            "KV cache",
+            str(report.get("kv_cache_dtype") or "unrecorded (pre-laws-14)"),
+        ),
         ("Prefix caching", str(manifest.get("enable_prefix_caching"))),
         ("max_num_seqs", str(manifest.get("max_num_seqs"))),
         ("vLLM", str((runtime_env.get("vllm") or {}).get("version"))),
@@ -543,24 +547,26 @@ def _link(cell: dict[str, Any] | None) -> str:
 
 
 def _kv_cache_fact(inspection: dict[str, Any]) -> str:
-    """How the KV cache was quantized during scoring, from what the config declared.
+    """What the checkpoint declares for its KV cache, and what scoring did instead.
 
-    vLLM honours a declared scheme whenever `kv_cache_dtype` stays at "auto",
-    which is what scoring leaves it at. So this is not a property the card is
-    reporting for interest: it is a difference in what ran, between a candidate
-    that declared a scheme and one beside it that did not.
+    Scoring pins an unquantized cache, so a declared scheme is never honoured
+    here. It is still worth naming: it tells a reader deploying this checkpoint
+    what they will get by default, and it is the difference between this card and
+    the numbers, which were taken without it.
     """
     scheme = inspection.get("kv_cache_scheme")
     if not isinstance(scheme, dict) or not scheme:
-        return "unquantized (no scheme declared)"
+        return "unquantized (none declared; scoring pins unquantized regardless)"
     algo = scheme.get("quant_algo")
-    if algo:
-        return f"{algo}, honoured because scoring leaves kv_cache_dtype at auto"
-    strategy = scheme.get("strategy")
-    described = f"{scheme.get('num_bits')}-bit {scheme.get('type')}"
-    if strategy:
-        described += f", per {strategy}"
-    return f"{described}, honoured because scoring leaves kv_cache_dtype at auto"
+    if not algo:
+        algo = f"{scheme.get('num_bits')}-bit {scheme.get('type')}"
+        strategy = scheme.get("strategy")
+        if strategy:
+            algo += f", per {strategy}"
+    return (
+        f"declares {algo}, which scoring overrides: the numbers below were taken "
+        f"with an unquantized cache, as every candidate's were"
+    )
 
 
 def _deployed_quantization(deployed: dict[str, Any]) -> list[str]:

@@ -113,6 +113,19 @@ one that substituted nothing; the record comes from the loaded model during
 scoring. Version-12 paired reports must be rescored. The paired routed-score and
 BxQ protocol versions are now 5.
 
+Version 14 adds no law. It puts `kv_cache_dtype` into the comparability key
+(Law 10), the bound capture fields (Law 5), and the baseline agreement Law 1
+already required of the model runner, because scoring had left it at
+`auto`, under which vLLM resolves the KV cache dtype from a scheme declared in
+the candidate's own config. One candidate therefore ran its attention through an
+8-bit KV cache while the candidates it was ranked against ran unquantized, and
+nothing in versions 1 through 13 could see the difference. The KV cache is now
+pinned unquantized and never inherits a checkpoint's declaration. A version-13
+report cannot be relabeled: it does not record which cache it used, and one that
+used a quantized cache measured something else. Version-13 reports must be
+rescored, and their captures retaken, since the capture is bound to the cache it
+was taken under.
+
 These laws govern every distribution-fidelity measurement this program
 publishes. They are not guidance. The pipeline refuses to produce or upload an
 artifact that violates one, and the only way past a refusal is a recorded,
@@ -227,8 +240,8 @@ is strictly less than or equal to the checkpoint's declared `vocab_size`.
 
 **Required.** A reference capture binds itself to the tokenizer identity, token
 hash, context length, row count, `score_from`, scored vocabulary size, tensor
-parallel size, eager mode, and runtime identity. Scoring against a capture whose
-manifest disagrees with the live configuration aborts.
+parallel size, eager mode, KV cache dtype, and runtime identity. Scoring against
+a capture whose manifest disagrees with the live configuration aborts.
 
 **Why.** Reusing a capture across configurations is the easiest way to publish a
 number that compares two different things. The binding must fail closed, because
@@ -353,9 +366,9 @@ number is presented as a capability, accuracy, or general quality claim.
 depth distribution, the vocabulary width, and the runtime. Cross-harness
 comparison is the single easiest way to publish a confident falsehood.
 
-**Check.** Each result records its suite ID, geometry, laws version, and runtime
-manifest hash. The leaderboard groups strictly by that tuple and refuses to place
-rows from differing tuples in one ranking. The suite identity is read from what the
+**Check.** Each result records its suite ID, geometry, laws version, KV cache
+dtype, and runtime manifest hash. The leaderboard groups strictly by that tuple
+and refuses to place rows from differing tuples in one ranking. The suite identity is read from what the
 scoring run recorded, never from a suite manifest supplied to the audit, or a run
 that tokenized at run time reports a complete key by borrowing the identity of a
 suite it never opened.

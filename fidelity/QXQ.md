@@ -1,6 +1,6 @@
 # QxQ and BxQ — Routed-Model Distribution Fidelity
 
-**Applies to:** laws version 13, Laws 14 and 17.
+**Applies to:** laws version 14, Laws 14 and 17.
 **Read first:** [`LAWS.md`](LAWS.md) for the laws, [`README.md`](README.md) for the
 harness.
 
@@ -343,16 +343,33 @@ count. That checkpoint now scores 1.17816288 and passes all seventeen laws.
 Scoring pins `VLLM_BATCH_INVARIANT=1`, disables DeepGEMM
 (`VLLM_MOE_USE_DEEP_GEMM=0`) and FlashInfer autotune, sets `NCCL_DETERMINISTIC=1`
 and `CUBLAS_WORKSPACE_CONFIG=:4096:8`, enforces eager execution, disables prefix
-caching, and holds `max_num_seqs=1`.
+caching, holds `max_num_seqs=1`, and pins `kv_cache_dtype=bfloat16`.
 
 None of that is optional and none of it is a performance setting. Each one closes
 a path by which two runs of the same tokens could diverge.
 
+The KV cache pin closes the widest such path found so far, and it was open for
+the whole campaign. Left at `auto`, vLLM resolves the KV cache dtype from a
+scheme declared in the candidate's own config, so
+`unsloth/gemma-4-26B-A4B-it-NVFP4` — which declares an 8-bit float KV cache —
+had its attention read and written through a quantized cache while every
+candidate it was ranked against used an unquantized one. That is a difference in
+how the measurement was taken, not a property of the checkpoint being measured,
+and it inflated that candidate's KLD by an amount no one had bounded. The cache
+is never quantized: scoring holds 4096 tokens, so there is no memory pressure
+that quantizing it could relieve, and nothing to weigh against the loss of
+comparability. `assert_unquantized_kv_cache` reads the dtype the engine actually
+resolved and refuses both a quantized value and `auto`, because the failure being
+prevented is precisely a value nobody checked.
+
 Because that runtime *is* part of the result, its identity is bound into the
 comparability key: `vllm_commit`, `vllm_dirty_digest`,
-`compiled_extensions_sha256`, `torch`, `driver`, and `gpu_names`, alongside the
-suite and geometry. Two candidates are ranked against each other only when all of
-it matches. A consequence worth internalizing before committing to this
+`compiled_extensions_sha256`, `torch`, `driver`, `gpu_names`, and
+`kv_cache_dtype`, alongside the suite and geometry. Two candidates are ranked
+against each other only when all of it matches. `kv_cache_dtype` is in that list
+because of the unsloth case above: the key's one job is to bound a ranking to
+runs that ran alike, and it had nothing to say about a candidate whose attention
+ran at a different precision than its neighbours'. A consequence worth internalizing before committing to this
 repository: **any commit changes `vllm_commit`, and a dirty tree changes
 `vllm_dirty_digest`, so the next scoring run treats every prior report as stale
 and rescores the family.** That is correct behaviour, not a bug, and it is why
@@ -453,13 +470,14 @@ not rankable against deployed candidates, and the published tables separate them
 
 **A scheme label names the narrowest group, not the whole model.** A checkpoint
 may quantize attention at one width and its experts at another, and may declare a
-KV cache scheme that vLLM honours because scoring leaves `kv_cache_dtype` at
-`auto`. `unsloth/gemma-4-26B-A4B-it-NVFP4` is `format: "mixed-precision"`: FP8
-W8A8 attention, NVFP4 W4A4 experts and dense MLP, and an FP8 KV cache. Its QxQ of
-1.16570700 against 1.77968754 for a complete all-`Linear` NVFP4 export is
-therefore mostly the 8-bit attention, not a better NVFP4 export, and it lands
-between the all-FP8 candidate at 0.69415039 and the all-NVFP4 ones exactly where a
-hybrid should. This is not a comparability failure — the key deliberately excludes
+KV cache scheme. `unsloth/gemma-4-26B-A4B-it-NVFP4` is `format:
+"mixed-precision"`: FP8 W8A8 attention, NVFP4 W4A4 experts and dense MLP, and a
+declared FP8 KV cache. Its QxQ of 1.16570700 against 1.77968754 for a complete
+all-`Linear` NVFP4 export is therefore mostly the 8-bit attention, not a better
+NVFP4 export, and it lands between the all-FP8 candidate at 0.69415039 and the
+all-NVFP4 ones exactly where a hybrid should. That 1.16570700 was taken before
+§9's KV cache pin, so it also carries the FP8 cache the checkpoint declared; the
+laws-14 rescore separates the two, leaving only the weight scheme in the number. This is not a comparability failure — the key deliberately excludes
 the candidate's scheme, because ranking schemes against one reference is the
 point — but it was a labelling one until `scheme_mix` and `kv_cache_scheme` were
 added to the inspection. Component coverage cannot substitute: it counts how many

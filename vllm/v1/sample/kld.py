@@ -100,6 +100,14 @@ def iter_eval_rows(
 WORKER_KLD_ABS_TOLERANCE = 1e-5
 WORKER_KLD_MEAN_REL_TOLERANCE = 1e-7
 
+# Scoring never quantizes the KV cache, and never leaves the dtype at "auto",
+# under which vLLM resolves it from a scheme declared in the candidate's own
+# config. That ran one candidate's attention through an 8-bit cache while the
+# candidates it was ranked against used an unquantized one: a difference in how
+# the measurement was taken, not in the checkpoint being measured. Scoring holds
+# 4096 tokens, so there is nothing to weigh against the loss of comparability.
+UNQUANTIZED_KV_CACHE_DTYPE = "bfloat16"
+
 
 def nonfinite_summary(result: KLDResult) -> str:
     """Where a KLD payload is not a number, or "" when every value is finite.
@@ -1409,6 +1417,10 @@ def manifest_mismatches(
         "kld_vocab_size",
         "tensor_parallel_size",
         "enforce_eager",
+        # A capture taken against a quantized KV cache is not the same reference
+        # as one taken without, so an older capture that recorded nothing here is
+        # refused rather than assumed to have been unquantized.
+        "kv_cache_dtype",
         "runtime",
     ),
 ) -> list[str]:
