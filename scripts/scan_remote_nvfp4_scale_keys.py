@@ -9,9 +9,17 @@ it to decide whether an existing result carries a substitution nobody disclosed.
     python3 scripts/scan_remote_nvfp4_scale_keys.py \\
         unsloth/gemma-4-26B-A4B-it-NVFP4@20df0542b1a86ce19f495ac2eca2c7c12bce82f9
 
-A module is counted as NVFP4 when it carries a ``weight_scale``. Absence of an
-activation scale is only a gap when the checkpoint's other modules have one: a
-weight-only W4A16 export has none anywhere and that is correct.
+A module counts as NVFP4 only if it carries the second-level global weight scale
+that NVFP4 needs and no other scheme has: ``weight_scale_2`` on a ModelOpt export
+or ``weight_global_scale`` on a compressed-tensors one. Keying on ``weight_scale``
+alone reports every FP8 layer of a ``format: "mixed-precision"`` checkpoint as a
+missing NVFP4 scale, which is how this script first lied about
+``unsloth/gemma-4-26B-A4B-it-NVFP4``: FP8 attention, NVFP4 experts, and 115
+false positives.
+
+Absence of an activation scale is still only a gap when the checkpoint's other
+NVFP4 modules have one, because a weight-only W4A16 export has none anywhere and
+that is correct.
 """
 
 import argparse
@@ -20,6 +28,7 @@ import json
 import sys
 
 ACTIVATION_KEYS = ("input_scale", "input_global_scale")
+NVFP4_WEIGHT_KEYS = ("weight_scale_2", "weight_global_scale")
 
 
 def shard_names(repo: str, revision: str | None) -> list[str]:
@@ -61,16 +70,22 @@ def scan(repo: str, revision: str) -> int:
     quantized = {
         module: leaves
         for module, leaves in modules.items()
-        if "weight_scale" in leaves
+        if any(key in leaves for key in NVFP4_WEIGHT_KEYS)
     }
+    other = sum(
+        1
+        for module, leaves in modules.items()
+        if "weight_scale" in leaves and module not in quantized
+    )
+    print(f"  NVFP4 modules          : {len(quantized)}")
+    print(f"  other quantized modules: {other} (not NVFP4; ignored)")
     # Experts are already covered by the routed disclosure; the open question is
     # everything else, where a fill would have gone unreported entirely.
     dense = {m: v for m, v in quantized.items() if "experts" not in m}
     with_scale = {
         m for m, v in dense.items() if any(k in v for k in ACTIVATION_KEYS)
     }
-    print(f"  quantized modules      : {len(quantized)}")
-    print(f"  dense (non-expert)     : {len(dense)}")
+    print(f"  dense NVFP4 (non-expert): {len(dense)}")
     print(f"  dense with act scale   : {len(with_scale)}")
     if not dense:
         print("  -> no dense NVFP4 modules; nothing the dense walk would fill")
