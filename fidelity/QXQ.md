@@ -304,7 +304,11 @@ RedHatAI — so the collapse is not the suite failing to discriminate.
 This is n=2 and therefore a strong hint rather than a proof; a fill-direction
 sweep on one checkpoint would settle it, and has not been run. Treat a filled
 QxQ as an upper bound on that family of exports rather than a measurement of the
-particular one, which is what the separate comparability group already enforces.
+particular one. The leaderboard says so on the row: a filled candidate is ranked
+beside the clean ones, because it was measured on the same suite, geometry, and
+runtime, and carries a `†` naming what was substituted. It is not exiled into a
+section of its own, which would hide the comparison a reader came for while the
+substitution stays bound in its comparability key either way.
 It is also the argument against ever promoting the fill out of the harness: see
 §13.
 

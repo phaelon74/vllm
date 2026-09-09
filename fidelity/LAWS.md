@@ -368,7 +368,12 @@ comparison is the single easiest way to publish a confident falsehood.
 
 **Check.** Each result records its suite ID, geometry, laws version, KV cache
 dtype, and runtime manifest hash. The leaderboard groups strictly by that tuple
-and refuses to place rows from differing tuples in one ranking. The suite identity is read from what the
+and refuses to place rows from differing tuples in one ranking. One field of the
+key is deliberately not a section boundary: a substituted quantization parameter
+describes the candidate rather than how the number was taken, so such a row is
+marked and footnoted in place. Splitting it out would leave a reader comparing
+exports of one model unable to see the two side by side, and the substitution
+remains in the receipt's key, which is what binds it (Law 17). The suite identity is read from what the
 scoring run recorded, never from a suite manifest supplied to the audit, or a run
 that tokenized at run time reports a complete key by borrowing the identity of a
 suite it never opened.

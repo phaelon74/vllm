@@ -1496,11 +1496,30 @@ def _weakest_domain(receipt: dict[str, Any]) -> tuple[str | None, float | None]:
     return best
 
 
+# Carried in the key, but not a reason to split a table. Everything else in the
+# key describes how the measurement was taken, which every row in a section must
+# share. A substitution describes the candidate, so it is disclosed on its own row
+# instead of exiled into a section of one, where a reader comparing exports of the
+# same model would never see it. It stays in the receipt's comparability key,
+# which is what binds it (Law 10, Law 17).
+_UNGROUPED_KEY_FIELDS = frozenset({"substituted_parameters"})
+
+
 def _grouping_key(receipt: dict[str, Any]) -> str:
-    """Stable digest of the comparability key, so rankings never mix identities."""
-    caps = receipt.get("comparability_key") or {}
+    """Stable digest of how a number was measured, so rankings never mix identities."""
+    caps = {
+        name: value
+        for name, value in (receipt.get("comparability_key") or {}).items()
+        if name not in _UNGROUPED_KEY_FIELDS
+    }
     payload = json.dumps(caps, sort_keys=True).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _substituted(receipt: dict[str, Any]) -> list[str]:
+    """Quantization parameters this run did not use as the checkpoint exported them."""
+    names = (receipt.get("comparability_key") or {}).get("substituted_parameters")
+    return [str(name) for name in names] if isinstance(names, list) else []
 
 
 def candidate_identity(
@@ -1544,7 +1563,12 @@ def candidate_identity(
 
 
 def render_leaderboard(results: list[dict[str, Any]]) -> tuple[str, list[list[Any]]]:
-    """Rank compliant results, one table per comparability key (Law 10)."""
+    """Rank compliant results, one table per measurement identity (Law 10).
+
+    Sections split on everything in the comparability key that describes how the
+    number was taken. A substitution is disclosed on its row instead, so exports
+    of one model stay in one ranking where the difference between them is legible.
+    """
     groups: dict[str, list[dict[str, Any]]] = {}
     for item in results:
         groups.setdefault(_grouping_key(item["receipt"]), []).append(item)
@@ -1573,7 +1597,8 @@ def render_leaderboard(results: list[dict[str, Any]]) -> tuple[str, list[list[An
             f"TP{caps.get('tensor_parallel_size')}, "
             f"runner {'V2' if caps.get('model_runner_v2') else 'V1'}, "
             f"torch {caps.get('torch')}, driver {caps.get('driver')}, "
-            f"laws v{caps.get('laws_version')}."
+            f"laws v{caps.get('laws_version')}, "
+            f"KV cache {caps.get('kv_cache_dtype') or 'unrecorded'}."
         )
         lines.append("")
         ranked = sorted(
@@ -1629,11 +1654,12 @@ def render_leaderboard(results: list[dict[str, Any]]) -> tuple[str, list[list[An
                         _kld(composite_qdq),
                     )
                 )
+            substituted = _substituted(item["receipt"])
             rows.append(
                 (
                     family,
                     author or "n/a",
-                    quant,
+                    f"{quant} †" if substituted else quant,
                     _kld(qxq),
                     _kld(bxq),
                     "n/a" if delta is None else f"{float(delta):+.8f}",
@@ -1668,6 +1694,7 @@ def render_leaderboard(results: list[dict[str, Any]]) -> tuple[str, list[list[An
                     report.get("top1_agreement"),
                     report.get("num_positions"),
                     compliant,
+                    " ".join(substituted),
                 ]
             )
         lines += _table(
@@ -1708,6 +1735,24 @@ def render_leaderboard(results: list[dict[str, Any]]) -> tuple[str, list[list[An
                         "Composite QDQ",
                     ),
                 ),
+                "",
+            ]
+        marked = sorted(
+            {name for m in ranked for name in _substituted(m["receipt"])}
+        )
+        if marked:
+            lines += [
+                f"† The run did not use a quantization parameter as the checkpoint "
+                f"exported it, and substituted {', '.join(f'`{n}`' for n in marked)} "
+                f"instead; each receipt names what its own run substituted "
+                f"(Law 17). Such a row is ranked here because it was measured on "
+                f"the same suite, geometry, and runtime as its neighbours, and the "
+                f"substitution stays in its comparability key. Read it as an upper "
+                f"bound for that family of exports rather than a measurement of the "
+                f"particular checkpoint: two independently published checkpoints "
+                f"whose per-expert activation scales were both filled landed 0.00026 "
+                f"nats apart, which is the fill setting the number rather than the "
+                f"checkpoint. `QXQ.md` §7 has the evidence.",
                 "",
             ]
         if any(_weakest_domain(m["receipt"])[0] for m in ranked):
@@ -1821,6 +1866,7 @@ def _cmd_leaderboard(args: argparse.Namespace) -> int:
                     "top1_agreement",
                     "positions",
                     "law_compliant",
+                    "substituted_parameters",
                 ]
             )
             writer.writerows(csv_rows)
@@ -2357,6 +2403,38 @@ def selftest() -> int:
     assert "QxQ KLD" in card and "BxQ KLD" in card
     assert "Exact repeat" in card
     assert "qxq-vs-size.png" in card and "bxq-vs-size.png" in card
+
+    # A substitution must not split the table. It was measured on the same suite,
+    # geometry, and runtime as its neighbours, and splitting it out is how a
+    # reader comparing exports of one model never sees the two side by side.
+    def _member(name: str, kld: float, substituted: list[str]) -> dict[str, Any]:
+        return {
+            "label": f"m / {name}",
+            "report": {"mean_kld": kld, "student_model": f"/ckpt/{name}"},
+            "receipt": {
+                "compliant": True,
+                "comparability_key": {
+                    "suite_id": "s1",
+                    "laws_version": LAWS_VERSION,
+                    "kv_cache_dtype": "bfloat16",
+                    "substituted_parameters": substituted,
+                },
+            },
+        }
+
+    clean = _member("clean", 0.2, [])
+    filled = _member("filled", 0.4, ["w2_input_global_scale"])
+    assert _grouping_key(clean["receipt"]) == _grouping_key(filled["receipt"])
+    board, csv_out = render_leaderboard([clean, filled])
+    assert board.count("## Comparability group") == 1, board
+    assert "clean |" in board and "filled † |" in board, board
+    assert "`w2_input_global_scale`" in board and "`QXQ.md` §7" in board, board
+    assert [row[-1] for row in csv_out] == ["", "w2_input_global_scale"], csv_out
+    # A different runtime still splits, or the section would claim a shared one.
+    other = _member("other", 0.3, [])
+    other["receipt"]["comparability_key"]["kv_cache_dtype"] = "fp8"
+    assert _grouping_key(other["receipt"]) != _grouping_key(clean["receipt"])
+    print("  a substitution is disclosed on its row, not split into its own table")
 
     laws_path = os.path.join(os.path.dirname(__file__), "LAWS.md")
     with open(laws_path, encoding="utf-8") as handle:
