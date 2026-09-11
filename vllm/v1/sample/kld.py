@@ -106,7 +106,44 @@ WORKER_KLD_MEAN_REL_TOLERANCE = 1e-7
 # candidates it was ranked against used an unquantized one: a difference in how
 # the measurement was taken, not in the checkpoint being measured. Scoring holds
 # 4096 tokens, so there is nothing to weigh against the loss of comparability.
-UNQUANTIZED_KV_CACHE_DTYPE = "bfloat16"
+UNQUANTIZED_KV_CACHE_DTYPES = ("bfloat16", "float16", "float32")
+
+# What a checkpoint's config can call the dtype, mapped to what a cache accepts.
+_KV_CACHE_DTYPE_ALIASES = {
+    "bfloat16": "bfloat16",
+    "bf16": "bfloat16",
+    "float16": "float16",
+    "fp16": "float16",
+    "half": "float16",
+}
+
+
+def unquantized_kv_cache_dtype(model_path: str) -> str:
+    """The dtype an unquantized KV cache takes for one checkpoint.
+
+    The rule is that the cache is never quantized, not that it is always
+    bfloat16. Forcing bfloat16 onto a checkpoint published as float16 leaves the
+    query in one dtype and the key in another, and FlashAttention refuses the
+    pair outright, so the dtype is read from the checkpoint that will be run.
+    Anything this cannot read confidently caches in bfloat16, which is what vLLM
+    would pick anyway and what every reference in this project runs at.
+    """
+    import json
+
+    try:
+        with open(os.path.join(model_path, "config.json"), encoding="utf-8") as handle:
+            config = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return "bfloat16"
+    # A multimodal checkpoint states the language model's dtype on the inner
+    # config, and attention is the language model's.
+    for section in (config, config.get("text_config") or {}):
+        declared = section.get("torch_dtype") or section.get("dtype")
+        if isinstance(declared, str):
+            resolved = _KV_CACHE_DTYPE_ALIASES.get(declared.lower())
+            if resolved:
+                return resolved
+    return "bfloat16"
 
 
 def nonfinite_summary(result: KLDResult) -> str:

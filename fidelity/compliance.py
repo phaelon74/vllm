@@ -145,19 +145,32 @@ def law_1_zero_baseline(c: Campaign) -> Finding:
             f"baseline ran on model_runner_v2={baseline_runner!r} but the "
             f"candidate ran on {c.report.get('model_runner_v2')!r}",
         )
-    # A zero taken through a different KV cache than the candidate's does not
-    # establish that the candidate's path is exact, which is the only thing the
-    # baseline is here to establish.
+    # A zero taken through a quantized cache says nothing about a candidate scored
+    # without one, so both sides have to be unquantized. They need not be the same
+    # dtype: a checkpoint published as float16 caches in float16, because a
+    # bfloat16 key against a float16 query is a pair attention refuses. That is a
+    # property of the candidate rather than of the measurement, so it is disclosed
+    # here and bounded by the comparability key rather than refused.
+    from vllm.v1.sample.kld import UNQUANTIZED_KV_CACHE_DTYPES
+
     baseline_kv = c.self_report.get("kv_cache_dtype")
-    if baseline_kv != c.report.get("kv_cache_dtype"):
-        return Finding(
-            1,
-            title,
-            FAIL,
-            f"baseline cached in {baseline_kv!r} but the candidate cached in "
-            f"{c.report.get('kv_cache_dtype')!r}",
+    candidate_kv = c.report.get("kv_cache_dtype")
+    for role, value in (("baseline", baseline_kv), ("candidate", candidate_kv)):
+        if value not in UNQUANTIZED_KV_CACHE_DTYPES:
+            return Finding(
+                1,
+                title,
+                FAIL,
+                f"{role} cached in {value!r}, which is not one of "
+                f"{UNQUANTIZED_KV_CACHE_DTYPES}",
+            )
+    detail = f"self-KLD exactly 0.0 over {positions} positions"
+    if baseline_kv != candidate_kv:
+        detail += (
+            f"; baseline cached in {baseline_kv}, candidate in {candidate_kv}, "
+            f"both unquantized"
         )
-    return Finding(1, title, PASS, f"self-KLD exactly 0.0 over {positions} positions")
+    return Finding(1, title, PASS, detail)
 
 
 def law_2_determinism(c: Campaign) -> Finding:

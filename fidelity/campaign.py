@@ -1108,9 +1108,9 @@ def _score_report_is_current(
     # used, and one taken against a quantized cache measured that cache as much as
     # it measured the checkpoint. Neither can be relabeled into a laws-14 result,
     # and catching it here costs a rescore instead of a whole campaign.
-    from vllm.v1.sample.kld import UNQUANTIZED_KV_CACHE_DTYPE
+    from vllm.v1.sample.kld import UNQUANTIZED_KV_CACHE_DTYPES
 
-    if cached.get("kv_cache_dtype") != UNQUANTIZED_KV_CACHE_DTYPE:
+    if cached.get("kv_cache_dtype") not in UNQUANTIZED_KV_CACHE_DTYPES:
         return False
     routing_current = (
         _paired_report_is_current(cached)
@@ -1213,41 +1213,39 @@ def file_sha256(path: str) -> str:
 
 def weight_collisions(
     scored: list[tuple[str, Any, str | None]],
-) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
-    """Split a family's candidates into impossible pairs and honest duplicates.
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]], list[tuple[str, str]]]:
+    """Sort a family's candidate pairs by what their score and digest agree on.
 
-    Two candidates that scored the same mean from different weights is not a
-    coincidence a suite of this size produces; it is one checkpoint measured
-    twice, and both numbers are refused because nothing says which directory
-    the scorer actually read. Two candidates that share a digest are the same
-    weights under two names, which is a real finding about the upstream repos
-    rather than a defect here only when their scores also agree. Byte-identical
-    weights with conflicting means are equally impossible and are refused.
+    Byte-identical weights that scored different means are impossible under a
+    deterministic runtime and are refused: one of the two bindings is wrong and
+    nothing here can say which.
 
-    Returns (impossible, duplicates), each a list of name pairs.
+    Different digests with an identical mean are not impossible, which is what
+    this used to claim. `weights_identity` hashes shard names and safetensors
+    headers as well as tensor values, so it guarantees only one direction: equal
+    digests mean equal bytes. Two uploads of one quantization that differ in shard
+    naming, header key order, or a producer string in the metadata hold identical
+    tensors under different digests, and identical tensors are why the means match
+    to the last bit. That is a finding about the upstream repos, disclosed rather
+    than refused.
+
+    Returns (impossible, duplicates, equivalent), each a list of name pairs.
     """
     impossible: list[tuple[str, str]] = []
     duplicates: list[tuple[str, str]] = []
+    equivalent: list[tuple[str, str]] = []
     for i, (name, mean, digest) in enumerate(scored):
         for other, other_mean, other_digest in scored[i + 1:]:
-            same_weights = bool(digest) and digest == other_digest
-            if same_weights:
-                if (
-                    isinstance(mean, (int, float))
-                    and isinstance(other_mean, (int, float))
-                    and mean == other_mean
-                ):
-                    duplicates.append((name, other))
-                else:
-                    impossible.append((name, other))
-            elif (
+            same_score = (
                 isinstance(mean, (int, float))
+                and isinstance(other_mean, (int, float))
                 and mean == other_mean
-                and digest
-                and other_digest
-            ):
-                impossible.append((name, other))
-    return impossible, duplicates
+            )
+            if bool(digest) and digest == other_digest:
+                (duplicates if same_score else impossible).append((name, other))
+            elif same_score and digest and other_digest:
+                equivalent.append((name, other))
+    return impossible, duplicates, equivalent
 
 
 def score_one(
@@ -2994,11 +2992,19 @@ def cmd_assemble(config: Config, python: str, force: bool = False) -> int:
                 record.get("mean_kld"),
                 record.get("student_weights_sha256"),
             ))
-        impossible, duplicates = weight_collisions(scored_weights)
+        impossible, duplicates, equivalent = weight_collisions(scored_weights)
         for left, right in duplicates:
             print(
                 f"DUPLICATE {left} and {right} are byte-identical weights under "
                 f"two names; publish one and disclose the other as a re-upload."
+            )
+        for left, right in equivalent:
+            print(
+                f"EQUIVALENT {left} and {right} scored the same mean from different "
+                f"digests. The digest covers shard names and headers as well as "
+                f"tensor values, so this is one quantization repackaged, not one "
+                f"measured twice. Both are published and the relationship is "
+                f"disclosed."
             )
         for left, right in impossible:
             print(
@@ -3371,23 +3377,27 @@ def selftest() -> int:
     assert status == "fail", "a contradicted digest must not be overridable"
     assert "permits no override" in detail, detail
 
-    # Same mean from different weights is one checkpoint scored twice; a shared
-    # digest is one upload under two names.
-    impossible, duplicates = weight_collisions([
+    # A shared digest is one upload under two names. The same mean from different
+    # digests is one quantization repackaged, because the digest covers shard names
+    # and headers too and so cannot prove the tensors differ.
+    impossible, duplicates, equivalent = weight_collisions([
         ("mse", 0.0345, "a" * 64),
         ("plain", 0.0345, "b" * 64),
         ("rebrand", 0.09, "c" * 64),
         ("original", 0.09, "c" * 64),
     ])
-    assert impossible == [("mse", "plain")], impossible
+    assert not impossible, impossible
     assert duplicates == [("rebrand", "original")], duplicates
-    impossible, duplicates = weight_collisions([
+    assert equivalent == [("mse", "plain")], equivalent
+    # Identical bytes that scored differently is the one genuine contradiction.
+    impossible, duplicates, equivalent = weight_collisions([
         ("same-a", 0.1, "d" * 64),
         ("same-b", 0.2, "d" * 64),
     ])
-    assert impossible == [("same-a", "same-b")] and not duplicates
-    # An unbound report cannot be accused of either.
-    assert weight_collisions([("a", 0.1, None), ("b", 0.1, None)]) == ([], [])
+    assert impossible == [("same-a", "same-b")]
+    assert not duplicates and not equivalent
+    # An unbound report cannot be accused of anything.
+    assert weight_collisions([("a", 0.1, None), ("b", 0.1, None)]) == ([], [], [])
 
     assert "calibration benefit" in _beyond_rounding_what("awq", -0.01)
     assert "beat round-to-nearest" in _beyond_rounding_what("awq", -0.01)

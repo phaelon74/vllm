@@ -36,7 +36,10 @@ from transformers import AutoTokenizer
 
 from vllm import LLM, SamplingParams
 from vllm.inputs import TokensPrompt
-from vllm.v1.sample.kld import UNQUANTIZED_KV_CACHE_DTYPE
+from vllm.v1.sample.kld import (
+    UNQUANTIZED_KV_CACHE_DTYPES,
+    unquantized_kv_cache_dtype,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +87,6 @@ def apply_compiled_llm_kwargs(llm_kwargs: dict[str, Any]) -> None:
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     llm_kwargs["compilation_config"] = DETERMINISTIC_COMPILATION_CONFIG
     llm_kwargs["enable_flashinfer_autotune"] = False
-    llm_kwargs["kv_cache_dtype"] = UNQUANTIZED_KV_CACHE_DTYPE
 
 
 def apply_eager_llm_kwargs(llm_kwargs: dict[str, Any]) -> None:
@@ -95,9 +97,6 @@ def apply_eager_llm_kwargs(llm_kwargs: dict[str, Any]) -> None:
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     llm_kwargs["enforce_eager"] = True
     llm_kwargs["enable_flashinfer_autotune"] = False
-    # Explicit, never "auto": see UNQUANTIZED_KV_CACHE_DTYPE. Set on the shared
-    # kwargs so the reference and the candidate cache identically.
-    llm_kwargs["kv_cache_dtype"] = UNQUANTIZED_KV_CACHE_DTYPE
 
 
 def assert_unquantized_kv_cache(llm: Any, label: str) -> str:
@@ -123,12 +122,16 @@ def assert_unquantized_kv_cache(llm: Any, label: str) -> str:
             f"{label}: cannot read the resolved KV cache dtype, so cannot show "
             f"it was left unquantized"
         )
-    if resolved == "auto" or is_quantized_kv_cache(resolved):
+    if (
+        resolved == "auto"
+        or is_quantized_kv_cache(resolved)
+        or resolved not in UNQUANTIZED_KV_CACHE_DTYPES
+    ):
         raise ValueError(
-            f"{label}: KV cache resolved to {resolved!r}. Scoring pins "
-            f"{UNQUANTIZED_KV_CACHE_DTYPE!r} because a quantized KV cache is a "
-            f"property of the run and not of the checkpoint; 'auto' lets the "
-            f"candidate's own config decide and is refused for the same reason."
+            f"{label}: KV cache resolved to {resolved!r}, which is not one of "
+            f"{UNQUANTIZED_KV_CACHE_DTYPES}. A quantized KV cache is a property of "
+            f"the run and not of the checkpoint, and 'auto' is refused for the "
+            f"same reason: a declared kv_cache_scheme turns it into fp8."
         )
     return str(resolved)
 
@@ -162,25 +165,46 @@ def _merge_substitutions(workers: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
 
 
-def _quantizes_activations_to_fp4(model_path: str) -> bool:
-    """Whether a checkpoint quantizes activations to 4-bit float (W4A4).
+def _declared_expert_activation_quant(model_path: str) -> list[str]:
+    """How the checkpoint says each of its expert groups quantizes activations.
 
-    W4A16 and W4A4 exports of the same model differ only here, and the
-    difference decides which MoE kernels can score the checkpoint faithfully.
-    Read from the checkpoint rather than inferred from a repo name, which says
-    nothing reliable about the scheme.
+    Sorted, deduplicated labels like ``["4-bit float"]`` for a uniform W4A4 MoE,
+    ``["8-bit float", "4-bit float"]`` for one that is mixed inside the MoE, or
+    ``["unquantized"]`` for weight-only experts. Empty when the checkpoint
+    declares no expert group at all.
+
+    Scoped to groups that target experts, because a group covering only attention
+    says nothing about the kernels the MoE will run. Scanning every group is what
+    made a checkpoint with W4A4 attention and FP8 experts look like a W4A4 MoE.
+    Read from the checkpoint, and compared later against what the loader actually
+    built: the two do disagree, and a reader is entitled to know when.
     """
     config_path = os.path.join(model_path, "config.json")
     if not os.path.isfile(config_path):
-        return False
-    with open(config_path, encoding="utf-8") as handle:
-        quant = json.load(handle).get("quantization_config") or {}
-    groups = quant.get("config_groups") or {}
-    for group in groups.values():
+        return []
+    try:
+        with open(config_path, encoding="utf-8") as handle:
+            config = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return []
+    quant = config.get("quantization_config") or (
+        config.get("text_config") or {}
+    ).get("quantization_config") or {}
+    labels: list[str] = []
+    for group in (quant.get("config_groups") or {}).values():
+        targets = (group or {}).get("targets") or []
+        # "Linear" covers every linear module, experts included. Otherwise the
+        # target has to name them, whether as an explicit module list or a regex.
+        if not any(
+            target == "Linear" or "expert" in target for target in targets
+        ):
+            continue
         activations = (group or {}).get("input_activations") or {}
-        if activations.get("num_bits") == 4 and activations.get("type") == "float":
-            return True
-    return False
+        bits, kind = activations.get("num_bits"), activations.get("type")
+        label = "unquantized" if bits is None else f"{bits}-bit {kind or '?'}"
+        if label not in labels:
+            labels.append(label)
+    return labels
 
 
 def allow_apply_model_rpc() -> None:
@@ -1376,9 +1400,8 @@ def calculate_kld(
                     "tensor_parallel_size", 1
                 ),
                 "enforce_eager": bool((llm_kwargs or {}).get("enforce_eager")),
-                "kv_cache_dtype": (llm_kwargs or {}).get(
-                    "kv_cache_dtype", UNQUANTIZED_KV_CACHE_DTYPE
-                ),
+                "kv_cache_dtype": (llm_kwargs or {}).get("kv_cache_dtype")
+                or unquantized_kv_cache_dtype(reference_model_path),
                 "enable_prefix_caching": bool(
                     (llm_kwargs or {}).get("enable_prefix_caching")
                 ),
@@ -1457,9 +1480,13 @@ def calculate_kld(
                 "tensor_parallel_size", 1
             ),
             "enforce_eager": bool((llm_kwargs or {}).get("enforce_eager")),
-            "kv_cache_dtype": (llm_kwargs or {}).get(
-                "kv_cache_dtype", UNQUANTIZED_KV_CACHE_DTYPE
-            ),
+            # The manifest records the reference's cache, so this has to be the
+            # reference's too. Replaying a capture without --reference-model loads
+            # no reference, so there is no live value to compare; inheriting the
+            # recorded one states that rather than inventing a mismatch, and the
+            # tokens, geometry, and runtime fields still bind the capture.
+            "kv_cache_dtype": (llm_kwargs or {}).get("kv_cache_dtype")
+            or manifest.get("kv_cache_dtype"),
             "runtime": capture_runtime_manifest(),
         }
         mismatches = manifest_mismatches(manifest, live)
@@ -1589,18 +1616,22 @@ def calculate_kld(
     print("Phase 2: Computing KLD...")
     print(f"Loading test model: {model_path}")
     student_kwargs = dict(llm_kwargs or {})
+    # The candidate caches in its own compute dtype. The shared kwargs carry the
+    # reference's, and a checkpoint published as float16 cannot borrow it: the
+    # query would arrive float16 against a bfloat16 key and FlashAttention refuses
+    # the pair. Unquantized either way, which is what the policy asks for.
+    student_kwargs["kv_cache_dtype"] = unquantized_kv_cache_dtype(model_path)
     if routing_manifest is not None:
         student_kwargs["enable_return_routed_experts"] = True
-    if "moe_backend" not in student_kwargs and _quantizes_activations_to_fp4(
-        model_path
-    ):
-        # Auto-selection would also pick vLLM CUTLASS under batch invariance.
-        # Pin it so a published W4A4 number is the kernel the SM120 bitwise
-        # probe cleared, not FlashInfer (which collapses per-expert scales) and
-        # not emulation (which does the same). Student only: the reference is
-        # unquantized and has no NVFP4 experts.
-        student_kwargs["moe_backend"] = "cutlass"
-        print("  W4A4 NVFP4 checkpoint: pinning the CUTLASS MoE backend")
+    # No MoE backend is pinned from the checkpoint's config. Pinning one asked a
+    # pre-load guess to answer two questions it cannot: which kernel the loader
+    # will actually build, and what to do when one checkpoint needs several. A
+    # modelopt MIXED_PRECISION export declaring W4A4 experts was built weight-only
+    # and the pinned W4A4 kernel refused to load it; a compressed-tensors export
+    # with FP8 experts in its last eight layers and W4A4 everywhere else cannot be
+    # served by any single pin at all. The oracle answers per layer, and
+    # `inspect_model_moe_backends` below reads back what it chose, which is the
+    # measurement this project prefers to a declaration.
     with _phase(timings, "student_load"):
         llm = LLM(model=model_path, **student_kwargs)
     kv_cache_dtype = assert_unquantized_kv_cache(llm, "candidate")
@@ -1988,6 +2019,14 @@ def calculate_kld(
     report["kv_cache_dtype"] = kv_cache_dtype
     report["student_lm_head"] = student_head
     report["student_model"] = os.path.abspath(model_path)
+    # What the checkpoint says its experts do to activations, beside what the
+    # loader built. A modelopt MIXED_PRECISION export declaring 4-bit float
+    # activations was built weight-only, so the number measures a scheme the
+    # publisher did not ship. That is a fact about the pair, disclosed rather
+    # than quietly absorbed into a single scheme label.
+    report["declared_expert_activation_quant"] = _declared_expert_activation_quant(
+        model_path
+    )
     # Unconditional, and top level as well as inside the routing binding: a
     # compliance check and a comparability key must be able to ask what the run
     # substituted without reaching through a paired-routing structure that a
@@ -2905,6 +2944,16 @@ def main():
     else:
         apply_eager_llm_kwargs(llm_kwargs)
         print("Deterministic (eager) mode: bit-reproducible scoring")
+
+    # Explicit, never "auto", and read from the reference rather than assumed: the
+    # capture manifest binds this value, so it has to be the reference's, and the
+    # candidate overrides it with its own in `calculate_kld`. Replaying a stored
+    # capture loads no reference, and the manifest's own value stands in there.
+    if args.reference_model is not None:
+        llm_kwargs["kv_cache_dtype"] = unquantized_kv_cache_dtype(
+            args.reference_model
+        )
+        print(f"KV cache (reference, unquantized): {llm_kwargs['kv_cache_dtype']}")
 
     moe_backend = os.environ.get("VLLM_MOE_BACKEND")
     if moe_backend:
