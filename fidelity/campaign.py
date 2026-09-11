@@ -1308,7 +1308,16 @@ def score_one(
             bind_weights(report, student, observed=False)
             return report, capture
         print(f"=== {tag} uses historical score bindings; rescoring")
-        os.unlink(report)
+        # Moved aside rather than deleted, and out of `reports` so nothing that
+        # enumerates published reports finds it. The scorer holds the rebuild to
+        # the kernel this run read back, when the two share a binding. Deleting it
+        # here is still the safe act for the report itself: a rescore that dies
+        # halfway must not leave a stale number where a fresh one belongs.
+        prior = os.path.join(config.work, "prior", f"{tag}.json")
+        os.makedirs(os.path.dirname(prior), exist_ok=True)
+        os.replace(report, prior)
+    else:
+        prior = None
 
     capture_environment(config, python)
 
@@ -1360,6 +1369,8 @@ def score_one(
             cmd.append("--paired-routing")
     if moe_backend:
         cmd += ["--moe-backend", moe_backend]
+    if prior:
+        cmd += ["--prior-report", prior]
 
     print(f"=== {tag} (TP={tp} util={util:.2f} kv={kv:.2f} GiB)")
     rc = _run(cmd, log_path=log, env={

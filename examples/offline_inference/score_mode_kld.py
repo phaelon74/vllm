@@ -1117,6 +1117,64 @@ def _runtime_lm_head_info(llm: LLM) -> dict[str, Any]:
     }
 
 
+_KERNEL_IDENTITY_FIELDS = ("quant_method", "kernel", "experts")
+
+
+def _kernel_identity(profiles: Any) -> list[str]:
+    """Which kernel a build chose, projected out of its full layer profiles.
+
+    Parallelism and routing configuration are deliberately not read. They move for
+    reasons a rescore is entitled to move them for, and they are on the report
+    either way. What must not move under one binding is which kernel ran.
+
+    Empty when the profiles cannot be read, which reads as no expectation rather
+    than as a failed one.
+    """
+    identities = set()
+    for profile in profiles or ():
+        try:
+            fields = json.loads(profile)
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(fields, dict):
+            return []
+        identities.add(
+            json.dumps(
+                {key: fields.get(key) for key in _KERNEL_IDENTITY_FIELDS},
+                sort_keys=True,
+            )
+        )
+    return sorted(identities)
+
+
+def _prior_kernel_identity(path: str | None) -> list[str]:
+    """The kernel a previous run of this same binding read back off the model.
+
+    The oracle picks per layer from the checkpoint, the device, the installed
+    FlashInfer and its own source, and a campaign binds all four. So under one
+    binding the choice is a function, and a second run of that function owes the
+    same answer. Empty when there is nothing to hold this run to: no prior report,
+    a prior run that named a backend itself, or a prior run whose numerics or
+    built kernels differ from this one's -- a new binding is allowed a new kernel.
+    """
+    if not path or not os.path.isfile(path):
+        return []
+    try:
+        with open(path, encoding="utf-8") as handle:
+            prior = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(prior, dict) or prior.get("moe_backend_named"):
+        return []
+    from vllm.v1.sample.kld import capture_runtime_manifest, runtime_binding_view
+
+    recorded = runtime_binding_view(prior.get("runtime_binding"))
+    if not recorded or recorded != runtime_binding_view(capture_runtime_manifest()):
+        return []
+    evidence = (prior.get("qxq_cell") or {}).get("backend_evidence") or {}
+    return _kernel_identity(evidence.get("layer_profiles"))
+
+
 def calculate_kld(
     model_path: str,
     texts: list[str],
@@ -1143,6 +1201,7 @@ def calculate_kld(
     paired_routing: bool = False,
     reference_weights_sha256: str | None = None,
     moe_backend: str | None = None,
+    prior_report: str | None = None,
 ) -> dict[str, Any]:
     """Two-phase KLD: capture teacher references, then score the student."""
     from vllm.v1.sample.kld import (
@@ -1741,6 +1800,22 @@ def calculate_kld(
             raise RuntimeError(
                 "QxQ/BxQ exact-repeat scoring requires each MoE layer to use "
                 "the same certified backend profile on every worker"
+            )
+        # No kernel is pinned, so this is the check that makes the number
+        # repeatable rather than merely repeated: a published KLD is only
+        # reproducible if the same binding rebuilds the same kernel. Verifying
+        # that is safe where pinning it was not, because a pin can refuse to load
+        # a checkpoint and a comparison cannot.
+        built_kernel = _kernel_identity(sorted(backend_profiles))
+        expected_kernel = [] if moe_backend else _prior_kernel_identity(prior_report)
+        if expected_kernel and expected_kernel != built_kernel:
+            raise RuntimeError(
+                "QxQ/BxQ scoring read back a different MoE kernel than the "
+                "previous report of this binding: expected "
+                f"{', '.join(expected_kernel)}; built {', '.join(built_kernel)}. "
+                "Same numerics and same compiled kernels must reselect the same "
+                "backend, so the published number is not reproducible until this "
+                "is explained."
             )
         uncertified_recurrent = sorted(
             {
@@ -2771,6 +2846,14 @@ def main():
         "does not.",
     )
     parser.add_argument(
+        "--prior-report",
+        type=str,
+        default=None,
+        help="A previous report for this candidate, whose MoE kernel this run "
+        "must rebuild if it shares that report's binding. Defaults to whatever "
+        "--report-json already holds.",
+    )
+    parser.add_argument(
         "--dataset-config",
         type=str,
         default=None,
@@ -3033,6 +3116,7 @@ def main():
         paired_routing=args.paired_routing,
         reference_weights_sha256=args.reference_weights_sha256,
         moe_backend=args.moe_backend,
+        prior_report=args.prior_report or args.report_json,
     )
     elapsed_time = time.time() - start_time
 

@@ -139,13 +139,36 @@ uncertified.
 (§7) the choice belongs to vLLM's oracle, and the oracle ranks by expected
 performance, not by whether a kernel is certified here. `AVAILABLE_BACKENDS` in
 `vllm/model_executor/layers/fused_moe/oracle/nvfp4.py` puts `FLASHINFER_TRTLLM`
-first and nothing in that path consults `VLLM_BATCH_INVARIANT`, so an NVFP4 MoE
-candidate can be built on a kernel this document lists as uncertified. Certification
-is read off the loaded model either way and it fails closed: an uncertified backend
-is reported as uncertified, Law 14 refuses the attribution, and the candidate does
-not publish. Which is the correct outcome and an expensive one — a full scoring pass
-spent to learn what the oracle chose. Run the `smoke` stage on one candidate of a
-routed family before committing a campaign to it, and read the backend it names.
+first and nothing in that path consults `VLLM_BATCH_INVARIANT`, so nothing
+*guarantees* a certified kernel. The refusal is upstream of the cost, at least:
+scoring reads certification off the loaded model and raises before any forward pass,
+so an uncertified choice costs a model load rather than a scored pass.
+
+Measured, on ten gemma4-26b-a4b candidates at one row each: the oracle chose
+`VLLM_CUTLASS` for all four NVFP4 MoE exports, `TRITON` for the FP8 export, and
+`MARLIN` for the four INT4 ones. Every one is in the allowlist and every control
+repeated at exactly 0.000e+00. FlashInfer was first in the list each time and its
+`is_supported_config` declined each time, for reasons logged only at debug level.
+So the outcome is good and it is a reading rather than a promise: run the `smoke`
+stage over a routed family before committing a campaign to it, and read the backend
+each candidate names.
+
+**A kernel is verified on the next run, not pinned.** The oracle chooses per layer
+from the checkpoint, the device, the installed FlashInfer and its own source, and
+§9's comparability key binds all four — the last of them because the oracle is a
+`.py` file under `vllm/` and therefore inside the numerics digest. Under one binding
+the choice is a function, so a second run of it owes the same answer. Scoring holds
+it to that: `_prior_kernel_identity` reads the previous report for the candidate,
+and when its binding matches the live one, the expert class and kernel read back
+after the student load must match what that report recorded. A mismatch is refused
+before any forward pass, because a published number that a rerun would not
+reproduce is worse than no number. The comparison is narrowed to `quant_method`,
+`kernel` and `experts`: tensor and expert parallelism are recorded on the report but
+a rescore is entitled to move them. Where the binding differs the expectation is
+released, since new numerics or newly built kernels are allowed a new choice — that
+is a new number, not a broken one. This is the safe half of pinning. A pin had to
+predict the kernel before the load and could refuse a checkpoint outright (§7); a
+comparison happens after the load and can only refuse a contradiction.
 
 ## 6. Case study: uninitialized scales, not a broken kernel
 
@@ -577,7 +600,10 @@ qualifies it, and self-declaration never does.
 Note that `--only-candidate` applies to `smoke` only. To rescore a single
 candidate of an assembled family, delete its report from
 `<work>/reports/<tag>.json`; the completeness gate then rescores exactly that one
-and skips the rest.
+and skips the rest. A rescore the campaign decides on for itself moves the old
+report to `<work>/prior/<tag>.json` and holds the rebuild to the kernel that report
+read back. Deleting the report by hand skips that, which is the way to accept a
+kernel change deliberately rather than argue with the check.
 
 ## 12. What these numbers do not say
 
