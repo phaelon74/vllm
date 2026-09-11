@@ -1,6 +1,6 @@
 # Local Inference Lab — Distribution Fidelity Laws
 
-**Laws version:** 14
+**Laws version:** 15
 **Status:** draft, pending coordination with `local-inference-lab` on the
 publication namespace and suite format.
 
@@ -126,6 +126,32 @@ used a quantized cache measured something else. Version-13 reports must be
 rescored, and their captures retaken, since the capture is bound to the cache it
 was taken under.
 
+Version 15 adds no law and changes what two of them bind to.
+
+Law 10's comparability key drops `vllm_commit` and `vllm_dirty_digest` for
+`numerics_digest`, a hash of every `.py` under `vllm/` together with the scorer.
+Binding to the commit meant a documentation edit, a campaign config, or a fix to
+the orchestration invalidated every published number and cost GPU-days to
+reproduce values that were already correct. The commit is still recorded and still
+published under Law 6, where it says when a number was taken; currency asks
+whether the code that computed it would compute it again, and the digest answers
+that. `compiled_extensions_sha256` continues to cover the built kernels, so a
+rebuild still invalidates. A capture is bound the same way: it is retaken when the
+digest or the kernels move, not when the commit does.
+
+Law 1 no longer requires the baseline and the candidate to cache in the *same*
+unquantized dtype, only that each is unquantized. Version 14 held a literal
+`bfloat16`, which refused three checkpoints published as float16 outright:
+FlashAttention will not take a float16 query against a bfloat16 key. Each side now
+caches in its own checkpoint's compute dtype, both dtypes are recorded, and the
+candidate's stays in the comparability key, so a difference is disclosed and never
+silently ranked across.
+
+A version-14 report has no `numerics_digest` and cannot be relabeled into one; a
+report that records no digest cannot be shown to have been computed by the code
+running now. Version-14 reports must be rescored. This is the last rescore either
+change forces: after it, a commit that cannot reach a number costs nothing.
+
 These laws govern every distribution-fidelity measurement this program
 publishes. They are not guidance. The pipeline refuses to produce or upload an
 artifact that violates one, and the only way past a refusal is a recorded,
@@ -191,7 +217,10 @@ override, ranking two candidates requires repeated candidate capture as well.
 **Required.** Eager execution enforced. No autotuned kernel selection, no
 inference-time JIT kernel selection, no CUDA graphs, prefix caching disabled,
 and a fixed `max_num_seqs`. Tensor-parallel size is recorded, and reference and
-candidate are scored under identical settings.
+candidate are scored under identical settings, with one exception: each caches in
+its own checkpoint's compute dtype, because a float16 checkpoint cannot read a
+bfloat16 key. Both must be unquantized, both are recorded, and the candidate's is
+in the comparability key.
 
 **Why.** Timing-based autotuners and JIT kernel choice make the arithmetic a
 function of machine load, which silently converts run-to-run noise into apparent

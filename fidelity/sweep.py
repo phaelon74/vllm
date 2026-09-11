@@ -105,11 +105,27 @@ def published_state(library: str) -> tuple[list[str], list[str]]:
     return compliant, broken
 
 
+def _names_moe_backend(path: str) -> bool:
+    """Whether a report chose its MoE backend rather than letting vLLM choose."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return bool(json.load(handle).get("moe_backend_named"))
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
 def classify(work: str, published: set[str]) -> dict[str, object]:
     """What one work tree holds, relative to the published index."""
     reports = sorted(glob.glob(os.path.join(work, "reports", "*.json")))
     live = [p for p in reports if digest(p) in published]
-    orphans = [p for p in reports if p not in live]
+    # A counterfactual is not an orphan. It scores a published candidate on a
+    # named MoE backend to price what collapsing its per-expert activation
+    # scales cost, so the index cites it as evidence while its own digest is
+    # nowhere in the published set. Listing it as an unpublished report read as
+    # a candidate that failed to finish.
+    unpublished = [p for p in reports if p not in live]
+    counterfactuals = [p for p in unpublished if _names_moe_backend(p)]
+    orphans = [p for p in unpublished if p not in counterfactuals]
 
     captures = [
         p
@@ -130,6 +146,7 @@ def classify(work: str, published: set[str]) -> dict[str, object]:
         "reports": reports,
         "live": live,
         "orphans": orphans,
+        "counterfactuals": counterfactuals,
         "captures": captures,
         "variants": variants,
         # No live report means nothing in this tree was ever published from here.
@@ -189,6 +206,12 @@ def describe(tree: dict, owners: list[str]) -> None:
     if variants:
         size = sum(tree_size(p) for p in variants)
         print(f"    variants: {len(variants)} unpruned {gib(size)}  (rebuildable)")
+    counterfactuals = tree["counterfactuals"]
+    if counterfactuals:  # type: ignore[truthy-bool]
+        print(
+            f"    counterfactuals: {len(counterfactuals)}"  # type: ignore[arg-type]
+            f"  (collapse cost evidence, cited by published reports)"
+        )
     for path in tree["orphans"]:  # type: ignore[union-attr]
         print(f"      unpublished report: {os.path.basename(str(path))}")
 

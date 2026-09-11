@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-LAWS_VERSION = 14
+LAWS_VERSION = 15
 # v5 adds the substitution record Law 17 reads. A report scored before it cannot
 # say whether it used the checkpoint's own quantization parameters, so the bump
 # makes every earlier routed report stale rather than grandfathering the silence.
@@ -420,7 +420,13 @@ def comparability_key(c: Campaign) -> dict[str, Any]:
         "torch": runtime.get("torch"),
         "driver": runtime.get("driver"),
         "gpu_names": runtime.get("gpu_names"),
-        "vllm_commit": runtime.get("vllm_commit"),
+        # The commit used to bound this group, which split the leaderboard on edits
+        # that cannot reach a logit: a docs paragraph, a campaign config, this file.
+        # What bounds comparability is whether two runs computed their numbers with
+        # the same code, so the digest over the runtime and the scorer stands here
+        # instead. The commit each result was taken at is still recorded and still
+        # published; it is provenance, and it is reported as such.
+        "numerics_digest": runtime.get("numerics_digest"),
         "compiled_extensions_sha256": runtime.get(
             "compiled_extensions_sha256"
         ),

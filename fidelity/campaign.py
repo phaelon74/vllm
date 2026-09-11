@@ -1129,12 +1129,19 @@ def _score_report_is_current(
     except Exception:
         return False
     cached_runtime = cached.get("runtime_binding") or {}
+    # Currency asks whether this number would come out the same today, so it
+    # compares the code that produces numbers and the kernels that were built --
+    # not the commit. The commit moves for a documentation edit or an
+    # orchestration fix, and holding results to it meant a whole library went
+    # stale every time this file was touched, forcing GPU-days to reproduce
+    # numbers that were already right. The commit is still recorded on the report
+    # and published under Law 6: it says when a number was taken, which is
+    # provenance, and provenance is not a currency test.
+    cached_numerics = cached_runtime.get("numerics_digest")
     runtime_current = (
         isinstance(cached_runtime, dict)
-        and cached_runtime.get("vllm_commit")
-        == current_runtime.get("vllm_commit")
-        and cached_runtime.get("vllm_dirty_digest")
-        == current_runtime.get("vllm_dirty_digest")
+        and cached_numerics is not None
+        and cached_numerics == current_runtime.get("numerics_digest")
         and cached_runtime.get("compiled_extensions_sha256")
         == current_runtime.get("compiled_extensions_sha256")
     )
@@ -1262,6 +1269,7 @@ def score_one(
     paired_routing: bool = False,
     bind_reference_weights: bool = False,
     plan_from: str | None = None,
+    moe_backend: str | None = None,
 ) -> tuple[str, str]:
     """Score one pair. Returns (report_path, capture_dir).
 
@@ -1277,6 +1285,12 @@ def score_one(
     capture = os.path.join(
         config.work, "captures", f"{capture_label or label}{suffix}"
     )
+    # A counterfactual run lands beside the deployed one rather than over it. It
+    # shares the teacher capture, which is what keeps its cost to one student
+    # load: the reference distribution does not depend on which kernel the
+    # candidate's experts run.
+    if moe_backend:
+        tag = f"{tag}-moe-{moe_backend}"
     report = os.path.join(config.work, "reports", f"{tag}.json")
     log = os.path.join(config.work, "logs", f"{tag}.log")
     os.makedirs(os.path.dirname(report), exist_ok=True)
@@ -1344,6 +1358,8 @@ def score_one(
         ]
         if paired_routing:
             cmd.append("--paired-routing")
+    if moe_backend:
+        cmd += ["--moe-backend", moe_backend]
 
     print(f"=== {tag} (TP={tp} util={util:.2f} kv={kv:.2f} GiB)")
     rc = _run(cmd, log_path=log, env={
@@ -2083,7 +2099,147 @@ def _score_candidate(
     except (OSError, json.JSONDecodeError) as exc:
         raise CampaignError(f"could not record provenance in {report}: {exc}") from exc
 
+    _measure_collapse_cost(config, python, model, cand, routed, report)
     attribute_model(config, python, model, cand, capture, report)
+
+
+COLLAPSE_KIND = "per_expert_collapsed_to_layer_scalar"
+
+# The NVFP4 expert kernel that keeps one activation scale per expert. Named, not
+# guessed: `CutlassExpertsFp4` is the implementation `_activation_scale_substitution`
+# has been observed to leave uncollapsed, and the counterfactual verifies that it
+# actually did rather than trusting this constant.
+NON_COLLAPSING_MOE_BACKEND = "cutlass"
+
+
+def _collapsed_parameters(report: dict) -> list[str]:
+    """Which activation scales this run collapsed to one scalar per layer."""
+    return sorted(
+        str(record.get("parameter"))
+        for record in report.get("quantization_substitutions") or ()
+        if record.get("kind") == COLLAPSE_KIND
+    )
+
+
+def _cell_means(report: dict) -> dict[str, float | None]:
+    """The three numbers a reader compares, from whichever cells exist."""
+    means: dict[str, float | None] = {"mean_kld": report.get("mean_kld")}
+    for key, name in (("qxq_cell", "qxq"), ("bxq_cell", "bxq")):
+        cell = report.get(key)
+        means[name] = cell.get("mean_kld") if isinstance(cell, dict) else None
+    return means
+
+
+def _measure_collapse_cost(
+    config: Config,
+    python: str,
+    model: Model,
+    cand: Candidate,
+    routed: bool,
+    report_path: str,
+) -> None:
+    """Price the per-expert activation scale collapse this run disclosed.
+
+    Law 17 says a run that collapsed the checkpoint's per-expert activation scales
+    to one layer-wide scalar has to disclose it, and disclosure was as far as this
+    went: a reader was told the measurement used a parameter the checkpoint did not
+    export, and left to guess whether that was worth a decimal place or the whole
+    ranking. It is not a guess worth leaving open. The same candidate is scored
+    again on a kernel that keeps the per-expert scales, and the difference between
+    the two numbers is what the collapse cost.
+
+    The deployed number does not change. Which kernel the oracle builds for a
+    checkpoint on this hardware is a fact about deploying it, and the index reports
+    what deployment does; the counterfactual is priced beside it, never in place of
+    it.
+
+    Conditional by construction. A candidate that collapsed nothing pays nothing,
+    which is every dense candidate and every routed one whose experts kept their
+    own scales. A candidate that did collapse pays one student load and one scoring
+    pass, because the teacher capture is shared with the run that just finished.
+
+    Failure here is not the candidate's failure. A kernel that will not load this
+    checkpoint means the collapse cannot be priced on this hardware, which is
+    recorded as unpriced with the reason. Refusing the candidate over it would
+    withdraw a measured, compliant, deployed number because a second run vLLM never
+    has to perform did not work.
+    """
+    try:
+        with open(report_path, encoding="utf-8") as handle:
+            report = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CampaignError(f"could not read {report_path}: {exc}") from exc
+    collapsed = _collapsed_parameters(report)
+    if not collapsed:
+        return
+    if report.get("moe_backend_named"):
+        return
+
+    cell = report.get("qxq_cell") or {}
+    evidence = cell.get("backend_evidence") or {}
+    cost: dict[str, Any] = {
+        "parameters": collapsed,
+        "deployed_backend": evidence.get("backend"),
+        "counterfactual_backend": NON_COLLAPSING_MOE_BACKEND,
+        "deployed": _cell_means(report),
+    }
+    print(
+        f"=== {cand.name} collapsed {', '.join(collapsed)}; pricing it against "
+        f"the {NON_COLLAPSING_MOE_BACKEND} MoE backend"
+    )
+    try:
+        counterfactual, _ = score_one(
+            config, python, cand.name, cand.path, model.reference_path,
+            config.rows, decompose=False,
+            capture_label=f"{model.name}-ref",
+            measure_routing=routed,
+            paired_routing=routed,
+            moe_backend=NON_COLLAPSING_MOE_BACKEND,
+        )
+        with open(counterfactual, encoding="utf-8") as handle:
+            other = json.load(handle)
+    except (CampaignError, OSError, json.JSONDecodeError) as exc:
+        cost["priced"] = False
+        cost["reason"] = str(exc)
+        print(f"    unpriced: {exc}", file=sys.stderr)
+    else:
+        still = _collapsed_parameters(other)
+        cost["counterfactual_report"] = counterfactual
+        cost["counterfactual_backend_built"] = (
+            (other.get("qxq_cell") or {}).get("backend_evidence") or {}
+        ).get("backend")
+        cost["counterfactual"] = _cell_means(other)
+        if still:
+            # A second kernel that collapsed the same scales priced nothing: both
+            # numbers carry the substitution, so their difference is not its cost.
+            cost["priced"] = False
+            cost["reason"] = (
+                f"the {NON_COLLAPSING_MOE_BACKEND} backend also collapsed "
+                f"{', '.join(still)}"
+            )
+        else:
+            cost["priced"] = True
+            cost["delta"] = {
+                name: (
+                    cost["deployed"][name] - cost["counterfactual"][name]
+                    if isinstance(cost["deployed"][name], (int, float))
+                    and isinstance(cost["counterfactual"][name], (int, float))
+                    else None
+                )
+                for name in cost["deployed"]
+            }
+            for name, value in cost["delta"].items():
+                if value is not None:
+                    print(f"    {name}: collapse cost {value:+.8f}")
+    report["per_expert_collapse_cost"] = cost
+    try:
+        with open(report_path, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(report, handle, indent=2)
+            handle.write("\n")
+    except OSError as exc:
+        raise CampaignError(
+            f"could not record the collapse cost in {report_path}: {exc}"
+        ) from exc
 
 
 def preflight_suite(config: Config) -> None:

@@ -135,6 +135,18 @@ producing garbage that the harness dutifully writes down as a fidelity result.
 DeepGEMM, FlashInfer MoE, AITER, XPU, CPU, and every expert-parallel path remain
 uncertified.
 
+**Certification and backend selection now meet.** With the MoE backend pin removed
+(§7) the choice belongs to vLLM's oracle, and the oracle ranks by expected
+performance, not by whether a kernel is certified here. `AVAILABLE_BACKENDS` in
+`vllm/model_executor/layers/fused_moe/oracle/nvfp4.py` puts `FLASHINFER_TRTLLM`
+first and nothing in that path consults `VLLM_BATCH_INVARIANT`, so an NVFP4 MoE
+candidate can be built on a kernel this document lists as uncertified. Certification
+is read off the loaded model either way and it fails closed: an uncertified backend
+is reported as uncertified, Law 14 refuses the attribution, and the candidate does
+not publish. Which is the correct outcome and an expensive one — a full scoring pass
+spent to learn what the oracle chose. Run the `smoke` stage on one candidate of a
+routed family before committing a campaign to it, and read the backend it names.
+
 ## 6. Case study: uninitialized scales, not a broken kernel
 
 `CutlassExpertsFp4` self-declares batch invariance. Under
@@ -196,28 +208,56 @@ The fail-closed allowlist was the right reaction to a NaN that looked like a
 kernel defect. Once the scales were the cause, keeping CUTLASS off the list
 was the thing standing between native BxQ and a published number.
 
-## 7. W4A4 NVFP4 scores on native CUTLASS
+## 7. W4A4 NVFP4 and the kernel the loader actually builds
 
 A W4A16 export and a W4A4 export of the same model differ only in whether
 activations are also quantized, and that difference decides which kernels can
 score the checkpoint honestly. A repository name says nothing reliable about it,
-so `_quantizes_activations_to_fp4` in `examples/offline_inference/score_mode_kld.py`
-reads the checkpoint: any entry in `quantization_config.config_groups` whose
-`input_activations` declares `num_bits: 4` and `type: "float"` makes it W4A4.
+so `_declared_expert_activation_quant` in
+`examples/offline_inference/score_mode_kld.py` reads the checkpoint: for every
+`quantization_config.config_groups` entry that targets experts, it reports what
+that group declares for `input_activations` — `4-bit float`, `8-bit float`, or
+`unquantized`. Scoped to expert groups, because a group covering only attention
+says nothing about the kernels the MoE will run, and scanning every group is what
+made a checkpoint with W4A4 attention and FP8 experts look like a W4A4 MoE.
 
-For those checkpoints the scorer pins `moe_backend="cutlass"`. vLLM CUTLASS
-is the only native W4A4 MoE path that keeps a per-expert activation-scale
-vector. FlashInfer collapses every expert to one scalar via
+It reports a list, not a verdict, because a checkpoint can declare more than one
+width inside its own MoE. And it is a reading of the checkpoint, not a prediction
+about the run: what the loader builds is a separate fact, read back after load.
+
+**The scorer no longer pins a MoE backend, and the removal was not a
+simplification.** It used to pin `moe_backend="cutlass"` for anything it judged
+W4A4, and two real checkpoints showed that a pre-load pin is being asked two
+questions it cannot answer. `nvidia/gemma-4-26B-A4B-it-NVFP4` declares
+`num_bits: 4, type: float` weights *and* activations for `mlp.experts`; the
+modelopt `MIXED_PRECISION` loader built those experts weight-only, and the pinned
+W4A4 CUTLASS kernel refused a configuration ending `(symmetric)xNone` — the pin
+failed the candidate over a kernel the checkpoint was never going to get.
+`unsloth/gemma-4-26B-A4B-it-NVFP4` declares FP8 experts in its last eight layers
+and W4A4 in the rest, which no single global pin can serve at all. Both failures
+were ours, not the checkpoints'.
+
+So the choice is left to the oracle, which answers per layer and knows what it
+built, and `inspect_model_moe_backends` reads the answer back off the loaded
+model. That is the measurement this project prefers to a declaration, and it is
+the same discipline as `assert_unquantized_kv_cache` in §9.
+
+The kernels themselves still differ, and which one ran still decides what a number
+means. vLLM CUTLASS is the only native W4A4 MoE path that keeps a per-expert
+activation-scale vector. FlashInfer collapses every expert to one scalar via
 `amax_for_moe_activation_quant(...).repeat(num_experts)` — the same defect as
-emulation. Marlin drops activation scales and would score W4A4 as W4A16.
+emulation. Marlin drops activation scales and scores W4A4 as W4A16.
 
 Unwritten slots are now a NaN sentinel, filled from the maximum of the present
 per-expert scales before CUTLASS fuses them into the weight alphas. Too large
 wastes quantization range; too small overflows e4m3. A layer with no finite
 positive slot is refused rather than invented. The fill is recorded on the
 layer at fill time as `uncalibrated_experts_filled_from_layer_max` and Law 17
-discloses it. A complete export such as unsloth records an empty substitution
-list: native CUTLASS used the checkpoint's own scales.
+discloses it. A complete export scored on CUTLASS records an empty substitution
+list, because the kernel used the checkpoint's own scales. A complete export is
+not automatically such a run: with the pin gone, unsloth's mixed-precision MoE
+gets whichever kernel the loader builds for it, and if that kernel collapses the
+scales the substitution is disclosed and then priced.
 
 Both halves of the model are walked, because a dense NVFP4 projection can omit a
 shard's scale exactly as an expert can. `inspect_model_moe_backends` covers the
@@ -238,9 +278,33 @@ nothing was inspected at all.
 | Marlin | dropped entirely (scores W4A16) | certified |
 | Emulation | collapsed to a layer maximum | certified |
 
-**The pin belongs on the student only.** It is applied to `student_kwargs`, not
-the shared `llm_kwargs`. Applied to the latter it propagates to the unquantized
-BF16 teacher, which has no such scheme, and reference engine initialization fails.
+**A collapse is priced, not just disclosed.** Law 17 states that a run used one
+layer-wide scalar where the checkpoint exported a scale per expert, and that left
+a reader to guess whether the substitution was worth a decimal place or the
+ranking. When a report discloses `per_expert_collapsed_to_layer_scalar`, the
+campaign scores that candidate once more with `--moe-backend cutlass`, which keeps
+the per-expert scales, and records the difference as `per_expert_collapse_cost`.
+The one-pager prints both numbers and the delta.
+
+Conditional by construction: a candidate that collapsed nothing pays nothing,
+which is every dense candidate and every routed one whose experts kept their own
+scales. A candidate that did collapse pays one student load and one scoring pass,
+because the teacher capture does not depend on which kernel the experts run and is
+shared with the run that just finished. If the non-collapsing kernel will not load
+the checkpoint on this hardware, the cost is recorded as unpriced with the reason;
+withdrawing a measured, compliant, deployed number because a second run vLLM never
+has to perform did not work would be the wrong trade.
+
+The deployed number does not change. Which kernel the oracle builds for a
+checkpoint on this hardware is a fact about deploying it, and this index reports
+what deployment does. The counterfactual is priced beside it, never in place of it,
+and the two are not comparable to each other's leaderboard groups because the
+substitution is part of the comparability key.
+
+**A named backend belongs on the student only.** `--moe-backend` reaches
+`student_kwargs`, not the shared `llm_kwargs`. Applied to the latter it propagates
+to the unquantized BF16 teacher, which has no such scheme, and reference engine
+initialization fails.
 
 A weight-only W4A16 NVFP4 result still measures the quantization scheme rather than
 a native FP4 kernel's own rounding, because dense Marlin is not batch invariant
@@ -347,12 +411,12 @@ count. That checkpoint now scores 1.17816288 and passes all seventeen laws.
 Scoring pins `VLLM_BATCH_INVARIANT=1`, disables DeepGEMM
 (`VLLM_MOE_USE_DEEP_GEMM=0`) and FlashInfer autotune, sets `NCCL_DETERMINISTIC=1`
 and `CUBLAS_WORKSPACE_CONFIG=:4096:8`, enforces eager execution, disables prefix
-caching, holds `max_num_seqs=1`, and pins `kv_cache_dtype=bfloat16`.
+caching, holds `max_num_seqs=1`, and refuses a quantized KV cache.
 
 None of that is optional and none of it is a performance setting. Each one closes
 a path by which two runs of the same tokens could diverge.
 
-The KV cache pin closes the widest such path found so far, and it was open for
+The KV cache closes the widest such path found so far, and it was open for
 the whole campaign. Left at `auto`, vLLM resolves the KV cache dtype from a
 scheme declared in the candidate's own config, so
 `unsloth/gemma-4-26B-A4B-it-NVFP4` — which declares an 8-bit float KV cache —
@@ -362,6 +426,18 @@ how the measurement was taken, not a property of the checkpoint being measured.
 The cache is never quantized: scoring holds 4096 tokens, so there is no memory
 pressure that quantizing it could relieve, and nothing to weigh against the loss
 of comparability.
+
+Unquantized is not one dtype. It was a literal `bfloat16` at first, which refused
+three AWQ checkpoints published as float16: FlashAttention will not take a float16
+query against a bfloat16 key, so the run died in `mha_varlen_fwd` rather than
+scoring. `unquantized_kv_cache_dtype` in `vllm/v1/sample/kld.py` reads each
+checkpoint's own `torch_dtype` and caches in that, so a float16 model caches in
+float16 and a bfloat16 model in bfloat16. Both are unquantized, which is the
+property the policy is about; the resolved dtype is recorded on the report and
+carried in the comparability key, so a reader is told which one a number was taken
+under and two candidates cached differently are not silently ranked together.
+`assert_unquantized_kv_cache` refuses anything outside
+`UNQUANTIZED_KV_CACHE_DTYPES`, and still refuses `auto`.
 
 The rescore that followed measured what it had cost, and doubled as the cleanest
 determinism evidence in this document. unsloth is the only one of the nine
@@ -378,18 +454,53 @@ harness reproduced everything outside it. `assert_unquantized_kv_cache` reads th
 resolved and refuses both a quantized value and `auto`, because the failure being
 prevented is precisely a value nobody checked.
 
+**A number that moves on a rescore is not a number that was wrong.** The Qwen
+families were first scored before the NVFP4 uncalibrated-scale fill, before the
+Marlin determinism work, and before MoE batch invariance; rescored under all three,
+some of those values moved by as much as 6%. That is the correct amount of movement
+for a runtime that gained a fill where it had been consuming uninitialized scales
+and a batch-invariant expert path where it had not had one. Each value was a
+faithful measurement of the runtime that produced it, which is why the runtime is
+in the comparability key and why a legacy number is never quietly ranked beside a
+current one. Read a movement of this size as the runtime changing, and look for the
+change; the alarming case is a number that moves when nothing that computes it did,
+which is what the digest below is for.
+
 Because that runtime *is* part of the result, its identity is bound into the
-comparability key: `vllm_commit`, `vllm_dirty_digest`,
+comparability key: `numerics_digest`,
 `compiled_extensions_sha256`, `torch`, `driver`, `gpu_names`, and
 `kv_cache_dtype`, alongside the suite and geometry. Two candidates are ranked
 against each other only when all of it matches. `kv_cache_dtype` is in that list
 because of the unsloth case above: the key's one job is to bound a ranking to
 runs that ran alike, and it had nothing to say about a candidate whose attention
-ran at a different precision than its neighbours'. A consequence worth internalizing before committing to this
-repository: **any commit changes `vllm_commit`, and a dirty tree changes
-`vllm_dirty_digest`, so the next scoring run treats every prior report as stale
-and rescores the family.** That is correct behaviour, not a bug, and it is why
-harness fixes are best batched.
+ran at a different precision than its neighbours'.
+
+The commit used to sit in that list, and the consequence was that **any commit
+invalidated every published number.** A documentation paragraph, a campaign
+config, a new script: the next scoring run read a different `vllm_commit`,
+declared 45 compliant reports stale, and spent GPU-days reproducing numbers that
+were already right — and, being a rescore rather than a refusal, it did so
+silently. That was over-refusal dressed as rigour. An index of quantization
+fidelity is under continuous development by construction, so a currency test that
+cannot tell a docs edit from a kernel change makes the index unmaintainable.
+
+What bounds a result is whether the code that computed it would compute it again.
+`numerics_digest` in `vllm/v1/sample/kld.py` hashes every `.py` under `vllm/`
+together with the scorer, and `compiled_extensions_sha256` covers the built
+kernels, so between them they answer that question directly. Kernel sources are
+not hashed, because a source edit cannot move a number until it is rebuilt and the
+rebuild changes the extension digest. The digest is deliberately coarse — a
+comment in `vllm/` moves it — because deciding which edits inside the runtime are
+numerically inert is exactly the judgement a currency test must not be trusted
+with, and the cost of that coarseness is a rescore rather than a wrong number.
+
+The commit is still recorded on every report and printed on every one-pager. It
+says *when* a number was taken, which is provenance under Law 6, and provenance is
+not a currency test. A result reads: at commit `abc123`, under numerics digest
+`def456`, this KLD was measured. The commit may have moved a hundred times since;
+the number stands until the digest moves. Harness fixes are still best batched,
+now because a rescore wave costs GPU-hours rather than because the alternative is
+a stale library.
 
 ## 10. Gates that stop a correct measurement from being published wrong
 
@@ -475,10 +586,22 @@ suite, geometry, runtime, or laws version, and not against any published
 elsewhere. The comparability key is printed with every leaderboard group for
 exactly this reason.
 
-**A W4A4 NVFP4 MoE result is a native CUTLASS number.** See §7. FlashInfer and
-emulation collapse per-expert activation scales; those paths are not how a
-W4A4 candidate is scored. A W4A16 dense NVFP4 result still measures the scheme
-rather than a native FP4 kernel, because dense Marlin is not batch invariant.
+**A W4A4 NVFP4 MoE result is not guaranteed to be a native CUTLASS number.** It
+used to be, by a pin, and the pin failed two checkpoints it should have scored
+(§7). A result is now a number from whichever expert kernel the loader built for
+that checkpoint on this hardware, which is the kernel deploying it would get. Read
+it off the one-pager's declared-against-built table rather than inferring it from
+the scheme label: a checkpoint declaring 4-bit activations for its experts may have
+been built weight-only, and one built on a kernel that collapses per-expert
+activation scales carries a disclosed substitution and a priced cost for it. A
+W4A16 dense NVFP4 result still measures the scheme rather than a native FP4 kernel,
+because dense Marlin is not batch invariant.
+
+**A declared quantization is not a performed one.** The checkpoint's
+`quantization_config` is a statement by whoever exported it, and the kernels vLLM
+builds are a separate fact. `nvidia/gemma-4-26B-A4B-it-NVFP4` declares W4A4
+experts and was built weight-only; its number is honest about what ran and says
+nothing about what a W4A4 kernel would have scored.
 
 **The QDQ ladder is diagnostic, never a candidate.** Those cells round weights on
 synthetic BF16 checkpoints and route naturally. They are not QxQ or BxQ, they are
@@ -492,7 +615,7 @@ declared FP8 KV cache. Its QxQ of 1.13846019 against 1.77968754 for a complete
 all-`Linear` NVFP4 export is therefore mostly the 8-bit attention, not a better
 NVFP4 export, and it lands between the all-FP8 candidate at 0.69415039 and the
 all-NVFP4 ones exactly where a hybrid should. The declared KV cache is a separate
-matter and is no longer in that number: §9 pins an unquantized cache, which is
+matter and is no longer in that number: §9 holds an unquantized cache, which is
 worth 0.02724681 of the 0.64 separating it from the complete export, so the
 attention width still carries the result. This is not a comparability failure — the key deliberately excludes
 the candidate's scheme, because ranking schemes against one reference is the

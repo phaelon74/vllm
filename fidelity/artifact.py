@@ -108,6 +108,13 @@ def _identity(
 ) -> list[str]:
     """Everything that bounds the number's comparability, per Law 10."""
     runtime = manifest.get("runtime") or {}
+    # The commit that scored *this* number, which is now not always the commit the
+    # environment report was captured at. A result stays current across commits
+    # that cannot reach a number, so a family can hold reports taken at several,
+    # and reading the environment's commit here would attribute a number to a tree
+    # that did not produce it. Falls back to the environment for reports written
+    # before the binding was recorded.
+    bound = report.get("runtime_binding") or {}
     caps = receipt.get("comparability_key") or {}
     rows = [
         ("Reference checkpoint", str(manifest.get("reference_model"))),
@@ -144,8 +151,24 @@ def _identity(
         ("Prefix caching", str(manifest.get("enable_prefix_caching"))),
         ("max_num_seqs", str(manifest.get("max_num_seqs"))),
         ("vLLM", str((runtime_env.get("vllm") or {}).get("version"))),
-        ("vLLM commit", _short(runtime_env.get("vllm_commit"), 12)),
-        ("vLLM dirty digest", _short(runtime_env.get("vllm_dirty_digest"), 16)),
+        (
+            "vLLM commit",
+            _short(bound.get("vllm_commit") or runtime_env.get("vllm_commit"), 12),
+        ),
+        (
+            "vLLM dirty digest",
+            _short(
+                bound.get("vllm_dirty_digest")
+                or runtime_env.get("vllm_dirty_digest"),
+                16,
+            ),
+        ),
+        (
+            "Numerics digest",
+            _short(
+                bound.get("numerics_digest") or runtime.get("numerics_digest"), 16
+            ),
+        ),
         (
             "Compiled extensions",
             _short(runtime_env.get("compiled_extensions_sha256"), 16),
@@ -157,7 +180,19 @@ def _identity(
         ("Laws version", str(receipt.get("laws_version", LAWS_VERSION))),
         ("Partition", str(receipt.get("partition"))),
     ]
-    return ["## Identity", "", *_table(rows, ("Item", "Value")), ""]
+    return [
+        "## Identity",
+        "",
+        *_table(rows, ("Item", "Value")),
+        "",
+        "The commit says when this number was taken. The numerics digest says what "
+        "took it: a hash of the runtime and the scorer, which moves only when code "
+        "that can change a logit changes. Comparability is bounded by the digest, "
+        "so a result stays current across commits that cannot reach a number, and "
+        "two results carrying the same digest were computed by the same code "
+        "whatever their commits say.",
+        "",
+    ]
 
 
 def _text_line(env_dir: str | None, name: str, needle: str) -> str:
@@ -1140,6 +1175,134 @@ def _attribution(receipt: dict[str, Any]) -> list[str]:
     return out
 
 
+def _expert_kernels(report: dict[str, Any]) -> list[str]:
+    """What the checkpoint declared for its experts against what vLLM built.
+
+    A ``quantization_config`` is a statement by whoever exported the checkpoint.
+    Which kernel the loader builds for it on this hardware is a separate fact, and
+    the two can disagree: a modelopt ``MIXED_PRECISION`` export declaring 4-bit
+    weights and 4-bit activations for its experts was built weight-only here, so a
+    reader given only the declaration would have discounted this number for an
+    activation quantization the run never performed. The number on this page is
+    the one the built kernels computed. Both are shown, so which is which is
+    checkable rather than asserted.
+    """
+    declared = report.get("declared_expert_activation_quant")
+    cell = report.get("qxq_cell") or {}
+    evidence = cell.get("backend_evidence") or {}
+    identity = cell.get("backend_identity") or []
+    built = evidence.get("backend")
+    if not declared and not built:
+        return []
+
+    layers = [
+        layer
+        for worker in identity
+        if isinstance(worker, dict)
+        for layer in worker.get("layers") or ()
+        if isinstance(layer, dict)
+    ]
+    carrying = [layer for layer in layers if layer.get("activation_scales")]
+    out = [
+        "## Expert kernels: declared against built",
+        "",
+    ]
+    out += _table(
+        [
+            (
+                "Declared for its experts",
+                ", ".join(f"`{item}`" for item in declared or ())
+                or "no expert group declared",
+            ),
+            ("Expert implementation built", f"`{built}`" if built else "n/a"),
+            (
+                "Expert kernel built",
+                f"`{evidence.get('kernel')}`" if evidence.get("kernel") else "n/a",
+            ),
+            (
+                "Expert layers carrying an activation scale",
+                f"{len(carrying)} of {len(layers)}" if layers else "n/a",
+            ),
+        ],
+        ("Property", "Value"),
+    )
+    out.append("")
+    if declared and "4-bit float" in declared and layers and not carrying:
+        out += [
+            "**The checkpoint declares 4-bit float activations for its experts and "
+            "no expert layer loaded an NVFP4 activation scale.** The kernels vLLM "
+            "built for it quantize expert weights only, so this number was not "
+            "measured under 4-bit activations however the export is labelled. "
+            "Scored on what was built, because what vLLM builds for a checkpoint "
+            "is what deploying it does.",
+            "",
+        ]
+    out += _collapse_cost(report)
+    return out
+
+
+def _collapse_cost(report: dict[str, Any]) -> list[str]:
+    """What collapsing the checkpoint's per-expert activation scales cost.
+
+    Law 17 discloses that a run used one layer-wide scalar where the checkpoint
+    exported a scale per expert. Disclosure alone left the reader to guess whether
+    that was worth a decimal place or the ranking, so the same candidate is scored
+    again on a kernel that keeps the per-expert scales and the difference is stated
+    here. The deployed number is unchanged: this prices the substitution, it does
+    not replace the measurement.
+    """
+    cost = report.get("per_expert_collapse_cost")
+    if not isinstance(cost, dict) or not cost:
+        return []
+    parameters = ", ".join(f"`{p}`" for p in cost.get("parameters") or ())
+    out = [
+        "### What the collapse cost",
+        "",
+        f"This run collapsed {parameters} to one scalar per layer. To price that, "
+        f"the candidate was scored again on the "
+        f"`{cost.get('counterfactual_backend')}` MoE backend, which keeps a scale "
+        f"per expert. Same tokens, same reference capture, same geometry.",
+        "",
+    ]
+    if not cost.get("priced"):
+        out += [
+            f"**Unpriced.** {cost.get('reason') or 'the second run did not complete'}"
+            f". The collapse is disclosed and its cost on this hardware is not "
+            f"known; the deployed number above stands as measured.",
+            "",
+        ]
+        return out
+    deployed = cost.get("deployed") or {}
+    counterfactual = cost.get("counterfactual") or {}
+    delta = cost.get("delta") or {}
+    rows = [
+        (
+            {"mean_kld": "Deployed mean", "qxq": "QxQ", "bxq": "BxQ"}[name],
+            _kld(deployed.get(name)),
+            _kld(counterfactual.get(name)),
+            f"{delta[name]:+.8f}" if isinstance(delta.get(name), float) else "n/a",
+        )
+        for name in ("mean_kld", "qxq", "bxq")
+        if deployed.get(name) is not None
+    ]
+    out += _table(
+        rows,
+        ("Measure", "Collapsed (deployed)", "Per-expert scales", "Difference"),
+    )
+    out += [
+        "",
+        "A positive difference means the collapse made this checkpoint look worse "
+        "than its own exported scales would; a negative one means the collapse "
+        "flattered it, which is the direction that misleads. Neither run is more "
+        "correct than the other -- one is what vLLM does with this checkpoint "
+        "here, the other is what the checkpoint asked for -- and they are not "
+        "comparable to each other's leaderboard groups, because the substitution "
+        "is part of the comparability key.",
+        "",
+    ]
+    return out
+
+
 def _routing(receipt: dict[str, Any]) -> list[str]:
     """Natural QxQ routing divergence measured against teacher selections."""
     routing = receipt.get("routing")
@@ -1441,6 +1604,7 @@ def render_onepager(
         ]
     parts += _identity(report, manifest, receipt, runtime_env)
     parts += _attribution(receipt)
+    parts += _expert_kernels(report)
     parts += _routing(receipt)
     parts += _domains(receipt)
     parts += _head_split(report, manifest)
@@ -2435,6 +2599,71 @@ def selftest() -> int:
     other["receipt"]["comparability_key"]["kv_cache_dtype"] = "fp8"
     assert _grouping_key(other["receipt"]) != _grouping_key(clean["receipt"])
     print("  a substitution is disclosed on its row, not split into its own table")
+
+    # Declared and built are separate facts, and the one-pager has to show both.
+    # A checkpoint declaring 4-bit activations for experts that loaded no
+    # activation scale was built weight-only, and a reader given only the
+    # declaration would discount the number for a quantization it never ran.
+    weight_only = {
+        "declared_expert_activation_quant": ["4-bit float"],
+        "qxq_cell": {
+            "backend_evidence": {"backend": "MarlinExperts"},
+            "backend_identity": [
+                {"layers": [{"layer_id": 0, "activation_scales": None}]}
+            ],
+        },
+    }
+    section = "\n".join(_expert_kernels(weight_only))
+    assert "quantize expert weights only" in section, section
+    assert "`4-bit float`" in section and "`MarlinExperts`" in section, section
+    agreeing = {
+        "declared_expert_activation_quant": ["4-bit float"],
+        "qxq_cell": {
+            "backend_evidence": {"backend": "CutlassExpertsFp4"},
+            "backend_identity": [
+                {
+                    "layers": [
+                        {
+                            "layer_id": 0,
+                            "activation_scales": {"w2_input_global_scale": {}},
+                        }
+                    ]
+                }
+            ],
+        },
+    }
+    assert "weights only" not in "\n".join(_expert_kernels(agreeing))
+    assert _expert_kernels({"mean_kld": 0.2}) == []
+    print("  declared and built expert quantization are both rendered")
+
+    # A priced collapse states the difference; an unpriced one states that it is
+    # unpriced. Neither may quietly restate the deployed number as the cost.
+    priced = dict(
+        weight_only,
+        per_expert_collapse_cost={
+            "parameters": ["w2_input_global_scale"],
+            "counterfactual_backend": "cutlass",
+            "priced": True,
+            "deployed": {"mean_kld": 0.161, "qxq": 0.161, "bxq": 0.070},
+            "counterfactual": {"mean_kld": 0.152, "qxq": 0.152, "bxq": 0.121},
+            "delta": {"mean_kld": 0.009, "qxq": 0.009, "bxq": -0.051},
+        },
+    )
+    cost = "\n".join(_collapse_cost(priced))
+    assert "+0.00900000" in cost and "-0.05100000" in cost, cost
+    unpriced = dict(
+        priced,
+        per_expert_collapse_cost={
+            "parameters": ["w2_input_global_scale"],
+            "counterfactual_backend": "cutlass",
+            "priced": False,
+            "reason": "the cutlass backend does not support this device",
+        },
+    )
+    text = "\n".join(_collapse_cost(unpriced))
+    assert "**Unpriced.**" in text and "does not support" in text, text
+    assert _collapse_cost({"mean_kld": 0.2}) == []
+    print("  a collapse is priced against a non-collapsing kernel, or said to be not")
 
     laws_path = os.path.join(os.path.dirname(__file__), "LAWS.md")
     with open(laws_path, encoding="utf-8") as handle:

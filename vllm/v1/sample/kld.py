@@ -619,7 +619,88 @@ def capture_runtime_manifest() -> dict[str, Any]:
     info["compiled_extensions_sha256"] = _digest_mapping(
         info["compiled_extensions"]
     )
+    info["numerics_digest"] = numerics_digest()
     return info
+
+
+# Where a change can move a measured number: the runtime that computes logits and
+# the scorer that reduces them. Kernel sources are not listed because a source
+# edit cannot change a number until it is rebuilt, and the rebuild shows up in
+# `compiled_extensions_sha256`.
+_NUMERICS_TREES = ("vllm",)
+_NUMERICS_FILES = (os.path.join("examples", "offline_inference", "score_mode_kld.py"),)
+
+
+def _repo_root() -> str:
+    """The checkout this runtime was imported from."""
+    override = os.environ.get("KLD_REPO_ROOT")
+    if override:
+        return override
+    # vllm/v1/sample/kld.py -> up four to the checkout.
+    return os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    )
+
+
+_NUMERICS_DIGEST: list[str | None] = []
+
+
+def numerics_digest() -> str | None:
+    """Digest of the code that can change a measured number.
+
+    A published result records the commit it was taken at, and that record is
+    provenance. It is a poor currency test, because the commit moves for a
+    documentation edit, an orchestration fix, or a new script, none of which can
+    change a KLD -- and demanding equality with the live commit then forces a full
+    rescore to reproduce numbers that were already correct. Two runs whose logits
+    were computed by identical code are the same measurement whatever the commit
+    says, and this digest is what says so.
+
+    Deliberately coarse. Every ``.py`` under the runtime counts, comments and all,
+    because deciding which edits inside it are numerically inert is exactly the
+    judgement a currency test must not be trusted with. Returns None when the tree
+    cannot be read, and a None digest never matches, so the fallback is a rescore.
+
+    Computed once per process. A campaign asks this for every candidate, and the
+    tree is not permitted to change while one is scoring: a run that saw two
+    different digests would be binding its earlier reports to code that no longer
+    exists, which is the failure this is here to end rather than reproduce.
+    """
+    if _NUMERICS_DIGEST:
+        return _NUMERICS_DIGEST[0]
+    _NUMERICS_DIGEST.append(_compute_numerics_digest())
+    return _NUMERICS_DIGEST[0]
+
+
+def _compute_numerics_digest() -> str | None:
+    root = _repo_root()
+    digest = hashlib.sha256()
+    paths: list[str] = []
+    for tree in _NUMERICS_TREES:
+        base = os.path.join(root, tree)
+        if not os.path.isdir(base):
+            return None
+        for current, dirs, names in os.walk(base):
+            dirs[:] = sorted(d for d in dirs if d != "__pycache__")
+            for name in sorted(names):
+                if name.endswith(".py"):
+                    paths.append(os.path.join(current, name))
+    for name in _NUMERICS_FILES:
+        candidate = os.path.join(root, name)
+        if not os.path.isfile(candidate):
+            return None
+        paths.append(candidate)
+    for path in sorted(paths):
+        relative = os.path.relpath(path, root).replace(os.sep, "/").encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        try:
+            with open(path, "rb") as handle:
+                while chunk := handle.read(1 << 20):
+                    digest.update(chunk)
+        except OSError:
+            return None
+    return digest.hexdigest()
 
 
 def _git_commit() -> str | None:
@@ -1441,6 +1522,33 @@ def read_json(path: str) -> Any:
         return json.load(f)
 
 
+_RUNTIME_BINDING_FIELDS = (
+    "numerics_digest",
+    "compiled_extensions_sha256",
+    "torch",
+    "flashinfer",
+    "driver",
+    "gpu_names",
+)
+
+
+def runtime_binding_view(runtime: Any) -> dict[str, Any]:
+    """The runtime fields a capture is bound to: those that can move a number.
+
+    Binding used to compare the whole manifest, which meant a capture was refused
+    when the commit, the dirty digest, the Python patch level, or the platform
+    string moved. None of those can change a logit, and refusing on them made a
+    reference capture unusable the moment anything in the repository was touched.
+    What remains is the code that computes, the kernels that were built, and the
+    hardware they ran on. A capture recorded before this existed has no digest
+    here, and None never matches a real one, so it is recaptured rather than
+    assumed.
+    """
+    if not isinstance(runtime, dict):
+        return {}
+    return {key: runtime.get(key) for key in _RUNTIME_BINDING_FIELDS}
+
+
 def manifest_mismatches(
     manifest: dict[str, Any],
     live: dict[str, Any],
@@ -1470,6 +1578,17 @@ def manifest_mismatches(
         if key not in live:
             errors.append(f"live config missing {key!r}")
             continue
-        if manifest[key] != live[key]:
-            errors.append(f"{key}: captured {manifest[key]!r} != live {live[key]!r}")
+        captured, current = manifest[key], live[key]
+        if key == "runtime":
+            captured = runtime_binding_view(captured)
+            current = runtime_binding_view(current)
+            errors.extend(
+                f"runtime.{field}: captured {captured[field]!r} "
+                f"!= live {current[field]!r}"
+                for field in _RUNTIME_BINDING_FIELDS
+                if captured[field] != current[field]
+            )
+            continue
+        if captured != current:
+            errors.append(f"{key}: captured {captured!r} != live {current!r}")
     return errors

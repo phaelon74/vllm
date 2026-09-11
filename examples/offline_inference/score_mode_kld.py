@@ -1142,6 +1142,7 @@ def calculate_kld(
     routing_dir: str | None = None,
     paired_routing: bool = False,
     reference_weights_sha256: str | None = None,
+    moe_backend: str | None = None,
 ) -> dict[str, Any]:
     """Two-phase KLD: capture teacher references, then score the student."""
     from vllm.v1.sample.kld import (
@@ -1254,11 +1255,15 @@ def calculate_kld(
             existing_manifest = read_json(existing_manifest_path)
             current_runtime = capture_runtime_manifest()
             captured_runtime = existing_manifest.get("runtime") or {}
+            # Recapture when the code that computes logits changed, not when the
+            # commit moved. A teacher capture is the most expensive artifact here,
+            # and throwing it away for an edit that cannot reach a logit bought
+            # nothing: the same tokens through the same runtime give the same
+            # reference distribution whatever the commit is called.
+            captured_numerics = captured_runtime.get("numerics_digest")
             if (
-                captured_runtime.get("vllm_commit")
-                != current_runtime.get("vllm_commit")
-                or captured_runtime.get("vllm_dirty_digest")
-                != current_runtime.get("vllm_dirty_digest")
+                captured_numerics is None
+                or captured_numerics != current_runtime.get("numerics_digest")
                 or captured_runtime.get("compiled_extensions_sha256")
                 != current_runtime.get("compiled_extensions_sha256")
             ):
@@ -1632,6 +1637,14 @@ def calculate_kld(
     # served by any single pin at all. The oracle answers per layer, and
     # `inspect_model_moe_backends` below reads back what it chose, which is the
     # measurement this project prefers to a declaration.
+    #
+    # One exception, and it is not a guess: a counterfactual run named a backend
+    # because a first run already read back that the oracle's choice collapsed the
+    # checkpoint's per-expert activation scales. That names a kernel on the
+    # strength of a measurement, which is the opposite of predicting one.
+    if moe_backend:
+        student_kwargs["moe_backend"] = moe_backend
+        print(f"MoE backend named for this run: {moe_backend}")
     with _phase(timings, "student_load"):
         llm = LLM(model=model_path, **student_kwargs)
     kv_cache_dtype = assert_unquantized_kv_cache(llm, "candidate")
@@ -2027,6 +2040,10 @@ def calculate_kld(
     report["declared_expert_activation_quant"] = _declared_expert_activation_quant(
         model_path
     )
+    # None means the oracle chose freely, which is the published configuration.
+    # A name here marks a counterfactual run, so a reader can never mistake one
+    # for the deployed number.
+    report["moe_backend_named"] = moe_backend
     # Unconditional, and top level as well as inside the routing binding: a
     # compliance check and a comparability key must be able to ask what the run
     # substituted without reaching through a paired-routing structure that a
@@ -2744,6 +2761,16 @@ def main():
         "expert IDs while retaining the student's own gating weights.",
     )
     parser.add_argument(
+        "--moe-backend",
+        type=str,
+        default=None,
+        help="Name the MoE backend for the candidate instead of letting the "
+        "oracle choose. For counterfactual runs only: a deployed number is the "
+        "one the oracle chose, and this is how the cost of a kernel that "
+        "collapses per-expert activation scales is measured against one that "
+        "does not.",
+    )
+    parser.add_argument(
         "--dataset-config",
         type=str,
         default=None,
@@ -3005,6 +3032,7 @@ def main():
         routing_dir=args.routing_dir,
         paired_routing=args.paired_routing,
         reference_weights_sha256=args.reference_weights_sha256,
+        moe_backend=args.moe_backend,
     )
     elapsed_time = time.time() - start_time
 
