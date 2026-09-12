@@ -394,8 +394,20 @@ def build_index(
 ) -> str:
     """Stage the small, findable index: one-pagers, leaderboard, laws."""
     staging = tempfile.mkdtemp(prefix="lil-index-")
-    for doc in ("LAWS.md", "QXQ.md"):
-        shutil.copy2(os.path.join(HERE, doc), os.path.join(staging, doc))
+    # The whole documentation set, because a reader who only ever sees the Hub
+    # could previously read the numbers and had no way to obtain the procedure
+    # that produced them. The operating manual publishes as MANUAL.md: this
+    # index's own card is README.md, so the two cannot share a name.
+    for doc, name in (
+        ("INSTALL.md", "INSTALL.md"),
+        ("README.md", "MANUAL.md"),
+        ("LAWS.md", "LAWS.md"),
+        ("QXQ.md", "QXQ.md"),
+        ("DECISIONS.md", "DECISIONS.md"),
+        ("EXTENDING.md", "EXTENDING.md"),
+        ("PR54444-Adendum.md", "PR54444-Adendum.md"),
+    ):
+        shutil.copy2(os.path.join(HERE, doc), os.path.join(staging, name))
     for name in ("leaderboard.md", "leaderboard.csv"):
         src = os.path.join(library, name)
         if os.path.isfile(src):
@@ -434,6 +446,26 @@ def build_index(
         f"comparing anything here. Numbers are comparable only within a single "
         f"artifact's suite, geometry, and runtime identity. Each one-pager cites "
         f"the laws version it was scored under, which is not always the newest.",
+        "",
+        # Not a `## ` heading: `index_models_in` reads every one of those as a
+        # model name, and a phantom model in the index is a phantom model in the
+        # ledger it can be rebuilt from.
+        "**Documentation.**",
+        "",
+        "- [`INSTALL.md`](INSTALL.md) — install the suite and score models "
+        "yourself, including what is and is not reproducible off our hardware.",
+        "- [`MANUAL.md`](MANUAL.md) — the operating manual: campaigns, the "
+        "pipeline order, the library layout, and publishing.",
+        "- [`LAWS.md`](LAWS.md) — the rules every artifact here obeys.",
+        "- [`QXQ.md`](QXQ.md) — what the two cells measure, and the failure "
+        "modes they exist to catch.",
+        "- [`DECISIONS.md`](DECISIONS.md) — why the design is shaped this way, "
+        "including the earlier designs that produced wrong numbers.",
+        "- [`EXTENDING.md`](EXTENDING.md) — how to approach a model this suite "
+        "was not built for.",
+        "",
+        "The suite is a fork of vLLM rather than a package: see "
+        "[`INSTALL.md`](INSTALL.md) §1.",
         "",
     ]
     for plan in index_entries(library, plans, read_ledger(library)):

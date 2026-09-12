@@ -7,11 +7,20 @@ Read [`LAWS.md`](LAWS.md) first. The laws are enforced, not advised: the
 compliance checker exits non-zero on any violation, so a pipeline wired to it
 cannot publish a non-compliant result.
 
+This document assumes a working install. If you do not have one, start with
+[`INSTALL.md`](INSTALL.md) — the suite is a fork of vLLM rather than a package,
+and one CUDA extension has to be rebuilt for routed INT4 candidates to mean
+anything.
+
 ## Components
 
 | File | Role |
 |---|---|
+| `INSTALL.md` | Prerequisites, the install, verification, and what is reproducible |
 | `LAWS.md` | The immutable laws, their automated checks, and the override procedure |
+| `QXQ.md` | What the two cells measure and the failure modes they catch |
+| `DECISIONS.md` | Why the design is shaped this way, and the reversals behind it |
+| `EXTENDING.md` | Triage and mechanism guide for a model the suite was not built for |
 | `suite.py` | Mints the frozen token suite; verifies one; self-tests offline |
 | `suites/recipe-v1.json` | The base recipe: sources, revisions, strata, benchmarks |
 | `bootstrap.sh` | Creates the venv, installs this branch, fetches checkpoints |

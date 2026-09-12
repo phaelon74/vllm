@@ -569,6 +569,14 @@ being dropped from the config silently.
 
 ## 11. Reproducing and extending
 
+Reproducing from scratch starts at [`INSTALL.md`](INSTALL.md), which covers the
+install and is explicit about which of your numbers will match ours and which will
+not. Extending to a model with a mechanism this suite has not met — linear or
+hybrid attention, a latent KV cache, MTP heads, a new quantization scheme — starts
+at [`EXTENDING.md`](EXTENDING.md), which is organised by mechanism and opens with
+a triage order. What follows here is the debugging ladder for the case those two
+documents send you to: a candidate that loads but will not produce a number.
+
 Certify a new MoE backend before trusting it. In order:
 
 ```bash
