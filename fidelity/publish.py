@@ -36,6 +36,7 @@ from artifact import (  # noqa: E402 - sibling module
     candidate_identity,
     front_matter,
 )
+from campaign import weight_collisions  # noqa: E402 - sibling module
 from compliance import LAWS_VERSION  # noqa: E402 - sibling module
 from redaction import scan_tree  # noqa: E402 - sibling module
 
@@ -168,28 +169,28 @@ def gate(
                     report.get("student_weights_sha256"),
                 )
             )
-        collision = False
-        for index, (left, left_mean, left_digest) in enumerate(scored):
-            for right, right_mean, right_digest in scored[index + 1 :]:
-                if (
-                    left_mean is not None
-                    and right_mean is not None
-                    and left_digest
-                    and right_digest
-                    and (
-                        (left_mean == right_mean and left_digest != right_digest)
-                        or (
-                            left_mean != right_mean
-                            and left_digest == right_digest
-                        )
-                    )
-                ):
-                    hard_stop.append(
-                        f"{model}: {left} and {right} have contradictory score "
-                        "and weight identities; rescore both"
-                    )
-                    collision = True
-        if collision:
+        # Only equal digests prove equal bytes. This used to refuse an equal mean
+        # from unequal digests as a contradiction, and so refused a whole family
+        # over two upstream repos that had repackaged one quantization -- the same
+        # mistake `weight_collisions` documents having made and fixed. Assembly
+        # already draws this line; drawing it a second time here drew it wrong.
+        impossible, duplicates, equivalent = weight_collisions(scored)
+        for left, right in duplicates:
+            print(
+                f"DUPLICATE  {model}: {left} and {right} are byte-identical "
+                f"weights under two names"
+            )
+        for left, right in equivalent:
+            print(
+                f"EQUIVALENT {model}: {left} and {right} are one quantization "
+                f"repackaged; both publish with the relationship disclosed"
+            )
+        if impossible:
+            hard_stop.extend(
+                f"{model}: {left} and {right} have contradictory score and "
+                f"weight identities; rescore both"
+                for left, right in impossible
+            )
             continue
         bad = [
             name
