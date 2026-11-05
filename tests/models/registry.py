@@ -296,7 +296,6 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
     ),
     "FalconForCausalLM": _HfExamplesInfo("tiiuae/falcon-7b"),
     "FalconH1ForCausalLM": _HfExamplesInfo("tiiuae/Falcon-H1-0.5B-Base"),
-    "FlintForCausalLM": _HfExamplesInfo("RecursiveSI/flint", is_available_online=False),
     "FlexOlmoForCausalLM": _HfExamplesInfo("allenai/Flex-reddit-2x7B-1T"),
     "GemmaForCausalLM": _HfExamplesInfo("google/gemma-1.1-2b-it"),
     "Gemma2ForCausalLM": _HfExamplesInfo(
@@ -536,6 +535,9 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
     "Qwen3NextForCausalLM": _HfExamplesInfo(
         "Qwen/Qwen3-Next-80B-A3B-Instruct",
         extras={"tiny-random": "tiny-random/qwen3-next-moe"},
+    ),
+    "RicursiveForCausalLM": _HfExamplesInfo(
+        "ricursiveAI/Ripple-65B-Preview", trust_remote_code=True
     ),
     "Rnj1ForCausalLM": _HfExamplesInfo(
         "EssentialAI/rnj-1-instruct",

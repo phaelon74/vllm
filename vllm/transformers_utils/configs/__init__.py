@@ -89,6 +89,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "HyperCLOVAXConfig": "transformers",
     "Kimi_K25Config": "transformers",
     "Step3p7TextConfig": "transformers",
+    "RicursiveConfig": "vllm.transformers_utils.configs.ricursive",
 }
 
 __all__ = [
@@ -157,7 +158,7 @@ __all__ = [
     "InklingModelConfig",
     "InklingAudioConfig",
     "InklingVisionConfig",
-    "InklingMMConfig",
+    "RicursiveConfig",
 ]
 
 
